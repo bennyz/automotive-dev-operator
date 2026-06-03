@@ -102,7 +102,7 @@ func (h *Handler) handleError(err error) {
 		h.opts.HandleError(err)
 		return
 	}
-	fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+	fmt.Fprintln(os.Stderr, common.FormatError(err))
 	os.Exit(1)
 }
 
@@ -125,11 +125,14 @@ func (h *Handler) applyWaitFollowDefaults(cmd *cobra.Command, defaultWait, defau
 // validateBootcBuildFlags validates flag combinations for the build command.
 func (h *Handler) validateBootcBuildFlags() error {
 	if strings.TrimSpace(*h.opts.ServerURL) == "" {
-		return fmt.Errorf("server URL required (use --server, CAIB_SERVER, run 'caib login <server-url>' or 'jmp login <endpoint>')")
+		return common.ServerURLRequiredError("caib image build --server <server-url>")
 	}
 
 	if *h.opts.UseInternalRegistry && *h.opts.ExportOCI != "" {
-		return fmt.Errorf("--internal-registry cannot be used with --push-disk")
+		return common.NewActionableError(
+			fmt.Errorf("--internal-registry cannot be used with --push-disk"),
+			fmt.Sprintf("caib image build -m %s --push-disk %s", *h.opts.Manifest, *h.opts.ExportOCI),
+		)
 	}
 
 	if *h.opts.OutputDir != "" && !*h.opts.BuildDiskImage {
@@ -166,7 +169,10 @@ func (h *Handler) validateReproducibleFlags() error {
 		return err
 	}
 	if *h.opts.Reproducible && *h.opts.UseInternalRegistry {
-		return fmt.Errorf("--reproducible cannot be used with --internal-registry (internal registry does not support OCI referrers)")
+		return common.NewActionableError(
+			fmt.Errorf("--reproducible cannot be used with --internal-registry (internal registry does not support OCI referrers)"),
+			"caib image build -m <manifest> --reproducible --push-disk <registry>",
+		)
 	}
 	return nil
 }
@@ -373,7 +379,11 @@ func (h *Handler) displayBuildResults(ctx context.Context, api *buildapiclient.C
 
 func (h *Handler) validateFlashLeaseFlags(cmd *cobra.Command) error {
 	if *h.opts.FlashAfterBuild && *h.opts.LeaseName != "" && cmd.Flags().Changed("lease-duration") {
-		return fmt.Errorf("--lease and --lease-duration are mutually exclusive")
+		return common.NewActionableError(
+			fmt.Errorf("--lease and --lease-duration are mutually exclusive"),
+			fmt.Sprintf("caib image build --flash --lease %s", *h.opts.LeaseName),
+			"caib image build --flash --lease-duration <duration>",
+		)
 	}
 	return nil
 }
@@ -385,7 +395,10 @@ func (h *Handler) applyFlashOptions(req *buildapitypes.BuildRequest, pushRequire
 		return nil
 	}
 	if *h.opts.ExportOCI == "" && !*h.opts.UseInternalRegistry {
-		return fmt.Errorf("cannot enable --flash without exporting a disk image (%s)", pushRequiredFlag)
+		return common.NewActionableError(
+			fmt.Errorf("cannot enable --flash without exporting a disk image (%s)", pushRequiredFlag),
+			fmt.Sprintf("caib image build --flash %s <registry>", pushRequiredFlag),
+		)
 	}
 	clientInfo, err := common.ResolveJumpstarterClient(strings.TrimSpace(*h.opts.JumpstarterClient))
 	if err != nil {
@@ -571,7 +584,7 @@ func (h *Handler) RunDisk(cmd *cobra.Command, args []string) {
 	*h.opts.ContainerRef = containerRef
 
 	if strings.TrimSpace(*h.opts.ServerURL) == "" {
-		h.handleError(fmt.Errorf("server URL required (use --server, CAIB_SERVER, run 'caib login <server-url>' or 'jmp login <endpoint>')"))
+		h.handleError(common.ServerURLRequiredError(fmt.Sprintf("caib image disk --server <server-url> %s", containerRef)))
 		return
 	}
 
@@ -581,7 +594,10 @@ func (h *Handler) RunDisk(cmd *cobra.Command, args []string) {
 	}
 
 	if *h.opts.UseInternalRegistry && *h.opts.ExportOCI != "" {
-		h.handleError(fmt.Errorf("--internal-registry cannot be used with --push"))
+		h.handleError(common.NewActionableError(
+			fmt.Errorf("--internal-registry cannot be used with --push"),
+			fmt.Sprintf("caib image disk --push %s %s", *h.opts.ExportOCI, containerRef),
+		))
 		return
 	}
 
@@ -677,7 +693,7 @@ func (h *Handler) RunBuildDev(cmd *cobra.Command, args []string) {
 	}
 
 	if strings.TrimSpace(*h.opts.ServerURL) == "" {
-		h.handleError(fmt.Errorf("server URL required (use --server, CAIB_SERVER, run 'caib login <server-url>' or 'jmp login <endpoint>')"))
+		h.handleError(common.ServerURLRequiredError(fmt.Sprintf("caib image build-dev --server <server-url> %s", manifestPath)))
 		return
 	}
 
@@ -688,7 +704,10 @@ func (h *Handler) RunBuildDev(cmd *cobra.Command, args []string) {
 
 	if *h.opts.UseInternalRegistry {
 		if *h.opts.ExportOCI != "" {
-			h.handleError(fmt.Errorf("--internal-registry cannot be used with --push"))
+			h.handleError(common.NewActionableError(
+				fmt.Errorf("--internal-registry cannot be used with --push"),
+				fmt.Sprintf("caib image build-dev --push %s %s", *h.opts.ExportOCI, manifestPath),
+			))
 			return
 		}
 	} else if err := common.ValidateOutputRequiresPush(*h.opts.OutputDir, *h.opts.ExportOCI, "--push"); err != nil {
@@ -838,7 +857,10 @@ func (h *Handler) handleFileUploads(
 	defer cancel()
 	for {
 		if err := readyCtx.Err(); err != nil {
-			return fmt.Errorf("timed out waiting for upload server to be ready")
+			return common.NewActionableError(
+				fmt.Errorf("timed out waiting for upload server to be ready (10m)"),
+				"caib image logs "+buildName,
+			)
 		}
 		reqCtx, reqCancel := context.WithTimeout(readyCtx, 15*time.Second)
 		st, err := api.GetBuild(reqCtx, buildName)
@@ -867,7 +889,10 @@ func (h *Handler) handleFileUploads(
 	for {
 		remaining := time.Until(uploadDeadline)
 		if remaining <= 0 {
-			return fmt.Errorf("upload files failed: timed out after 10m")
+			return common.NewActionableError(
+				fmt.Errorf("upload files failed: timed out after 10m"),
+				"caib image logs "+buildName,
+			)
 		}
 		attemptTimeout := perAttemptTimeout
 		if remaining < attemptTimeout {
@@ -914,7 +939,7 @@ func (h *Handler) RunCancel(_ *cobra.Command, args []string) {
 
 func (h *Handler) runBuildAction(buildName, verb string, action func(context.Context, *buildapiclient.Client, string) error) {
 	if strings.TrimSpace(*h.opts.ServerURL) == "" {
-		h.handleError(fmt.Errorf("server URL required (use --server, CAIB_SERVER, run 'caib login <server-url>' or 'jmp login <endpoint>')"))
+		h.handleError(common.ServerURLRequiredError(fmt.Sprintf("caib image %s --server <server-url> %s", verb, buildName)))
 		return
 	}
 

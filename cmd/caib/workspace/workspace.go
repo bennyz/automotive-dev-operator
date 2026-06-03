@@ -786,7 +786,10 @@ func waitForRunning(name string) {
 			return
 		case <-timeout:
 			fmt.Println()
-			handleError(fmt.Errorf("timed out waiting for workspace %q to be running", name))
+			handleError(caibcommon.NewActionableError(
+				fmt.Errorf("timed out waiting for workspace %q to be running", name),
+				"caib workspace logs "+name,
+			))
 		case <-ticker.C:
 			var ws *buildapitypes.WorkspaceResponse
 			err := caibcommon.ExecuteWithReauth(serverURL, &authToken, insecureSkipTLS, func(client *buildapiclient.Client) error {
@@ -819,6 +822,14 @@ func waitForRunning(name string) {
 					fmt.Println()
 				}
 				return
+			case "Stopped":
+				if isTTY && showProgress {
+					fmt.Println()
+				}
+				handleError(caibcommon.NewActionableError(
+					fmt.Errorf("workspace %q is stopped (auto-paused due to inactivity)", name),
+					"caib workspace start "+name,
+				))
 			case "Failed":
 				if isTTY && showProgress {
 					fmt.Println()
@@ -831,12 +842,12 @@ func waitForRunning(name string) {
 
 func requireServer() {
 	if serverURL == "" {
-		handleError(fmt.Errorf("--server is required (or set CAIB_SERVER, or run 'caib login <server-url>')"))
+		handleError(caibcommon.ServerURLRequiredError("caib workspace --server <server-url>"))
 	}
 }
 
 func handleError(err error) {
-	fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+	fmt.Fprintln(os.Stderr, caibcommon.FormatError(err))
 	os.Exit(1)
 }
 

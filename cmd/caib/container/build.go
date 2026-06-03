@@ -35,6 +35,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/clilog"
+	caibcommon "github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/common"
 	"github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/config"
 	"github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/registryauth"
 	"github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/ui"
@@ -140,14 +141,21 @@ func runBuildContainer(_ *cobra.Command, args []string) {
 	clilog.Infof("Containerfile: %s\n", filepath.Join(absContextDir, containerfile))
 
 	if serverURL == "" {
-		handleError(fmt.Errorf("server URL required (use --server, CAIB_SERVER, run 'caib login <server-url>' or 'jmp login <endpoint>')"))
+		handleError(caibcommon.ServerURLRequiredError("caib container build --server <server-url> ."))
 	}
 
 	if containerBuildPush != "" && useInternalRegistry {
-		handleError(fmt.Errorf("--push and --internal-registry are mutually exclusive"))
+		handleError(caibcommon.NewActionableError(
+			fmt.Errorf("--push and --internal-registry are mutually exclusive"),
+			fmt.Sprintf("caib container build --push %s .", containerBuildPush),
+		))
 	}
 	if containerBuildPush == "" && !useInternalRegistry {
-		handleError(fmt.Errorf("either --push or --internal-registry is required"))
+		handleError(caibcommon.NewActionableError(
+			fmt.Errorf("either --push or --internal-registry is required"),
+			"caib container build --push <registry/image:tag> .",
+			"caib container build --internal-registry .",
+		))
 	}
 
 	if buildName == "" {

@@ -57,7 +57,10 @@ func (h *Handler) waitForBuildCompletion(ctx context.Context, api *buildapiclien
 		select {
 		case <-timeoutCtx.Done():
 			pb.Clear()
-			timeoutErr := fmt.Errorf("timed out waiting for build")
+			timeoutErr := common.NewActionableError(
+				fmt.Errorf("timed out waiting for build %s", name),
+				"caib image show "+name,
+			)
 			h.handleError(timeoutErr)
 			return timeoutErr
 		case <-ticker.C:

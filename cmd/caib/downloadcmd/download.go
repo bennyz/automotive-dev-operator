@@ -50,11 +50,14 @@ func (h *Handler) RunDownload(_ *cobra.Command, args []string) {
 	downloadBuildName := args[0]
 
 	if h.opts.ServerURL == nil || strings.TrimSpace(*h.opts.ServerURL) == "" {
-		h.handleError(fmt.Errorf("server URL required (use --server, CAIB_SERVER, run 'caib login <server-url>' or 'jmp login <endpoint>')"))
+		h.handleError(common.ServerURLRequiredError(fmt.Sprintf("caib image download --server <server-url> -o <dir> %s", downloadBuildName)))
 		return
 	}
 	if h.opts.OutputDir == nil || strings.TrimSpace(*h.opts.OutputDir) == "" {
-		h.handleError(fmt.Errorf("--output / -o is required"))
+		h.handleError(common.NewActionableError(
+			fmt.Errorf("--output / -o is required"),
+			fmt.Sprintf("caib image download -o <output-dir> %s", downloadBuildName),
+		))
 		return
 	}
 	if h.opts.InsecureSkipTLS == nil {
@@ -78,7 +81,10 @@ func (h *Handler) RunDownload(_ *cobra.Command, args []string) {
 	}
 
 	if st.Phase != phaseCompleted {
-		h.handleError(fmt.Errorf("build %s is not completed (phase: %s), cannot download artifacts", downloadBuildName, st.Phase))
+		h.handleError(common.NewActionableError(
+			fmt.Errorf("build %s is not completed (phase: %s), cannot download artifacts", downloadBuildName, st.Phase),
+			"caib image logs "+downloadBuildName,
+		))
 		return
 	}
 
