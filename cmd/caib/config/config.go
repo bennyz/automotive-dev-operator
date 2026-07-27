@@ -28,7 +28,8 @@ var healthHTTPClient *http.Client
 
 // CLIConfig holds saved CLI settings.
 type CLIConfig struct {
-	ServerURL string `json:"server_url"`
+	ServerURL           string `json:"server_url"`
+	DerivedFromEndpoint string `json:"derived_from_endpoint,omitempty"`
 }
 
 // DefaultServer returns the effective default server URL: CAIB_SERVER env, then saved config.
@@ -47,12 +48,34 @@ func DefaultServer() string {
 }
 
 // DefaultServerWithDerive returns the effective default server URL.
-// Resolution order: CAIB_SERVER env → saved config → Jumpstarter derivation.
+// Resolution order: CAIB_SERVER env → saved config (with staleness check) → Jumpstarter derivation.
+// When the saved URL was auto-derived from a Jumpstarter endpoint that no longer matches
+// the current Jumpstarter config, the cached value is skipped and re-derived.
 func DefaultServerWithDerive() string {
-	if s := DefaultServer(); s != "" {
+	if s := strings.TrimSpace(os.Getenv("CAIB_SERVER")); s != "" {
 		return s
 	}
+
+	cfg, err := Read()
+	if err == nil && cfg != nil {
+		if s := strings.TrimSpace(cfg.ServerURL); s != "" {
+			if !IsDerivedAndStale(cfg) {
+				return s
+			}
+		}
+	}
+
 	return DeriveServerFromJumpstarter()
+}
+
+// IsDerivedAndStale returns true when the saved config was auto-derived from a
+// Jumpstarter endpoint that no longer matches the current Jumpstarter client config.
+// Manually-set URLs (DerivedFromEndpoint == "") are never considered stale.
+func IsDerivedAndStale(cfg *CLIConfig) bool {
+	if cfg.DerivedFromEndpoint == "" {
+		return false
+	}
+	return JumpstarterEndpoint() != cfg.DerivedFromEndpoint
 }
 
 // JumpstarterEndpoint reads the default Jumpstarter client config files and returns
@@ -120,6 +143,7 @@ func DeriveServerFromJumpstarter() string {
 	if grpcEndpoint == "" {
 		return ""
 	}
+	rawEndpoint := grpcEndpoint
 
 	// Derive Build API URL from gRPC endpoint:
 	// grpc.jumpstarter-lab.apps.example.com:443 → https://ado-build-api-<ns>.apps.example.com
@@ -165,7 +189,7 @@ func DeriveServerFromJumpstarter() string {
 		}
 
 		fmt.Fprintf(os.Stderr, "Using Build API server derived from Jumpstarter config: %s\n", apiURL)
-		if err := SaveServerURL(apiURL); err != nil {
+		if err := saveDerivedServerURL(apiURL, rawEndpoint); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: could not save derived server URL to config: %v\n", err)
 		}
 		return apiURL
@@ -196,7 +220,23 @@ func Read() (*CLIConfig, error) {
 }
 
 // SaveServerURL writes the given server URL to the local config file.
+// This is the manual-set path (e.g. caib login <url>) — clears DerivedFromEndpoint
+// so the URL is never auto-invalidated.
 func SaveServerURL(serverURL string) error {
+	return saveConfig(&CLIConfig{ServerURL: strings.TrimSpace(serverURL)})
+}
+
+// saveDerivedServerURL saves a server URL that was auto-derived from a Jumpstarter endpoint.
+// The source endpoint is recorded so the cached URL can be invalidated when the
+// Jumpstarter config changes.
+func saveDerivedServerURL(serverURL, sourceEndpoint string) error {
+	return saveConfig(&CLIConfig{
+		ServerURL:           strings.TrimSpace(serverURL),
+		DerivedFromEndpoint: strings.TrimSpace(sourceEndpoint),
+	})
+}
+
+func saveConfig(cfg *CLIConfig) error {
 	path, err := configFilePath()
 	if err != nil {
 		return err
@@ -204,7 +244,6 @@ func SaveServerURL(serverURL string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return err
 	}
-	cfg := &CLIConfig{ServerURL: strings.TrimSpace(serverURL)}
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return err

@@ -85,11 +85,12 @@ var _ = Describe("DeriveServerFromJumpstarter", func() {
 		Expect(result).To(Equal(expected))
 		Expect(requestedURL).To(Equal(expected + "/v1/healthz"))
 
-		// Verify it was persisted
+		// Verify it was persisted with source endpoint
 		cfg, err := Read()
 		Expect(err).NotTo(HaveOccurred())
 		Expect(cfg).NotTo(BeNil())
 		Expect(cfg.ServerURL).To(Equal(expected))
+		Expect(cfg.DerivedFromEndpoint).To(Equal("grpc.lab.apps.example.com:443"))
 	})
 
 	It("uses CAIB_BUILD_API_NAMESPACE when set", func() {
@@ -257,7 +258,7 @@ var _ = Describe("DefaultServerWithDerive", func() {
 		Expect(called).To(BeFalse(), "derivation should not be attempted when CAIB_SERVER is set")
 	})
 
-	It("returns saved config when CAIB_SERVER is empty, without calling derive", func() {
+	It("returns manually-saved config when CAIB_SERVER is empty, without calling derive", func() {
 		Expect(SaveServerURL("https://from-config.example.com")).To(Succeed())
 		writeJumpstarterConfig(tempDir, "grpc.lab.apps.example.com:443")
 
@@ -274,6 +275,94 @@ var _ = Describe("DefaultServerWithDerive", func() {
 
 		Expect(DefaultServerWithDerive()).To(Equal("https://from-config.example.com"))
 		Expect(called).To(BeFalse(), "derivation should not be attempted when saved config exists")
+	})
+
+	It("returns derived config when Jumpstarter endpoint still matches (cache hit)", func() {
+		// Simulate a previously-derived config that matches current Jumpstarter endpoint
+		Expect(saveConfig(&CLIConfig{
+			ServerURL:           "https://ado-build-api-automotive-dev-operator-system.apps.example.com",
+			DerivedFromEndpoint: "grpc.lab.apps.example.com:443",
+		})).To(Succeed())
+		writeJumpstarterConfig(tempDir, "grpc.lab.apps.example.com:443")
+
+		called := false
+		healthHTTPClient = &http.Client{
+			Transport: roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+				called = true
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(strings.NewReader("")),
+				}, nil
+			}),
+		}
+
+		Expect(DefaultServerWithDerive()).To(Equal("https://ado-build-api-automotive-dev-operator-system.apps.example.com"))
+		Expect(called).To(BeFalse(), "should use cached URL when Jumpstarter endpoint matches")
+	})
+
+	It("invalidates derived config when Jumpstarter endpoint changes", func() {
+		// Simulate a derived config from old cluster
+		Expect(saveConfig(&CLIConfig{
+			ServerURL:           "https://ado-build-api-automotive-dev-operator-system.apps.old-cluster.com",
+			DerivedFromEndpoint: "grpc.lab.apps.old-cluster.com:443",
+		})).To(Succeed())
+		// Current Jumpstarter config points to new cluster
+		writeJumpstarterConfig(tempDir, "grpc.lab.apps.new-cluster.com:443")
+
+		healthHTTPClient = &http.Client{
+			Transport: roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(strings.NewReader("")),
+				}, nil
+			}),
+		}
+
+		result := DefaultServerWithDerive()
+		Expect(result).To(Equal("https://ado-build-api-automotive-dev-operator-system.apps.new-cluster.com"))
+
+		// Verify new derivation was persisted with new source
+		cfg, err := Read()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(cfg.DerivedFromEndpoint).To(Equal("grpc.lab.apps.new-cluster.com:443"))
+	})
+
+	It("does not invalidate manually-set config even when Jumpstarter endpoint changes", func() {
+		// Manually set (no DerivedFromEndpoint)
+		Expect(SaveServerURL("https://manual-server.example.com")).To(Succeed())
+		writeJumpstarterConfig(tempDir, "grpc.lab.apps.different-cluster.com:443")
+
+		called := false
+		healthHTTPClient = &http.Client{
+			Transport: roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+				called = true
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(strings.NewReader("")),
+				}, nil
+			}),
+		}
+
+		Expect(DefaultServerWithDerive()).To(Equal("https://manual-server.example.com"))
+		Expect(called).To(BeFalse(), "manually-set URL should never be invalidated")
+	})
+
+	It("invalidates derived config when Jumpstarter config is removed", func() {
+		// Derived URL from a cluster that no longer has Jumpstarter config
+		Expect(saveConfig(&CLIConfig{
+			ServerURL:           "https://ado-build-api-automotive-dev-operator-system.apps.old-cluster.com",
+			DerivedFromEndpoint: "grpc.lab.apps.old-cluster.com:443",
+		})).To(Succeed())
+		// No Jumpstarter config written - simulates deletion/corruption
+
+		healthHTTPClient = &http.Client{
+			Transport: roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+				return nil, fmt.Errorf("connection refused")
+			}),
+		}
+
+		// Should not return stale URL; derivation runs but fails → empty
+		Expect(DefaultServerWithDerive()).To(BeEmpty())
 	})
 
 	It("falls through to Jumpstarter derivation when env and config are empty", func() {

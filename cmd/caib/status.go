@@ -101,7 +101,9 @@ func resolveServerWithSource() (string, string) {
 	cfg, err := config.Read()
 	if err == nil && cfg != nil {
 		if s := strings.TrimSpace(cfg.ServerURL); s != "" {
-			return s, "saved config (~/.config/caib/cli.json)"
+			if !config.IsDerivedAndStale(cfg) {
+				return s, "saved config (~/.config/caib/cli.json)"
+			}
 		}
 	}
 
