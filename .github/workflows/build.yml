@@ -26,6 +26,13 @@ jobs:
         steps:
             - uses: actions/checkout@v7
 
+            - name: Read operator version
+              run: |
+                  set -euo pipefail
+                  v=$(cat VERSION)
+                  [ -n "$v" ] || { echo "::error::VERSION file is empty"; exit 1; }
+                  echo "OPERATOR_VERSION=$v" >> "$GITHUB_ENV"
+
             - name: Set up Docker Buildx
               uses: docker/setup-buildx-action@v4
 
@@ -46,6 +53,8 @@ jobs:
                   tags: |
                       ${{ env.OPERATOR_IMAGE }}:${{ env.VERSION }}-arm64
                       ${{ env.OPERATOR_IMAGE }}:latest-arm64
+                  build-args: |
+                      VERSION=${{ env.OPERATOR_VERSION }}
                   cache-from: type=gha
                   cache-to: type=gha,mode=max
 
@@ -67,6 +76,13 @@ jobs:
         steps:
             - uses: actions/checkout@v7
 
+            - name: Read operator version
+              run: |
+                  set -euo pipefail
+                  v=$(cat VERSION)
+                  [ -n "$v" ] || { echo "::error::VERSION file is empty"; exit 1; }
+                  echo "OPERATOR_VERSION=$v" >> "$GITHUB_ENV"
+
             - name: Set up Docker Buildx
               uses: docker/setup-buildx-action@v4
 
@@ -87,6 +103,8 @@ jobs:
                   tags: |
                       ${{ env.OPERATOR_IMAGE }}:${{ env.VERSION }}-amd64
                       ${{ env.OPERATOR_IMAGE }}:latest-amd64
+                  build-args: |
+                      VERSION=${{ env.OPERATOR_VERSION }}
                   cache-from: type=gha
                   cache-to: type=gha,mode=max
 
