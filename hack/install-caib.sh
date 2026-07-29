@@ -46,12 +46,12 @@ esac
 ARTIFACT="caib-${VERSION}-${SUFFIX}.tar.gz"
 URL="https://github.com/${REPO}/releases/download/${VERSION}/${ARTIFACT}"
 CHECKSUMS_URL="https://github.com/${REPO}/releases/download/${VERSION}/checksums.txt"
-INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
+INSTALL_DIR="${INSTALL_DIR:-${HOME}/.local/bin}"
 
 if [ ! -d "$INSTALL_DIR" ]; then
-    echo "Error: Install directory does not exist: ${INSTALL_DIR}" >&2
-    echo "Please create it first or use an existing directory." >&2
-    exit 1
+    if ! mkdir -p "$INSTALL_DIR"; then
+        sudo mkdir -p "$INSTALL_DIR"
+    fi
 fi
 
 TMPDIR=$(mktemp -d)
