@@ -132,7 +132,7 @@ func NewImageCmd(opts Options) *cobra.Command {
 	buildCmd.Flags().StringVarP(opts.Architecture, "arch", "a", opts.GetDefaultArch(), "architecture (amd64, arm64)")
 	buildCmd.Flags().StringVar(opts.ContainerPush, "push", "", "push bootc container to registry (optional if --disk is used)")
 	buildCmd.Flags().BoolVar(opts.BuildDiskImage, "disk", false, "also build disk image from container")
-	buildCmd.Flags().StringVarP(opts.OutputDir, "output", "o", "", "download disk image to file from registry (implies --disk; requires --push-disk or --internal-registry)")
+	buildCmd.Flags().StringVarP(opts.OutputDir, "output", "o", "", "download disk image to file from registry (uses --disk and --internal-registry when no --push-disk given)")
 	buildCmd.Flags().StringVar(
 		opts.DiskFormat, "format", "", "disk image format (qcow2, raw, simg); inferred from output filename if not set",
 	)
@@ -200,7 +200,7 @@ func NewImageCmd(opts Options) *cobra.Command {
 	diskCmd.Flags().StringVar(opts.ServerURL, "server", defaultServer, "REST API server base URL")
 	diskCmd.Flags().StringVar(opts.AuthToken, "token", os.Getenv("CAIB_TOKEN"), "Bearer token for authentication")
 	diskCmd.Flags().StringVarP(opts.BuildName, "name", "n", "", "name for the build job (auto-generated if omitted)")
-	diskCmd.Flags().StringVarP(opts.OutputDir, "output", "o", "", "download disk image to file from registry (requires --push)")
+	diskCmd.Flags().StringVarP(opts.OutputDir, "output", "o", "", "download disk image to file from registry (uses --internal-registry when no --push given)")
 	diskCmd.Flags().StringVar(
 		opts.DiskFormat, "format", "", "disk image format (qcow2, raw, simg); inferred from output filename if not set",
 	)
@@ -249,7 +249,7 @@ func NewImageCmd(opts Options) *cobra.Command {
 	buildDevCmd.Flags().StringVarP(opts.Architecture, "arch", "a", opts.GetDefaultArch(), "architecture (amd64, arm64)")
 	buildDevCmd.Flags().StringVar(opts.Mode, "mode", "package", "build mode: image (ostree) or package (package-based)")
 	buildDevCmd.Flags().StringVar(opts.ExportFormat, "format", "", "export format: qcow2, raw, simg, etc.")
-	buildDevCmd.Flags().StringVarP(opts.OutputDir, "output", "o", "", "download artifact to file from registry (requires --push)")
+	buildDevCmd.Flags().StringVarP(opts.OutputDir, "output", "o", "", "download artifact to file from registry (uses --internal-registry when no --push given)")
 	buildDevCmd.Flags().StringVar(opts.CompressionAlgo, "compress", "gzip", "compression algorithm (gzip, lz4, xz)")
 	buildDevCmd.Flags().StringVar(opts.ExportOCI, "push", "", "push disk image as OCI artifact to registry")
 	buildDevCmd.Flags().StringVar(

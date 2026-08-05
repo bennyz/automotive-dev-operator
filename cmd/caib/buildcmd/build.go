@@ -151,17 +151,30 @@ func (h *Handler) applyWaitFollowDefaults(cmd *cobra.Command, defaultWait bool) 
 	}
 }
 
+// validateRegistryFlags auto-enables --internal-registry when --output is specified
+// without a push destination, then validates mutual exclusion and output-requires-push.
+func (h *Handler) validateRegistryFlags(pushFlagName, suggestion string) error {
+	if *h.opts.OutputDir != "" && *h.opts.ExportOCI == "" && !*h.opts.UseInternalRegistry {
+		*h.opts.UseInternalRegistry = true
+	}
+	if *h.opts.UseInternalRegistry && *h.opts.ExportOCI != "" {
+		return common.NewActionableError(
+			fmt.Errorf("--internal-registry cannot be used with %s", pushFlagName),
+			suggestion,
+		)
+	}
+	if !*h.opts.UseInternalRegistry {
+		if err := common.ValidateOutputRequiresPush(*h.opts.OutputDir, *h.opts.ExportOCI, pushFlagName); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // validateBootcBuildFlags validates flag combinations for the build command.
 func (h *Handler) validateBootcBuildFlags() error {
 	if strings.TrimSpace(*h.opts.ServerURL) == "" {
 		return common.ServerURLRequiredError("caib image build --server <server-url>")
-	}
-
-	if *h.opts.UseInternalRegistry && *h.opts.ExportOCI != "" {
-		return common.NewActionableError(
-			fmt.Errorf("--internal-registry cannot be used with --push-disk"),
-			fmt.Sprintf("caib image build -m %s --push-disk %s", *h.opts.Manifest, *h.opts.ExportOCI),
-		)
 	}
 
 	if *h.opts.OutputDir != "" && !*h.opts.BuildDiskImage {
@@ -173,10 +186,9 @@ func (h *Handler) validateBootcBuildFlags() error {
 	if *h.opts.FlashAfterBuild && !*h.opts.BuildDiskImage {
 		*h.opts.BuildDiskImage = true
 	}
-	if !*h.opts.UseInternalRegistry {
-		if err := common.ValidateOutputRequiresPush(*h.opts.OutputDir, *h.opts.ExportOCI, "--push-disk"); err != nil {
-			return err
-		}
+	if err := h.validateRegistryFlags("--push-disk",
+		fmt.Sprintf("caib image build -m %s --push-disk %s", *h.opts.Manifest, *h.opts.ExportOCI)); err != nil {
+		return err
 	}
 
 	if err := h.validateReproducibleFlags(); err != nil {
@@ -914,20 +926,13 @@ func (h *Handler) RunBuildDev(cmd *cobra.Command, args []string) {
 		return
 	}
 
-	if err := h.validateReproducibleFlags(); err != nil {
+	if err := h.validateRegistryFlags("--push",
+		fmt.Sprintf("caib image build-dev --push %s %s", *h.opts.ExportOCI, manifestPath)); err != nil {
 		h.handleError(err)
 		return
 	}
 
-	if *h.opts.UseInternalRegistry {
-		if *h.opts.ExportOCI != "" {
-			h.handleError(common.NewActionableError(
-				fmt.Errorf("--internal-registry cannot be used with --push"),
-				fmt.Sprintf("caib image build-dev --push %s %s", *h.opts.ExportOCI, manifestPath),
-			))
-			return
-		}
-	} else if err := common.ValidateOutputRequiresPush(*h.opts.OutputDir, *h.opts.ExportOCI, "--push"); err != nil {
+	if err := h.validateReproducibleFlags(); err != nil {
 		h.handleError(err)
 		return
 	}
