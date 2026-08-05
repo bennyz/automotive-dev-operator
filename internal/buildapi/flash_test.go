@@ -208,6 +208,33 @@ var _ = Describe("Flash", func() {
 			Expect(resp.Phase).To(Equal(phaseRunning))
 			Expect(resp.RequestedBy).To(Equal("alice"))
 		})
+
+		It("should return lease ID for completed flash TaskRun", func() {
+			tr := newFlashTaskRun("my-flash", "alice", "completed")
+			tr.Status.Results = []tektonv1.TaskRunResult{
+				{
+					Name:  "lease-id",
+					Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: "lease-abc123"},
+				},
+			}
+			fakeClient := newFakeClient(tr)
+			getClientFromRequestFn = func(_ *gin.Context) (ctrlclient.Client, error) {
+				return fakeClient, nil
+			}
+
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request, _ = http.NewRequest(http.MethodGet, "/v1/flashes/my-flash", nil)
+
+			server.getFlash(c, "my-flash")
+
+			Expect(w.Code).To(Equal(http.StatusOK))
+			var resp FlashResponse
+			Expect(json.Unmarshal(w.Body.Bytes(), &resp)).To(Succeed())
+			Expect(resp.Name).To(Equal("my-flash"))
+			Expect(resp.Phase).To(Equal(phaseCompleted))
+			Expect(resp.LeaseID).To(Equal("lease-abc123"))
+		})
 	})
 
 	Context("listFlash", func() {

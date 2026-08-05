@@ -307,7 +307,17 @@ func (a *APIServer) getFlash(c *gin.Context, name string) {
 		StartTime:      startStr,
 		CompletionTime: compStr,
 		TaskRunName:    taskRun.Name,
+		LeaseID:        extractTaskRunResult(taskRun, "lease-id"),
 	})
+}
+
+func extractTaskRunResult(tr *tektonv1.TaskRun, name string) string {
+	for _, result := range tr.Status.Results {
+		if result.Name == name {
+			return result.Value.StringVal
+		}
+	}
+	return ""
 }
 
 func getTaskRunStatus(tr *tektonv1.TaskRun) (phase, message string) {

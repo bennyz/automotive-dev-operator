@@ -269,6 +269,7 @@ type FlashResponse struct {
 	StartTime      string `json:"startTime,omitempty"`
 	CompletionTime string `json:"completionTime,omitempty"`
 	TaskRunName    string `json:"taskRunName,omitempty"`
+	LeaseID        string `json:"leaseId,omitempty"`
 }
 
 // FlashListItem represents a flash TaskRun in the list API

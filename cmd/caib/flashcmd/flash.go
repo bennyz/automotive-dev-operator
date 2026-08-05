@@ -286,7 +286,12 @@ func (h *Handler) waitForFlashCompletion(ctx context.Context, _ *buildapiclient.
 			}
 
 			if st.Phase == phaseCompleted {
-				clilog.Infoln("Flash completed successfully!")
+				if st.LeaseID != "" {
+					clilog.Infof("Flash completed successfully! Lease: %s\n", st.LeaseID)
+					clilog.Infof("Connect with: jmp shell --lease %s\n", st.LeaseID)
+				} else {
+					clilog.Infoln("Flash completed successfully!")
+				}
 				return
 			}
 			if st.Phase == phaseFailed {
