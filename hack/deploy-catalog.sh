@@ -368,23 +368,6 @@ entries:
 EOF
 ./bin/opm render bundle/ --output yaml >> catalog/automotive-dev-operator.yaml
 
-# Add openshift-pipelines dependency (opm render doesn't include dependencies.yaml)
-# Use awk for portable multi-line insertion after the olm.package version line
-awk '
-/^- type: olm\.package$/ { in_pkg=1 }
-in_pkg && /version:/ {
-    print
-    print "- type: olm.package.required"
-    print "  value:"
-    print "    packageName: openshift-pipelines-operator-rh"
-    print "    versionRange: \">=1.12.0\""
-    in_pkg=0
-    next
-}
-{ print }
-' catalog/automotive-dev-operator.yaml > catalog/automotive-dev-operator.yaml.tmp
-mv catalog/automotive-dev-operator.yaml.tmp catalog/automotive-dev-operator.yaml
-
 # Update bundle image reference to internal registry (handles both empty and existing image refs)
 sed -i.bak "s|^image:.*|image: ${BUNDLE_IMG_INTERNAL}|g" catalog/automotive-dev-operator.yaml
 rm -f catalog/automotive-dev-operator.yaml.bak
