@@ -317,11 +317,3 @@ func TestValueOrDash(t *testing.T) {
 		}
 	}
 }
-
-func TestFormatAge(t *testing.T) {
-	// non-RFC3339 input should be returned as-is
-	got := formatAge("not-a-date")
-	if got != "not-a-date" {
-		t.Errorf("formatAge(invalid) = %q, want %q", got, "not-a-date")
-	}
-}

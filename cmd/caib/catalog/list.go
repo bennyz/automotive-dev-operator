@@ -20,17 +20,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math"
 	"net/http"
 	"net/url"
 	"os"
 	"strings"
 	"text/tabwriter"
-	"time"
 
+	caibcommon "github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/common"
 	"github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/config"
 	"github.com/spf13/cobra"
-	"gopkg.in/yaml.v3"
 )
 
 var (
@@ -192,22 +190,18 @@ func runList(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("failed to parse response: %w", err)
 	}
 
-	// Output in requested format
-	format := strings.ToLower(strings.TrimSpace(getOutputFormat(cmd)))
-	switch format {
-	case "json":
-		output, _ := json.MarshalIndent(result, "", "  ")
-		fmt.Println(string(output))
-	case "yaml", "yml":
-		output, _ := yaml.Marshal(result)
-		fmt.Println(string(output))
-	case outputFormatTable:
-		printTable(result.Items, listTags != "")
-	default:
-		return fmt.Errorf("invalid output format %q (supported: table, json, yaml)", format)
+	rawFormat := getOutputFormat(cmd)
+	format, fmtErr := caibcommon.ResolveOutputFormat(&rawFormat)
+	if fmtErr != nil {
+		return fmtErr
 	}
 
-	return nil
+	var renderErr error
+	caibcommon.RenderFormatted(format, result, func() error {
+		printTable(result.Items, listTags != "")
+		return nil
+	}, func(err error) { renderErr = err })
+	return renderErr
 }
 
 func printTable(items []CatalogImageResponse, tagsFiltered bool) {
@@ -239,7 +233,7 @@ func printTable(items []CatalogImageResponse, tagsFiltered bool) {
 			target = img.Targets[0].Name
 		}
 
-		age := formatAge(img.CreatedAt)
+		age := caibcommon.FormatAge(img.CreatedAt)
 
 		if tagsFiltered {
 			if _, err := fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
@@ -276,34 +270,4 @@ func printTable(items []CatalogImageResponse, tagsFiltered bool) {
 
 	_, _ = fmt.Fprintf(w, "\n")
 	_, _ = fmt.Fprintf(os.Stderr, "%d image(s)\n", len(items))
-}
-
-// formatAge converts an RFC3339 timestamp to a human-readable relative duration.
-func formatAge(timestamp string) string {
-	t, err := time.Parse(time.RFC3339, timestamp)
-	if err != nil {
-		return timestamp
-	}
-
-	d := time.Since(t)
-	if d < 0 {
-		return "future"
-	}
-
-	switch {
-	case d < time.Minute:
-		return fmt.Sprintf("%ds", int(d.Seconds()))
-	case d < time.Hour:
-		return fmt.Sprintf("%dm", int(d.Minutes()))
-	case d < 24*time.Hour:
-		return fmt.Sprintf("%dh", int(d.Hours()))
-	case d < 30*24*time.Hour:
-		return fmt.Sprintf("%dd", int(math.Floor(d.Hours()/24)))
-	default:
-		months := int(math.Floor(d.Hours() / (24 * 30)))
-		if months < 12 {
-			return fmt.Sprintf("%dmo", months)
-		}
-		return fmt.Sprintf("%dy", int(math.Floor(d.Hours()/(24*365))))
-	}
 }

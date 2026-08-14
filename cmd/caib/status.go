@@ -2,7 +2,6 @@ package main
 
 import (
 	"crypto/tls"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -10,10 +9,10 @@ import (
 	"text/tabwriter"
 	"time"
 
+	caibcommon "github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/common"
 	"github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/config"
 	"github.com/fatih/color"
 	"github.com/spf13/cobra"
-	"gopkg.in/yaml.v3"
 )
 
 const (
@@ -54,28 +53,17 @@ type serverInfo struct {
 }
 
 func runStatus(_ *cobra.Command, _ []string) {
-	info := gatherStatus()
-
-	switch strings.ToLower(statusOutputFormat) {
-	case "json":
-		out, err := json.MarshalIndent(info, "", "  ")
-		if err != nil {
-			handleError(fmt.Errorf("error rendering JSON: %w", err))
-			return
-		}
-		fmt.Println(string(out))
-	case "yaml", "yml":
-		out, err := yaml.Marshal(info)
-		if err != nil {
-			handleError(fmt.Errorf("error rendering YAML: %w", err))
-			return
-		}
-		fmt.Print(string(out))
-	case "table":
-		printStatusTable(info)
-	default:
-		handleError(fmt.Errorf("invalid output format %q (supported: table, json, yaml)", statusOutputFormat))
+	format, err := caibcommon.ResolveOutputFormat(&statusOutputFormat)
+	if err != nil {
+		handleError(err)
+		return
 	}
+
+	info := gatherStatus()
+	caibcommon.RenderFormatted(format, info, func() error {
+		printStatusTable(info)
+		return nil
+	}, handleError)
 }
 
 func gatherStatus() statusInfo {

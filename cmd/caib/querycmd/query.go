@@ -7,7 +7,6 @@ import (
 	"os"
 	"strings"
 	"text/tabwriter"
-	"time"
 
 	common "github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/common"
 	buildapitypes "github.com/centos-automotive-suite/automotive-dev-operator/internal/buildapi"
@@ -220,7 +219,7 @@ func printBuildList(items []buildapitypes.BuildListItem) error {
 			"%s\t%s\t%s\t%s\t%s\n",
 			it.Name,
 			it.Phase,
-			formatAge(it.CreatedAt),
+			common.FormatAge(it.CreatedAt),
 			it.RequestedBy,
 			artifact,
 		); err != nil {
@@ -282,22 +281,4 @@ func valueOrDash(v string) string {
 		return "-"
 	}
 	return v
-}
-
-func formatAge(rfcTime string) string {
-	t, err := time.Parse(time.RFC3339, rfcTime)
-	if err != nil {
-		return rfcTime
-	}
-	d := time.Since(t)
-	switch {
-	case d < time.Minute:
-		return fmt.Sprintf("%ds", int(d.Seconds()))
-	case d < time.Hour:
-		return fmt.Sprintf("%dm", int(d.Minutes()))
-	case d < 24*time.Hour:
-		return fmt.Sprintf("%dh", int(d.Hours()))
-	default:
-		return fmt.Sprintf("%dd", int(d.Hours()/24))
-	}
 }
