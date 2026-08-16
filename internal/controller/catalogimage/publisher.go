@@ -22,6 +22,7 @@ import (
 
 	"github.com/containers/image/v5/types"
 	"github.com/go-logr/logr"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -104,8 +105,8 @@ type PublishResult struct {
 }
 
 // Publish creates or updates a CatalogImage and optionally verifies registry accessibility.
-// When a CatalogImage with the same registry URL already exists (common for scheduled builds
-// that push to a fixed tag), the existing entry is updated with the new build's metadata.
+// Existing entries are resolved by stable name first, then by registry URL (fixed-tag
+// scheduled builds). A URL match under a different name is re-homed to opts.Name.
 func (p *Publisher) Publish(ctx context.Context, opts PublishOptions) (*PublishResult, error) {
 	log := p.log.WithValues("name", opts.Name, "namespace", opts.Namespace, "registryURL", opts.RegistryURL)
 	log.Info("Publishing image to catalog")
@@ -121,7 +122,7 @@ func (p *Publisher) Publish(ctx context.Context, opts PublishOptions) (*PublishR
 		}
 	}
 
-	catalogImage, err := p.findExistingByRegistryURL(ctx, opts.Namespace, opts.RegistryURL)
+	catalogImage, stale, err := p.resolveExisting(ctx, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -137,9 +138,30 @@ func (p *Publisher) Publish(ctx context.Context, opts PublishOptions) (*PublishR
 		catalogImage = p.buildCatalogImage(opts)
 
 		if err := p.client.Create(ctx, catalogImage); err != nil {
-			return nil, fmt.Errorf("failed to create CatalogImage: %w", err)
+			if !apierrors.IsAlreadyExists(err) {
+				return nil, fmt.Errorf("failed to create CatalogImage: %w", err)
+			}
+			existing := &automotivev1alpha1.CatalogImage{}
+			if getErr := p.client.Get(ctx, client.ObjectKey{Name: opts.Name, Namespace: opts.Namespace}, existing); getErr != nil {
+				return nil, fmt.Errorf("failed to create CatalogImage: %w", err)
+			}
+			p.updateCatalogImage(existing, opts)
+			if updErr := p.client.Update(ctx, existing); updErr != nil {
+				return nil, fmt.Errorf("failed to update CatalogImage: %w", updErr)
+			}
+			catalogImage = existing
+			log.Info("Updated existing CatalogImage after create conflict", "name", catalogImage.Name, "verified", verified)
+		} else {
+			log.Info("Successfully created CatalogImage", "verified", verified)
 		}
-		log.Info("Successfully created CatalogImage", "verified", verified)
+	}
+
+	if stale != nil && stale.Name != catalogImage.Name {
+		if delErr := p.client.Delete(ctx, stale); delErr != nil && !apierrors.IsNotFound(delErr) {
+			log.Error(delErr, "Failed to delete stale CatalogImage after re-home", "staleName", stale.Name)
+		} else {
+			log.Info("Deleted stale CatalogImage after re-home", "staleName", stale.Name, "name", catalogImage.Name)
+		}
 	}
 
 	if p.auditRecorder != nil {
@@ -241,6 +263,44 @@ func (p *Publisher) PublishFromImageBuild(
 	})
 }
 
+// resolveExisting finds a CatalogImage to update. Prefer the stable name; fall back to
+// registry URL. A URL match with a different name is returned as stale so Publish can
+// create/update opts.Name and delete the leftover.
+func (p *Publisher) resolveExisting(
+	ctx context.Context,
+	opts PublishOptions,
+) (current *automotivev1alpha1.CatalogImage, stale *automotivev1alpha1.CatalogImage, err error) {
+	var named *automotivev1alpha1.CatalogImage
+	if opts.Name != "" {
+		got := &automotivev1alpha1.CatalogImage{}
+		getErr := p.client.Get(ctx, client.ObjectKey{Name: opts.Name, Namespace: opts.Namespace}, got)
+		if getErr == nil {
+			named = got
+		} else if client.IgnoreNotFound(getErr) != nil {
+			return nil, nil, fmt.Errorf("failed to get catalog image %s: %w", opts.Name, getErr)
+		}
+	}
+
+	byURL, err := p.findExistingByRegistryURL(ctx, opts.Namespace, opts.RegistryURL)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if named != nil {
+		if byURL != nil && byURL.Name != named.Name {
+			return named, byURL, nil
+		}
+		return named, nil, nil
+	}
+	if byURL != nil {
+		if opts.Name != "" && byURL.Name != opts.Name {
+			return nil, byURL, nil
+		}
+		return byURL, nil, nil
+	}
+	return nil, nil, nil
+}
+
 // findExistingByRegistryURL returns an existing CatalogImage with the same registry URL, or nil.
 func (p *Publisher) findExistingByRegistryURL(ctx context.Context, namespace, registryURL string) (*automotivev1alpha1.CatalogImage, error) {
 	lister := NewCatalogImageLister(p.client)
@@ -256,6 +316,7 @@ func (p *Publisher) findExistingByRegistryURL(ctx context.Context, namespace, re
 
 // updateCatalogImage applies new PublishOptions to an existing CatalogImage.
 func (p *Publisher) updateCatalogImage(catalogImage *automotivev1alpha1.CatalogImage, opts PublishOptions) {
+	catalogImage.Spec.RegistryURL = opts.RegistryURL
 	catalogImage.Spec.Digest = opts.Digest
 	catalogImage.Spec.Tags = opts.Tags
 	catalogImage.Spec.AuthSecretRef = opts.AuthSecretRef

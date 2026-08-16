@@ -22,6 +22,7 @@ import (
 
 	"github.com/containers/image/v5/types"
 	"github.com/go-logr/logr"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -180,14 +181,20 @@ func TestPublish_UpdatesExistingOnDuplicateRegistryURL(t *testing.T) {
 		t.Fatalf("Publish() error: %v", err)
 	}
 
-	if result.CatalogImage.Name != "old-build-xyz" {
-		t.Errorf("expected existing CatalogImage name %q, got %q", "old-build-xyz", result.CatalogImage.Name)
+	if result.CatalogImage.Name != "new-build-abc" {
+		t.Errorf("expected CatalogImage re-homed to %q, got %q", "new-build-abc", result.CatalogImage.Name)
 	}
 	if len(result.CatalogImage.Spec.Tags) != 1 || result.CatalogImage.Spec.Tags[0] != "updated-tag" {
 		t.Errorf("expected tags [updated-tag], got %v", result.CatalogImage.Spec.Tags)
 	}
 	if result.CatalogImage.Spec.Metadata.Architecture != "aarch64" {
 		t.Errorf("expected arch aarch64, got %q", result.CatalogImage.Spec.Metadata.Architecture)
+	}
+
+	stale := &automotivev1alpha1.CatalogImage{}
+	err = pub.client.Get(context.Background(), client.ObjectKey{Name: "old-build-xyz", Namespace: "default"}, stale)
+	if !apierrors.IsNotFound(err) {
+		t.Errorf("expected stale CatalogImage to be deleted, got err=%v", err)
 	}
 }
 

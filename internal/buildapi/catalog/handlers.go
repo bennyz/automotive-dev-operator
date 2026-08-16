@@ -32,8 +32,10 @@ import (
 )
 
 const (
-	sortByCreated = "created"
-	sortByName    = "name"
+	sortByCreated    = "created"
+	sortByName       = "name"
+	phaseAll         = "all"
+	defaultListPhase = string(automotivev1alpha1.CatalogImagePhaseAvailable)
 )
 
 // Handler handles catalog API requests
@@ -65,11 +67,10 @@ func (h *Handler) HandleListCatalogImages(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid query parameters", "details": err.Error()})
 		return
 	}
+	normalizeListParams(&params)
 
 	// Build list options
-	listOpts := []client.ListOption{}
-
-	listOpts = append(listOpts, client.InNamespace(h.defaultNamespace))
+	listOpts := []client.ListOption{client.InNamespace(h.defaultNamespace)}
 
 	// Build label selector for filtering
 	labelRequirements := []string{}
@@ -100,7 +101,7 @@ func (h *Handler) HandleListCatalogImages(c *gin.Context) {
 		return
 	}
 
-	needsPostProcessing := params.Sort != "" || params.Latest
+	needsPostProcessing := listNeedsPostProcessing(params)
 
 	if !needsPostProcessing {
 		listOpts = append(listOpts, client.Limit(int64(effectiveLimit(params.Limit))))
@@ -365,6 +366,32 @@ func effectiveLimit(limit int) int {
 	return 20
 }
 
+//go:fix inline
+func boolPtr(v bool) *bool { return new(v) }
+
+func latestEnabled(params ListQueryParams) bool {
+	if params.Latest == nil {
+		return true
+	}
+	return *params.Latest
+}
+
+func normalizeListParams(params *ListQueryParams) {
+	if params.Phase == "" {
+		params.Phase = defaultListPhase
+	}
+	if strings.EqualFold(params.Phase, phaseAll) {
+		params.Phase = ""
+	}
+	if params.Latest == nil {
+		params.Latest = new(true)
+	}
+}
+
+func listNeedsPostProcessing(params ListQueryParams) bool {
+	return params.Sort != "" || latestEnabled(params) || params.Phase != "" || params.Tags != ""
+}
+
 func postFilterAndSort(items []automotivev1alpha1.CatalogImage, params ListQueryParams) []automotivev1alpha1.CatalogImage {
 	if params.Phase != "" {
 		filtered := []automotivev1alpha1.CatalogImage{}
@@ -387,7 +414,7 @@ func postFilterAndSort(items []automotivev1alpha1.CatalogImage, params ListQuery
 		items = filtered
 	}
 
-	if params.Latest {
+	if latestEnabled(params) {
 		sort.Slice(items, func(i, j int) bool {
 			return items[i].CreationTimestamp.After(items[j].CreationTimestamp.Time)
 		})

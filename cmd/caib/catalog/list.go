@@ -39,6 +39,7 @@ var (
 	listTags         string
 	listSort         string
 	listLatest       bool
+	listAll          bool
 	listLimit        int
 )
 
@@ -47,8 +48,9 @@ func newListCmd() *cobra.Command {
 		Use:   "list",
 		Short: "List images in the catalog",
 		Long: `List images in the catalog with optional filtering by architecture, distribution,
-target, and phase. Use --latest to show only the newest image per schedule
-(or per distro/arch/target group for non-scheduled images).`,
+target, and phase. By default the API returns Available heads (newest per schedule,
+or per distro/arch/target for unscheduled images). Use --all to list every catalog
+image regardless of phase.`,
 		RunE: runList,
 	}
 
@@ -56,10 +58,11 @@ target, and phase. Use --latest to show only the newest image per schedule
 	cmd.Flags().StringVar(&listArchitecture, "architecture", "", "Filter by architecture (amd64, arm64)")
 	cmd.Flags().StringVar(&listDistro, "distro", "", "Filter by distribution (cs9, autosd10-sig)")
 	cmd.Flags().StringVar(&listTarget, "target", "", "Filter by hardware target (qemu, raspberry-pi)")
-	cmd.Flags().StringVar(&listPhase, "phase", "", "Filter by phase (Available, Unavailable, etc)")
+	cmd.Flags().StringVar(&listPhase, "phase", "", "Filter by phase (Available, Unavailable, Failed, all)")
 	cmd.Flags().StringVar(&listTags, "tags", "", "Filter by tags (comma-separated)")
 	cmd.Flags().StringVar(&listSort, "sort", "created", "Sort order: created (newest first), name")
-	cmd.Flags().BoolVar(&listLatest, "latest", false, "Show only the latest image per schedule or distro/arch/target group")
+	cmd.Flags().BoolVar(&listLatest, "latest", false, "Show only the latest image per schedule or distro/arch/target group (API default)")
+	cmd.Flags().BoolVar(&listAll, "all", false, "List all catalog images (all phases, not only latest heads)")
 	cmd.Flags().IntVar(&listLimit, "limit", 20, "Maximum results to show")
 
 	return cmd
@@ -130,8 +133,16 @@ func runList(cmd *cobra.Command, _ []string) error {
 	if listTarget != "" {
 		params.Set("target", listTarget)
 	}
-	if listPhase != "" {
-		params.Set("phase", listPhase)
+	if listAll {
+		params.Set("phase", "all")
+		params.Set("latest", "false")
+	} else {
+		if listPhase != "" {
+			params.Set("phase", listPhase)
+		}
+		if listLatest {
+			params.Set("latest", "true")
+		}
 	}
 	if listTags != "" {
 		params.Set("tags", listTags)
@@ -141,9 +152,6 @@ func runList(cmd *cobra.Command, _ []string) error {
 			return fmt.Errorf("invalid --sort value %q (supported: created, name)", listSort)
 		}
 		params.Set("sort", listSort)
-	}
-	if listLatest {
-		params.Set("latest", "true")
 	}
 	if listLimit > 0 {
 		params.Set("limit", fmt.Sprintf("%d", listLimit))
