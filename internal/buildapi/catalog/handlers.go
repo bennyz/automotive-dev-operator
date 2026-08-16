@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/go-logr/logr"
@@ -366,9 +367,6 @@ func effectiveLimit(limit int) int {
 	return 20
 }
 
-//go:fix inline
-func boolPtr(v bool) *bool { return new(v) }
-
 func latestEnabled(params ListQueryParams) bool {
 	if params.Latest == nil {
 		return true
@@ -416,7 +414,7 @@ func postFilterAndSort(items []automotivev1alpha1.CatalogImage, params ListQuery
 
 	if latestEnabled(params) {
 		sort.Slice(items, func(i, j int) bool {
-			return items[i].CreationTimestamp.After(items[j].CreationTimestamp.Time)
+			return catalogTime(items[i]).After(catalogTime(items[j]))
 		})
 		seen := map[string]bool{}
 		filtered := []automotivev1alpha1.CatalogImage{}
@@ -437,7 +435,7 @@ func postFilterAndSort(items []automotivev1alpha1.CatalogImage, params ListQuery
 	switch sortBy {
 	case sortByCreated:
 		sort.Slice(items, func(i, j int) bool {
-			return items[i].CreationTimestamp.After(items[j].CreationTimestamp.Time)
+			return catalogTime(items[i]).After(catalogTime(items[j]))
 		})
 	case sortByName:
 		sort.Slice(items, func(i, j int) bool {
@@ -461,6 +459,15 @@ func latestGroupKey(img *automotivev1alpha1.CatalogImage) string {
 		return "name:" + img.Name
 	}
 	return distro + "/" + arch + "/" + target
+}
+
+// catalogTime is when the catalog row last became the published head.
+// Overwrite-in-place does not bump creationTimestamp.
+func catalogTime(img automotivev1alpha1.CatalogImage) time.Time {
+	if img.Status.PublishedAt != nil && !img.Status.PublishedAt.Time.IsZero() {
+		return img.Status.PublishedAt.Time
+	}
+	return img.CreationTimestamp.Time
 }
 
 // hasAllTags checks if the image has all the requested tags

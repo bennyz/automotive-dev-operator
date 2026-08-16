@@ -87,6 +87,7 @@ type CatalogImageResponse struct {
 	Architecture     string            `json:"architecture,omitempty"`
 	Distro           string            `json:"distro,omitempty"`
 	Targets          []Target          `json:"targets,omitempty"`
+	Digest           string            `json:"digest,omitempty"`
 	Tags             []string          `json:"tags,omitempty"`
 	SourceType       string            `json:"sourceType,omitempty"`
 	SourceImageBuild string            `json:"sourceImageBuild,omitempty"`
@@ -97,6 +98,7 @@ type CatalogImageResponse struct {
 	SizeBytes        int64             `json:"sizeBytes,omitempty"`
 	DownloadURL      string            `json:"downloadUrl,omitempty"`
 	CreatedAt        string            `json:"createdAt"`
+	PublishedAt      string            `json:"publishedAt,omitempty"`
 	StatusReason     string            `json:"statusReason,omitempty"`
 	StatusMessage    string            `json:"statusMessage,omitempty"`
 }
@@ -241,7 +243,7 @@ func printTable(items []CatalogImageResponse, tagsFiltered bool) {
 			target = img.Targets[0].Name
 		}
 
-		age := caibcommon.FormatAge(img.CreatedAt)
+		age := caibcommon.FormatAge(catalogAgeTimestamp(img.CreatedAt, img.PublishedAt))
 
 		if tagsFiltered {
 			if _, err := fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
@@ -278,4 +280,11 @@ func printTable(items []CatalogImageResponse, tagsFiltered bool) {
 
 	_, _ = fmt.Fprintf(w, "\n")
 	_, _ = fmt.Fprintf(os.Stderr, "%d image(s)\n", len(items))
+}
+
+func catalogAgeTimestamp(createdAt, publishedAt string) string {
+	if publishedAt != "" {
+		return publishedAt
+	}
+	return createdAt
 }
