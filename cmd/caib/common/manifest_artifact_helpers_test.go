@@ -495,3 +495,76 @@ func TestExpandSourceGlob_AbsolutePattern(t *testing.T) {
 		t.Errorf("expected absolute path for absolute pattern, got %q", files[0])
 	}
 }
+
+func TestFindLocalFileReferencesForWorkspaceBuild_SkipsClusterPaths(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "local.bin"), []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	manifest := `
+content:
+  add_files:
+    - path: /usr/bin/app
+      source_path: /workspace/src/build/app
+    - path: /usr/bin/local
+      source_path: local.bin
+    - dest: /etc/
+      source_glob: /workspace/src/etc/**/*.conf
+`
+	refs, err := FindLocalFileReferencesForWorkspaceBuild(manifest, dir)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(refs) != 1 {
+		t.Fatalf("expected 1 laptop ref, got %d: %v", len(refs), refs)
+	}
+	if refs[0]["source_path"] != "local.bin" {
+		t.Errorf("source_path = %q, want local.bin", refs[0]["source_path"])
+	}
+}
+
+func TestFindLocalFileReferencesForWorkspaceBuild_KeepsRelativeWorkspaceNames(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "workspace"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "workspace", "file"), []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "dotfile"), []byte("y"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	manifest := `
+content:
+  add_files:
+    - path: /usr/bin/rel
+      source_path: workspace/file
+    - path: /usr/bin/dot
+      source_path: ./workspace/file
+    - path: /usr/bin/cluster
+      source_path: /workspace/src/app
+`
+	refs, err := FindLocalFileReferencesForWorkspaceBuild(manifest, dir)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(refs) != 2 {
+		t.Fatalf("expected 2 laptop refs, got %d: %v", len(refs), refs)
+	}
+}
+
+func TestFindLocalFileReferences_DoesNotSkipWorkspaceWithoutFlag(t *testing.T) {
+	manifest := `
+content:
+  add_files:
+    - path: /usr/bin/app
+      source_path: /workspace/src/build/app
+`
+	refs, err := FindLocalFileReferences(manifest, "/tmp")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(refs) != 1 {
+		t.Fatalf("expected 1 ref when not excluding workspace paths, got %d", len(refs))
+	}
+}

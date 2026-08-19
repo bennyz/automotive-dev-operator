@@ -593,7 +593,7 @@ func TestCopyFileToPodStreamsRawBytesWithNoTarCommand(t *testing.T) {
 	wantCmd := []string{
 		"/bin/sh",
 		"-c",
-		"mkdir -p \"$(dirname \"$1\")\" && cat > \"$1\" && chmod 0600 \"$1\"",
+		"mkdir -p \"$(dirname \"$1\")\" && tmp=\"$1.part.$$\" && cat > \"$tmp\" && chmod 0600 \"$tmp\" && mv -f \"$tmp\" \"$1\"",
 		"--",
 		"/workspace/shared/configs/app.conf",
 	}

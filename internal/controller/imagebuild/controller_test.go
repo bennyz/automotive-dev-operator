@@ -2,10 +2,15 @@ package imagebuild
 
 import (
 	"context"
+	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	automotivev1alpha1 "github.com/centos-automotive-suite/automotive-dev-operator/api/v1alpha1"
+	"github.com/centos-automotive-suite/automotive-dev-operator/internal/buildapi"
+	"github.com/centos-automotive-suite/automotive-dev-operator/internal/common/labels"
 	"github.com/centos-automotive-suite/automotive-dev-operator/internal/common/tasks"
 	controllerutils "github.com/centos-automotive-suite/automotive-dev-operator/internal/controller/controllerutils"
 	"github.com/go-logr/logr"
@@ -18,8 +23,10 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/record"
 	knativev1 "knative.dev/pkg/apis/duck/v1"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -1022,6 +1029,397 @@ func newTestReconciler(objs ...client.Object) *ImageBuildReconciler {
 		Client:   builder.Build(),
 		Scheme:   scheme,
 		Recorder: record.NewEventRecorderAdapter(record.NewFakeRecorder(100)),
+	}
+}
+
+func TestHandleUploadingState_ClientSkipsUploadsWithoutHydrate(t *testing.T) {
+	ib := &automotivev1alpha1.ImageBuild{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "skip-uploads",
+			Namespace:         "test-ns",
+			CreationTimestamp: metav1.Now(),
+			Annotations: map[string]string{
+				labels.ClientSkipsUploads: labels.ValueTrue,
+			},
+		},
+		Status: automotivev1alpha1.ImageBuildStatus{
+			Phase:   "Uploading",
+			Message: "Waiting for file uploads",
+		},
+	}
+	r := newTestReconciler(ib)
+
+	if _, err := r.handleUploadingState(context.Background(), ib); err != nil {
+		t.Fatalf("handleUploadingState() error: %v", err)
+	}
+
+	fresh := &automotivev1alpha1.ImageBuild{}
+	if err := r.Get(context.Background(), types.NamespacedName{Name: "skip-uploads", Namespace: "test-ns"}, fresh); err != nil {
+		t.Fatalf("Get() error: %v", err)
+	}
+	if fresh.Annotations[labels.UploadsComplete] != labels.ValueTrue {
+		t.Errorf("uploads-complete = %q, want true", fresh.Annotations[labels.UploadsComplete])
+	}
+	if fresh.Status.Phase != phaseBuilding {
+		t.Errorf("phase = %q, want %q", fresh.Status.Phase, phaseBuilding)
+	}
+}
+
+func TestHandleUploadingState_HydrateUploadPodNotReady(t *testing.T) {
+	ib := &automotivev1alpha1.ImageBuild{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "hydrate-wait",
+			Namespace:         "test-ns",
+			CreationTimestamp: metav1.Now(),
+			Annotations: map[string]string{
+				labels.WorkspaceHydrate:   `[{"kind":"path","absPath":"/workspace/src/a","relPath":"src/a"}]`,
+				labels.ClientSkipsUploads: labels.ValueTrue,
+			},
+		},
+		Status: automotivev1alpha1.ImageBuildStatus{
+			Phase:   "Uploading",
+			Message: "Waiting for file uploads",
+		},
+		Spec: automotivev1alpha1.ImageBuildSpec{Workspace: "dev-ws"},
+	}
+	r := newTestReconciler(ib)
+	r.RestConfig = &rest.Config{}
+
+	result, err := r.handleUploadingState(context.Background(), ib)
+	if err != nil {
+		t.Fatalf("handleUploadingState() error: %v", err)
+	}
+	if result.RequeueAfter != 2*time.Second {
+		t.Fatalf("RequeueAfter = %v, want 2s", result.RequeueAfter)
+	}
+
+	fresh := &automotivev1alpha1.ImageBuild{}
+	if err := r.Get(context.Background(), types.NamespacedName{Name: "hydrate-wait", Namespace: "test-ns"}, fresh); err != nil {
+		t.Fatalf("Get() error: %v", err)
+	}
+	if fresh.Status.Phase != "Uploading" {
+		t.Errorf("phase = %q, want Uploading", fresh.Status.Phase)
+	}
+	if fresh.Status.Message != "Waiting for upload pod" {
+		t.Errorf("message = %q, want Waiting for upload pod", fresh.Status.Message)
+	}
+}
+
+func newRunningUploadPod(buildName string) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      buildName + "-upload",
+			Namespace: "test-ns",
+			Labels: map[string]string{
+				labels.ImageBuildName: buildName,
+				labels.Name:           "upload-pod",
+			},
+		},
+		Spec:   corev1.PodSpec{Containers: []corev1.Container{{Name: "upload"}}},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+}
+
+func newHydrateBuild(name string) *automotivev1alpha1.ImageBuild {
+	return &automotivev1alpha1.ImageBuild{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              name,
+			Namespace:         "test-ns",
+			CreationTimestamp: metav1.Now(),
+			Annotations: map[string]string{
+				labels.WorkspaceHydrate:   `[{"kind":"path","absPath":"/workspace/src/a","relPath":"src/a"}]`,
+				labels.ClientSkipsUploads: labels.ValueTrue,
+			},
+		},
+		Status: automotivev1alpha1.ImageBuildStatus{Phase: "Uploading"},
+		Spec:   automotivev1alpha1.ImageBuildSpec{Workspace: "dev-ws"},
+	}
+}
+
+// pollHydrate drives ensureWorkspaceHydrate until it settles (done or error) so
+// tests can observe the background goroutine's result deterministically.
+func pollHydrate(t *testing.T, r *ImageBuildReconciler, ib *automotivev1alpha1.ImageBuild) (bool, error) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		done, err := r.ensureWorkspaceHydrate(context.Background(), ib)
+		if done || err != nil {
+			return done, err
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("hydrate did not settle in time")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// driveUploadingUntilSettled calls handleUploadingState until the background
+// hydration finishes and a reconcile returns something other than the poll
+// requeue (workspaceHydratePoll), i.e. the error was surfaced and classified.
+func driveUploadingUntilSettled(t *testing.T, r *ImageBuildReconciler, ib *automotivev1alpha1.ImageBuild) ctrl.Result {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		result, err := r.handleUploadingState(context.Background(), ib)
+		if err != nil {
+			t.Fatalf("handleUploadingState() error: %v", err)
+		}
+		if result.RequeueAfter != workspaceHydratePoll {
+			return result
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("hydrate did not settle in time")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestEnsureWorkspaceHydrate_AsyncCompletes verifies the copy runs off the
+// reconcile path (goroutine) and, once finished, is recorded via the
+// WorkspaceHydrateDone annotation so it is not repeated.
+func TestEnsureWorkspaceHydrate_AsyncCompletes(t *testing.T) {
+	ib := newHydrateBuild("hydrate-async")
+	r := newTestReconciler(ib, newRunningUploadPod("hydrate-async"))
+	r.RestConfig = &rest.Config{}
+
+	var calls atomic.Int32
+	r.hydrateFunc = func(context.Context, *rest.Config, client.Client, *automotivev1alpha1.ImageBuild) error {
+		calls.Add(1)
+		return nil
+	}
+
+	// First call must not block: it starts the goroutine and reports not-done.
+	done, err := r.ensureWorkspaceHydrate(context.Background(), ib)
+	if err != nil || done {
+		t.Fatalf("first call = (%v, %v), want (false, nil)", done, err)
+	}
+
+	done, err = pollHydrate(t, r, ib)
+	if err != nil {
+		t.Fatalf("hydrate error: %v", err)
+	}
+	if !done {
+		t.Fatal("hydrate never completed")
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("hydrate ran %d times, want 1", got)
+	}
+	if ib.Annotations[labels.WorkspaceHydrateDone] != labels.ValueTrue {
+		t.Fatalf("WorkspaceHydrateDone = %q, want true", ib.Annotations[labels.WorkspaceHydrateDone])
+	}
+	fresh := &automotivev1alpha1.ImageBuild{}
+	if err := r.Get(context.Background(), types.NamespacedName{Name: "hydrate-async", Namespace: "test-ns"}, fresh); err != nil {
+		t.Fatalf("Get() error: %v", err)
+	}
+	if fresh.Annotations[labels.WorkspaceHydrateDone] != labels.ValueTrue {
+		t.Fatal("WorkspaceHydrateDone not persisted")
+	}
+}
+
+// TestEnsureWorkspaceHydrate_InProgressDoesNotRelaunch confirms repeated
+// reconciles while a copy is running return not-done without starting a second
+// goroutine.
+func TestEnsureWorkspaceHydrate_InProgressDoesNotRelaunch(t *testing.T) {
+	ib := newHydrateBuild("hydrate-inflight")
+	r := newTestReconciler(ib, newRunningUploadPod("hydrate-inflight"))
+	r.RestConfig = &rest.Config{}
+
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var calls atomic.Int32
+	r.hydrateFunc = func(context.Context, *rest.Config, client.Client, *automotivev1alpha1.ImageBuild) error {
+		calls.Add(1)
+		started <- struct{}{}
+		<-release
+		return nil
+	}
+	t.Cleanup(func() { close(release) })
+
+	// First call launches the goroutine; wait until it is actually running so the
+	// relaunch assertion below is not racing the goroutine's own calls.Add(1).
+	done, err := r.ensureWorkspaceHydrate(context.Background(), ib)
+	if err != nil || done {
+		t.Fatalf("first call = (%v, %v), want (false, nil)", done, err)
+	}
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("hydrate goroutine never started")
+	}
+
+	// Further reconciles while the copy is in flight must not relaunch it.
+	for i := range 3 {
+		done, err := r.ensureWorkspaceHydrate(context.Background(), ib)
+		if err != nil || done {
+			t.Fatalf("call %d = (%v, %v), want (false, nil)", i, done, err)
+		}
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("hydrate launched %d times while in progress, want 1", got)
+	}
+}
+
+// TestEnsureWorkspaceHydrate_NoUploadPodDefers ensures we do not spawn a
+// goroutine before the destination pod is ready.
+func TestEnsureWorkspaceHydrate_NoUploadPodDefers(t *testing.T) {
+	ib := newHydrateBuild("hydrate-nopod")
+	r := newTestReconciler(ib)
+	r.RestConfig = &rest.Config{}
+
+	var calls atomic.Int32
+	r.hydrateFunc = func(context.Context, *rest.Config, client.Client, *automotivev1alpha1.ImageBuild) error {
+		calls.Add(1)
+		return nil
+	}
+
+	done, err := r.ensureWorkspaceHydrate(context.Background(), ib)
+	if done {
+		t.Fatal("done = true, want false while upload pod missing")
+	}
+	if !errors.Is(err, buildapi.ErrUploadPodNotReady) {
+		t.Fatalf("err = %v, want ErrUploadPodNotReady", err)
+	}
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("hydrate ran %d times, want 0 (no goroutine before pod ready)", got)
+	}
+}
+
+// TestEnsureWorkspaceHydrate_ErrorSurfacesAndClearsJob verifies a failed copy
+// surfaces the error, does not mark hydration done, and clears its tracking
+// entry so a later reconcile can retry.
+func TestEnsureWorkspaceHydrate_ErrorSurfacesAndClearsJob(t *testing.T) {
+	ib := newHydrateBuild("hydrate-err")
+	r := newTestReconciler(ib, newRunningUploadPod("hydrate-err"))
+	r.RestConfig = &rest.Config{}
+
+	wantErr := errors.New("boom")
+	r.hydrateFunc = func(context.Context, *rest.Config, client.Client, *automotivev1alpha1.ImageBuild) error {
+		return wantErr
+	}
+
+	_, err := pollHydrate(t, r, ib)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("err = %v, want %v", err, wantErr)
+	}
+	if ib.Annotations[labels.WorkspaceHydrateDone] == labels.ValueTrue {
+		t.Fatal("failed hydrate must not be marked done")
+	}
+	if _, ok := r.hydrating.Load("test-ns/hydrate-err"); ok {
+		t.Fatal("failed hydrate job entry must be cleared for retry")
+	}
+}
+
+func TestHandleUploadingState_HydrateDoneSelfCompletesUploads(t *testing.T) {
+	ib := &automotivev1alpha1.ImageBuild{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "hydrate-done",
+			Namespace:         "test-ns",
+			CreationTimestamp: metav1.Now(),
+			Annotations: map[string]string{
+				labels.WorkspaceHydrate:     `[{"kind":"path","absPath":"/workspace/src/a","relPath":"src/a"}]`,
+				labels.WorkspaceHydrateDone: labels.ValueTrue,
+				labels.ClientSkipsUploads:   labels.ValueTrue,
+			},
+		},
+		Status: automotivev1alpha1.ImageBuildStatus{
+			Phase:   "Uploading",
+			Message: "Waiting for file uploads",
+		},
+	}
+	r := newTestReconciler(ib)
+
+	if _, err := r.handleUploadingState(context.Background(), ib); err != nil {
+		t.Fatalf("handleUploadingState() error: %v", err)
+	}
+
+	fresh := &automotivev1alpha1.ImageBuild{}
+	if err := r.Get(context.Background(), types.NamespacedName{Name: "hydrate-done", Namespace: "test-ns"}, fresh); err != nil {
+		t.Fatalf("Get() error: %v", err)
+	}
+	if fresh.Annotations[labels.UploadsComplete] != labels.ValueTrue {
+		t.Errorf("uploads-complete = %q, want true", fresh.Annotations[labels.UploadsComplete])
+	}
+	if fresh.Status.Phase != phaseBuilding {
+		t.Errorf("phase = %q, want %q", fresh.Status.Phase, phaseBuilding)
+	}
+}
+
+func TestHandleUploadingState_HydratePermanentErrorFailsBuild(t *testing.T) {
+	ib := &automotivev1alpha1.ImageBuild{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "hydrate-bad",
+			Namespace:         "test-ns",
+			CreationTimestamp: metav1.Now(),
+			Annotations: map[string]string{
+				labels.WorkspaceHydrate: `{`,
+			},
+		},
+		Status: automotivev1alpha1.ImageBuildStatus{Phase: "Uploading"},
+	}
+	// A running upload pod lets ensureWorkspaceHydrate launch the background copy;
+	// the invalid annotation then produces a permanent error asynchronously.
+	r := newTestReconciler(ib, newRunningUploadPod("hydrate-bad"))
+	r.RestConfig = &rest.Config{}
+
+	driveUploadingUntilSettled(t, r, ib)
+
+	fresh := &automotivev1alpha1.ImageBuild{}
+	if err := r.Get(context.Background(), types.NamespacedName{Name: "hydrate-bad", Namespace: "test-ns"}, fresh); err != nil {
+		t.Fatalf("Get() error: %v", err)
+	}
+	if fresh.Status.Phase != phaseFailed {
+		t.Errorf("phase = %q, want %q", fresh.Status.Phase, phaseFailed)
+	}
+}
+
+func TestHandleUploadingState_HydrateTransientErrorRequeues(t *testing.T) {
+	ib := &automotivev1alpha1.ImageBuild{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "hydrate-retry",
+			Namespace:         "test-ns",
+			CreationTimestamp: metav1.Now(),
+			Annotations: map[string]string{
+				labels.WorkspaceHydrate: `[{"kind":"path","absPath":"/workspace/src/a","relPath":"src/a"}]`,
+			},
+		},
+		Spec:   automotivev1alpha1.ImageBuildSpec{Workspace: "dev-ws"},
+		Status: automotivev1alpha1.ImageBuildStatus{Phase: "Uploading"},
+	}
+	ws := &automotivev1alpha1.Workspace{
+		ObjectMeta: metav1.ObjectMeta{Name: "dev-ws", Namespace: "test-ns"},
+		Status:     automotivev1alpha1.WorkspaceStatus{Phase: "Stopped"},
+	}
+	uploadPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "hydrate-retry-upload-pod",
+			Namespace: "test-ns",
+			Labels: map[string]string{
+				labels.ImageBuildName: "hydrate-retry",
+				labels.Name:           "upload-pod",
+			},
+		},
+		Spec:   corev1.PodSpec{Containers: []corev1.Container{{Name: "fileserver"}}},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	r := newTestReconciler(ib, ws, uploadPod)
+	r.RestConfig = &rest.Config{}
+
+	// The workspace is Stopped, so the background copy returns a transient error;
+	// a later reconcile surfaces it and schedules the retry requeue.
+	result := driveUploadingUntilSettled(t, r, ib)
+	if result.RequeueAfter != workspaceHydrateRetry {
+		t.Fatalf("RequeueAfter = %v, want %v", result.RequeueAfter, workspaceHydrateRetry)
+	}
+
+	fresh := &automotivev1alpha1.ImageBuild{}
+	if err := r.Get(context.Background(), types.NamespacedName{Name: "hydrate-retry", Namespace: "test-ns"}, fresh); err != nil {
+		t.Fatalf("Get() error: %v", err)
+	}
+	if fresh.Status.Phase == phaseFailed {
+		t.Fatalf("transient hydrate error failed the build: %s", fresh.Status.Message)
+	}
+	if fresh.Annotations[labels.WorkspaceHydrateAttempts] != "1" {
+		t.Errorf("attempts = %q, want 1", fresh.Annotations[labels.WorkspaceHydrateAttempts])
 	}
 }
 

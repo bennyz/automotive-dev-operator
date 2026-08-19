@@ -10,13 +10,16 @@ import (
 	stderrors "errors"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	automotivev1alpha1 "github.com/centos-automotive-suite/automotive-dev-operator/api/v1alpha1"
 	"github.com/centos-automotive-suite/automotive-dev-operator/internal/buildapi"
 	"github.com/centos-automotive-suite/automotive-dev-operator/internal/common/bundleverify"
+	"github.com/centos-automotive-suite/automotive-dev-operator/internal/common/labels"
 	"github.com/centos-automotive-suite/automotive-dev-operator/internal/common/registryutil"
 	"github.com/centos-automotive-suite/automotive-dev-operator/internal/common/tasks"
 	controllerutils "github.com/centos-automotive-suite/automotive-dev-operator/internal/controller/controllerutils"
@@ -58,6 +61,7 @@ const (
 	phaseCancelled = automotivev1alpha1.ImageBuildPhaseCancelled
 	phaseCompleted = automotivev1alpha1.ImageBuildPhaseCompleted
 	phaseFailed    = automotivev1alpha1.ImageBuildPhaseFailed
+	phaseUploading = automotivev1alpha1.ImageBuildPhaseUploading
 
 	// Tekton condition type for completion status
 	conditionSucceeded = "Succeeded"
@@ -189,6 +193,23 @@ type ImageBuildReconciler struct {
 	Recorder        events.EventRecorder
 	RestConfig      *rest.Config
 	verifiedBundles sync.Map
+	// hydrating tracks in-flight background workspace hydrations keyed by
+	// "namespace/name" so the long-running copy does not block a reconcile
+	// worker. Values are *hydrateJob.
+	hydrating sync.Map
+	// hydrateFunc performs the copy; overridable in tests. nil means the
+	// default buildapi.HydrateWorkspaceForImageBuild.
+	hydrateFunc hydrateFunc
+}
+
+// hydrateFunc copies a build's workspace add_files onto its upload pod.
+type hydrateFunc func(context.Context, *rest.Config, client.Client, *automotivev1alpha1.ImageBuild) error
+
+// hydrateJob is the state of a background hydration. err is written once, before
+// done is set, so a reader that observes done==true also observes err.
+type hydrateJob struct {
+	done atomic.Bool
+	err  error
 }
 
 // +kubebuilder:rbac:groups=automotive.sdv.cloud.redhat.com,namespace=system,resources=workspaces,verbs=get;update
@@ -227,6 +248,10 @@ func (r *ImageBuildReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 	imageBuild := &automotivev1alpha1.ImageBuild{}
 	if err := r.Get(ctx, req.NamespacedName, imageBuild); err != nil {
+		if errors.IsNotFound(err) {
+			// Drop any background hydration state for a deleted build.
+			r.hydrating.Delete(req.Namespace + "/" + req.Name)
+		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
@@ -252,7 +277,7 @@ func (r *ImageBuildReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	switch imageBuild.Status.Phase {
 	case "":
 		phaseResult, phaseErr = r.handleInitialState(ctx, imageBuild)
-	case "Uploading":
+	case phaseUploading:
 		phaseResult, phaseErr = r.handleUploadingState(ctx, imageBuild)
 	case phaseBuilding:
 		phaseResult, phaseErr = r.handleBuildingState(ctx, imageBuild)
@@ -395,7 +420,7 @@ func (r *ImageBuildReconciler) handleInitialState(
 		if err := r.createUploadPod(ctx, imageBuild); err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to create upload server: %w", err)
 		}
-		if err := r.updateStatus(ctx, imageBuild, "Uploading", "Waiting for file uploads"); err != nil {
+		if err := r.updateStatus(ctx, imageBuild, phaseUploading, "Waiting for file uploads"); err != nil {
 			log.Error(err, "Failed to update status to Uploading")
 			return ctrl.Result{}, err
 		}
@@ -444,8 +469,31 @@ func (r *ImageBuildReconciler) handleUploadingState(
 		return ctrl.Result{}, nil
 	}
 
-	uploadsComplete := imageBuild.Annotations != nil &&
-		imageBuild.Annotations["automotive.sdv.cloud.redhat.com/uploads-complete"] == "true"
+	hydrated, hydrateErr := r.ensureWorkspaceHydrate(ctx, imageBuild)
+	if hydrateErr != nil {
+		return r.handleWorkspaceHydrateError(ctx, imageBuild, hydrateErr)
+	}
+	if !hydrated {
+		// Copy is running in the background; poll without blocking the worker.
+		return ctrl.Result{RequeueAfter: workspaceHydratePoll}, nil
+	}
+
+	var uploadsComplete bool
+	if buildapi.ShouldSelfCompleteUploads(imageBuild.Annotations) {
+		patched := imageBuild.DeepCopy()
+		if patched.Annotations == nil {
+			patched.Annotations = map[string]string{}
+		}
+		patched.Annotations[labels.UploadsComplete] = labels.ValueTrue
+		if err := r.Patch(ctx, patched, client.MergeFrom(imageBuild)); err != nil {
+			return ctrl.Result{}, fmt.Errorf("mark uploads complete after workspace hydrate: %w", err)
+		}
+		imageBuild.Annotations = patched.Annotations
+		uploadsComplete = true
+	} else {
+		uploadsComplete = imageBuild.Annotations != nil &&
+			imageBuild.Annotations[labels.UploadsComplete] == labels.ValueTrue
+	}
 
 	if !uploadsComplete {
 		return ctrl.Result{RequeueAfter: time.Second * 10}, nil
@@ -460,6 +508,166 @@ func (r *ImageBuildReconciler) handleUploadingState(
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{}, nil
+}
+
+const (
+	maxWorkspaceHydrateAttempts = 6
+	workspaceHydrateRetry       = 5 * time.Second
+	workspaceHydrateTimeout     = 2 * time.Minute
+	// workspaceHydratePoll is how often the reconciler re-checks a background
+	// hydration that is still running.
+	workspaceHydratePoll = 3 * time.Second
+)
+
+func (r *ImageBuildReconciler) handleWorkspaceHydrateError(
+	ctx context.Context,
+	imageBuild *automotivev1alpha1.ImageBuild,
+	err error,
+) (ctrl.Result, error) {
+	log := r.buildLogger(imageBuild)
+	if stderrors.Is(err, buildapi.ErrUploadPodNotReady) {
+		if imageBuild.Status.Message != "Waiting for upload pod" {
+			if statusErr := r.updateStatus(ctx, imageBuild, phaseUploading, "Waiting for upload pod"); statusErr != nil {
+				log.Error(statusErr, "Failed to update status while waiting for upload pod")
+			}
+		}
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+	}
+
+	attempts := hydrateAttemptCount(imageBuild)
+	if !buildapi.IsPermanentHydrateError(err) && attempts < maxWorkspaceHydrateAttempts {
+		if bumpErr := r.bumpHydrateAttempts(ctx, imageBuild, attempts+1); bumpErr != nil {
+			return ctrl.Result{}, bumpErr
+		}
+		msg := fmt.Sprintf("Retrying workspace file copy (%d/%d): %v", attempts+1, maxWorkspaceHydrateAttempts, err)
+		if statusErr := r.updateStatus(ctx, imageBuild, phaseUploading, msg); statusErr != nil {
+			log.Error(statusErr, "Failed to update status while retrying workspace hydrate")
+		}
+		return ctrl.Result{RequeueAfter: workspaceHydrateRetry}, nil
+	}
+
+	log.Error(err, "Failed to hydrate workspace files into upload pod")
+	if shutdownErr := r.shutdownUploadPod(ctx, imageBuild); shutdownErr != nil {
+		log.Error(shutdownErr, "Failed to shutdown upload pod after hydrate failure")
+	}
+	if statusErr := r.updateStatus(ctx, imageBuild, phaseFailed,
+		fmt.Sprintf("Workspace file hydrate failed: %v", err)); statusErr != nil {
+		log.Error(statusErr, "Failed to update status to Failed")
+		return ctrl.Result{}, statusErr
+	}
+	return ctrl.Result{}, nil
+}
+
+func hydrateAttemptCount(imageBuild *automotivev1alpha1.ImageBuild) int {
+	if imageBuild.Annotations == nil {
+		return 0
+	}
+	n, err := strconv.Atoi(imageBuild.Annotations[labels.WorkspaceHydrateAttempts])
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
+}
+
+func (r *ImageBuildReconciler) bumpHydrateAttempts(
+	ctx context.Context,
+	imageBuild *automotivev1alpha1.ImageBuild,
+	n int,
+) error {
+	patched := imageBuild.DeepCopy()
+	if patched.Annotations == nil {
+		patched.Annotations = map[string]string{}
+	}
+	patched.Annotations[labels.WorkspaceHydrateAttempts] = strconv.Itoa(n)
+	if err := r.Patch(ctx, patched, client.MergeFrom(imageBuild)); err != nil {
+		return fmt.Errorf("record workspace hydrate attempt: %w", err)
+	}
+	imageBuild.Annotations = patched.Annotations
+	return nil
+}
+
+// ensureWorkspaceHydrate drives workspace hydration off the reconcile worker.
+// The copy runs in a background goroutine keyed by build name; the reconciler
+// polls its result instead of blocking. It returns:
+//
+//   - (true, nil)  hydration is complete or not needed; proceed.
+//   - (false, nil) a copy is running (or was just started); requeue and poll.
+//   - (false, err) a copy finished with err for handleWorkspaceHydrateError to
+//     classify as transient (retry) or permanent (fail).
+func (r *ImageBuildReconciler) ensureWorkspaceHydrate(
+	ctx context.Context,
+	imageBuild *automotivev1alpha1.ImageBuild,
+) (bool, error) {
+	if imageBuild.Annotations == nil || imageBuild.Annotations[labels.WorkspaceHydrate] == "" {
+		return true, nil
+	}
+	if imageBuild.Annotations[labels.WorkspaceHydrateDone] == labels.ValueTrue {
+		return true, nil
+	}
+
+	key := imageBuild.Namespace + "/" + imageBuild.Name
+	if v, ok := r.hydrating.Load(key); ok {
+		job := v.(*hydrateJob)
+		if !job.done.Load() {
+			return false, nil // copy still running
+		}
+		r.hydrating.Delete(key)
+		if job.err != nil {
+			return false, job.err
+		}
+		if err := r.markWorkspaceHydrateDone(ctx, imageBuild); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+
+	// No job yet. Defer until the destination pod is Running so we do not spawn
+	// goroutines that would immediately fail with ErrUploadPodNotReady.
+	ready, err := buildapi.UploadPodReady(ctx, r.Client, imageBuild.Namespace, imageBuild.Name)
+	if err != nil {
+		return false, err
+	}
+	if !ready {
+		return false, buildapi.ErrUploadPodNotReady
+	}
+
+	job := &hydrateJob{}
+	r.hydrating.Store(key, job)
+	// The reconcile ctx is cancelled when Reconcile returns, so the copy uses
+	// its own timeout-bounded context. Hydration is idempotent (it skips files
+	// already present), so an interrupted or restarted copy resumes safely.
+	ib := imageBuild.DeepCopy()
+	fn := r.workspaceHydrateFunc()
+	go func() {
+		hydrateCtx, cancel := context.WithTimeout(context.Background(), workspaceHydrateTimeout)
+		defer cancel()
+		job.err = fn(hydrateCtx, r.RestConfig, r.Client, ib)
+		job.done.Store(true)
+	}()
+	return false, nil
+}
+
+func (r *ImageBuildReconciler) workspaceHydrateFunc() hydrateFunc {
+	if r.hydrateFunc != nil {
+		return r.hydrateFunc
+	}
+	return buildapi.HydrateWorkspaceForImageBuild
+}
+
+func (r *ImageBuildReconciler) markWorkspaceHydrateDone(
+	ctx context.Context,
+	imageBuild *automotivev1alpha1.ImageBuild,
+) error {
+	patched := imageBuild.DeepCopy()
+	if patched.Annotations == nil {
+		patched.Annotations = map[string]string{}
+	}
+	patched.Annotations[labels.WorkspaceHydrateDone] = labels.ValueTrue
+	if err := r.Patch(ctx, patched, client.MergeFrom(imageBuild)); err != nil {
+		return fmt.Errorf("mark workspace hydrate done: %w", err)
+	}
+	imageBuild.Annotations = patched.Annotations
+	return nil
 }
 
 func (r *ImageBuildReconciler) handleBuildingState(
@@ -2764,7 +2972,7 @@ func (r *ImageBuildReconciler) emitImageBuildLifecycleEvent(
 	oldPhase, newPhase, message string,
 ) {
 	switch newPhase {
-	case "Uploading":
+	case phaseUploading:
 		r.emitEventf(
 			imageBuild,
 			corev1.EventTypeNormal,

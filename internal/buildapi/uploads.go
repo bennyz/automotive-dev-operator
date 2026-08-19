@@ -16,7 +16,6 @@ import (
 	"github.com/gin-gonic/gin"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/remotecommand"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	automotivev1alpha1 "github.com/centos-automotive-suite/automotive-dev-operator/api/v1alpha1"
@@ -126,6 +125,17 @@ func findRunningUploadPod(ctx context.Context, k8sClient client.Client, namespac
 		}
 	}
 	return nil, nil
+}
+
+// UploadPodReady reports whether a Running upload pod exists for the build. The
+// controller uses it to defer starting a background workspace hydrate until the
+// destination pod is available.
+func UploadPodReady(ctx context.Context, k8sClient client.Client, namespace, buildName string) (bool, error) {
+	pod, err := findRunningUploadPod(ctx, k8sClient, namespace, buildName)
+	if err != nil {
+		return false, err
+	}
+	return pod != nil, nil
 }
 
 func (a *APIServer) uploadFiles(c *gin.Context, name string) {
@@ -253,22 +263,18 @@ func copyFileToPod(ctx context.Context, config *rest.Config, namespace, podName,
 			fmt.Fprintf(os.Stderr, "Warning: failed to close file: %v\n", err)
 		}
 	}()
+	return copyReaderToPod(ctx, config, namespace, podName, containerName, f, podPath)
+}
 
+func copyReaderToPod(ctx context.Context, config *rest.Config, namespace, podName, containerName string, r io.Reader, podPath string) error {
 	// Stream raw file bytes via stdin; the pod-side command writes them directly.
 	// Uses only sh + cat (available in ubi-minimal), no tar dependency.
-	cmd := []string{"/bin/sh", "-c", "mkdir -p \"$(dirname \"$1\")\" && cat > \"$1\" && chmod 0600 \"$1\"", "--", podPath}
-
-	executor, err := newPodExecExecutorFn(config, namespace, podName, containerName, cmd)
-	if err != nil {
-		return err
-	}
+	// Write to a temp file and rename so an interrupted transfer never leaves a
+	// truncated file at podPath (hydration skips files that already exist).
+	cmd := []string{"/bin/sh", "-c",
+		"mkdir -p \"$(dirname \"$1\")\" && tmp=\"$1.part.$$\" && cat > \"$tmp\" && chmod 0600 \"$tmp\" && mv -f \"$tmp\" \"$1\"",
+		"--", podPath}
 	var stderr bytes.Buffer
-	streamOpts := remotecommand.StreamOptions{Stdin: f, Stdout: io.Discard, Stderr: &stderr}
-	if err := executor.StreamWithContext(ctx, streamOpts); err != nil {
-		if stderr.Len() > 0 {
-			return fmt.Errorf("copy to pod: %w (stderr: %s)", err, stderr.String())
-		}
-		return err
-	}
-	return nil
+	err := streamPodExec(ctx, config, namespace, podName, containerName, cmd, r, io.Discard, &stderr)
+	return wrapPodStreamError("copy to pod", err, &stderr)
 }
