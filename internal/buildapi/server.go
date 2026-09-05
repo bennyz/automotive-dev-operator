@@ -1300,9 +1300,7 @@ func (a *APIServer) createBuild(c *gin.Context) {
 	c.Request = c.Request.WithContext(ctx)
 
 	var req BuildRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		spanError(span, err)
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid JSON request"})
+	if !bindOperationRequest(c, &req) {
 		return
 	}
 
@@ -1488,8 +1486,8 @@ func (a *APIServer) createBuild(c *gin.Context) {
 
 	writeJSON(c, http.StatusAccepted, BuildResponse{
 		Name:        req.Name,
-		Phase:       phaseBuilding,
-		Message:     "Build triggered",
+		Phase:       phasePending,
+		Message:     "Build accepted",
 		RequestedBy: requestedBy,
 		TraceID:     traceID,
 	})

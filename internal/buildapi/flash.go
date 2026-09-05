@@ -27,8 +27,11 @@ import (
 
 func (a *APIServer) createFlash(c *gin.Context) {
 	var req FlashRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid JSON request"})
+	if !bindOperationRequest(c, &req) {
+		return
+	}
+	if err := validateOperationMetadata(req.ExternalID, req.Callback); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error(), "code": "InvalidRequest"})
 		return
 	}
 
