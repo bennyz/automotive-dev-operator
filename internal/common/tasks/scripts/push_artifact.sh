@@ -1,109 +1,30 @@
+# shellcheck shell=bash
 # NOTE: common.sh is prepended to this script at embed time.
 
-ORAS_VERSION="1.2.0"
-# Detect container architecture
-case "$(uname -m)" in
-  x86_64) ORAS_ARCH="amd64" ;;
-  aarch64|arm64) ORAS_ARCH="arm64" ;;
-  *)
-    echo "ERROR: Unsupported architecture: $(uname -m)" >&2
-    exit 1
-    ;;
-esac
-ORAS_TARBALL="oras_${ORAS_VERSION}_linux_${ORAS_ARCH}.tar.gz"
-ORAS_BASE_URL="https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}"
-ORAS_CHECKSUMS="oras_${ORAS_VERSION}_checksums.txt"
-
-cleanup_oras_files() {
-  rm -f "$ORAS_TARBALL" "$ORAS_CHECKSUMS" oras
-}
-
-trap cleanup_oras_files EXIT
-
-echo "Downloading ORAS ${ORAS_VERSION} with integrity verification..."
-
-curl -LO "${ORAS_BASE_URL}/${ORAS_TARBALL}" || {
-  echo "ERROR: Failed to download ORAS tarball" >&2
-  exit 1
-}
-
-curl -LO "${ORAS_BASE_URL}/${ORAS_CHECKSUMS}" || {
-  echo "ERROR: Failed to download ORAS checksums" >&2
-  exit 1
-}
-
-expected_checksum=$(grep "${ORAS_TARBALL}" "${ORAS_CHECKSUMS}" | cut -d' ' -f1)
-if [ -z "$expected_checksum" ]; then
-  echo "ERROR: Could not find checksum for ${ORAS_TARBALL} in checksums file" >&2
-  exit 1
-fi
-
-if command -v sha256sum >/dev/null; then
-  actual_checksum=$(sha256sum "${ORAS_TARBALL}" | cut -d' ' -f1)
-elif command -v shasum >/dev/null; then
-  actual_checksum=$(shasum -a 256 "${ORAS_TARBALL}" | cut -d' ' -f1)
-else
-  echo "ERROR: Neither sha256sum nor shasum available for checksum verification" >&2
-  exit 1
-fi
-
-if [ "$expected_checksum" != "$actual_checksum" ]; then
-  echo "ERROR: Checksum verification failed for ${ORAS_TARBALL}" >&2
-  echo "  Expected: $expected_checksum" >&2
-  echo "  Actual:   $actual_checksum" >&2
-  exit 1
-fi
-
-echo "Checksum verification passed: $expected_checksum"
-
-tar -zxf "$ORAS_TARBALL" oras || {
-  echo "ERROR: Failed to extract ORAS from tarball" >&2
-  exit 1
-}
-
-mkdir -p "$HOME/bin"
-mv oras "$HOME/bin/" || {
-  echo "ERROR: Failed to install ORAS binary" >&2
-  exit 1
-}
-
-if ! echo "$PATH" | grep -q "$HOME/bin"; then
-  export PATH="$HOME/bin:$PATH"
-fi
-
-cleanup_oras_files
-trap - EXIT
-
-echo "ORAS ${ORAS_VERSION} installed successfully"
+install_oras || exit 1
 
 # Get media type based on file format and compression
 get_media_type() {
   case "$1" in
-    *.tar.gz)         echo "application/vnd.oci.image.layer.v1.tar+gzip" ;;
-    *.tar.lz4)        echo "application/vnd.oci.image.layer.v1.tar+lz4" ;;
-    *.tar.xz)         echo "application/vnd.oci.image.layer.v1.tar+xz" ;;
-    *.tar)            echo "application/vnd.oci.image.layer.v1.tar" ;;
+    *.tar.gz)         echo "$OCI_MEDIA_LAYER_GZIP" ;;
+    *.tar.xz)         echo "$OCI_MEDIA_LAYER_XZ" ;;
+    *.tar)            echo "$OCI_MEDIA_LAYER_BASE" ;;
 
-    *.simg.gz)        echo "application/vnd.automotive.disk.simg+gzip" ;;
-    *.simg.lz4)       echo "application/vnd.automotive.disk.simg+lz4" ;;
-    *.simg.xz)        echo "application/vnd.automotive.disk.simg+xz" ;;
-    *.raw.gz|*.img.gz) echo "application/vnd.automotive.disk.raw+gzip" ;;
-    *.raw.lz4|*.img.lz4) echo "application/vnd.automotive.disk.raw+lz4" ;;
-    *.raw.xz|*.img.xz) echo "application/vnd.automotive.disk.raw+xz" ;;
-    *.qcow2.gz)       echo "application/vnd.automotive.disk.qcow2+gzip" ;;
-    *.qcow2.lz4)      echo "application/vnd.automotive.disk.qcow2+lz4" ;;
-    *.qcow2.xz)       echo "application/vnd.automotive.disk.qcow2+xz" ;;
+    *.simg.gz)        echo "${OCI_MEDIA_DISK_SIMG}${OCI_COMPRESS_SUFFIX_GZIP}" ;;
+    *.simg.xz)        echo "${OCI_MEDIA_DISK_SIMG}${OCI_COMPRESS_SUFFIX_XZ}" ;;
+    *.raw.gz|*.img.gz) echo "${OCI_MEDIA_DISK_RAW}${OCI_COMPRESS_SUFFIX_GZIP}" ;;
+    *.raw.xz|*.img.xz) echo "${OCI_MEDIA_DISK_RAW}${OCI_COMPRESS_SUFFIX_XZ}" ;;
+    *.qcow2.gz)       echo "${OCI_MEDIA_DISK_QCOW2}${OCI_COMPRESS_SUFFIX_GZIP}" ;;
+    *.qcow2.xz)       echo "${OCI_MEDIA_DISK_QCOW2}${OCI_COMPRESS_SUFFIX_XZ}" ;;
 
-    *.simg)           echo "application/vnd.automotive.disk.simg" ;;
-    *.raw|*.img)      echo "application/vnd.automotive.disk.raw" ;;
-    *.qcow2)          echo "application/vnd.automotive.disk.qcow2" ;;
+    *.simg)           echo "$OCI_MEDIA_DISK_SIMG" ;;
+    *.raw|*.img)      echo "$OCI_MEDIA_DISK_RAW" ;;
+    *.qcow2)          echo "$OCI_MEDIA_DISK_QCOW2" ;;
 
-    *.gz)             echo "application/gzip" ;;
-    *.lz4)            echo "application/x-lz4" ;;
-    *.xz)             echo "application/x-xz" ;;
+    *.gz)             echo "$OCI_MEDIA_GZIP" ;;
+    *.xz)             echo "$OCI_MEDIA_XZ" ;;
 
-    # Default fallback
-    *)                echo "application/octet-stream" ;;
+    *)                echo "$OCI_MEDIA_OCTETSTREAM" ;;
   esac
 }
 
@@ -114,17 +35,17 @@ json_escape() {
 
 get_artifact_type() {
   case "$1" in
-    *.simg.gz|*.simg.lz4|*.simg) echo "application/vnd.automotive.disk.simg" ;;
-    *.qcow2.gz|*.qcow2.lz4|*.qcow2.xz|*.qcow2) echo "application/vnd.automotive.disk.qcow2" ;;
-    *.raw.gz|*.raw.lz4|*.raw.xz|*.raw|*.img.gz|*.img.lz4|*.img.xz|*.img) echo "application/vnd.automotive.disk.raw" ;;
-    *) echo "application/octet-stream" ;;
+    *.simg.gz|*.simg.xz|*.simg) echo "$OCI_MEDIA_DISK_SIMG" ;;
+    *.qcow2.gz|*.qcow2.xz|*.qcow2) echo "$OCI_MEDIA_DISK_QCOW2" ;;
+    *.raw.gz|*.raw.xz|*.raw|*.img.gz|*.img.xz|*.img) echo "$OCI_MEDIA_DISK_RAW" ;;
+    *) echo "$OCI_MEDIA_OCTETSTREAM" ;;
   esac
 }
 
 get_partition_name() {
-  # Strip base extension (.simg/.raw/.img), optional .tar, and optional compression (.gz/.lz4/.xz)
-  # Examples: boot_a.simg.gz -> boot_a, foo.simg.tar.gz -> foo, system.raw.lz4 -> system
-  basename "$1" | sed -E 's/\.(simg|raw|img)(\.tar)?(\.(gz|lz4|xz))?$//'
+  # Strip base extension (.simg/.raw/.img), optional .tar, and optional compression (.gz/.xz)
+  # Examples: boot_a.simg.gz -> boot_a, foo.simg.tar.gz -> foo, system.raw.xz -> system
+  basename "$1" | sed -E 's/\.(simg|raw|img)(\.tar)?(\.(gz|xz))?$//'
 }
 
 # Remap partition names for specific targets where AIB's logical names
@@ -176,6 +97,20 @@ builder_image_used="$(params.builder-image)"
 aib_version="$(params.aib-version)"
 aib_image="$(params.automotive-image-builder)"
 aib_command="$(params.aib-command)"
+SECURE_BUILD="$(params.secure-build)"
+insecure_registry="$(params.insecure-registry)"
+REPRODUCIBLE="$(params.reproducible)"
+TASK_BUNDLE_REF="$(params.task-bundle-ref)"
+CUSTOM_DEFINES="$(params.custom-defines)"
+AIB_EXTRA_ARGS="$(params.aib-extra-args)"
+EXPORT_FORMAT="$(params.export-format)"
+
+ORAS_EXTRA_ARGS=()
+if [ "$insecure_registry" = "true" ]; then
+  registry_host="${repo_url%%/*}"
+  # shellcheck disable=SC2207
+  ORAS_EXTRA_ARGS=($(detect_registry_protocol "$registry_host"))
+fi
 
 config_file="/etc/target-defaults/target-defaults.yaml"
 default_partitions=""
@@ -192,7 +127,28 @@ else
   echo "No partition configuration found, skipping default-partitions annotation"
 fi
 
-cd /workspace/shared
+cd /workspace/shared || exit
+
+# Verify artifact integrity against the digest produced by the build task.
+EXPECTED_DIGEST="$(params.expected-artifact-digest)"
+if [ -n "$EXPECTED_DIGEST" ]; then
+  echo "=== Artifact Integrity Verification ==="
+  ACTUAL_DIGEST=$(compute_artifact_digest "${parts_dir}" "${exportFile}")
+  if [ -z "$ACTUAL_DIGEST" ]; then
+    echo "WARNING: Cannot verify integrity — artifact not found yet"
+  fi
+  if [ -n "$ACTUAL_DIGEST" ]; then
+    if [ "$EXPECTED_DIGEST" != "$ACTUAL_DIGEST" ]; then
+      echo "ERROR: Artifact integrity check failed!" >&2
+      echo "  Expected: $EXPECTED_DIGEST" >&2
+      echo "  Actual:   $ACTUAL_DIGEST" >&2
+      exit 1
+    fi
+    echo "  Integrity verified: $ACTUAL_DIGEST"
+  fi
+else
+  echo "No artifact integrity digest provided, skipping verification"
+fi
 
 echo "=== Artifact Push Configuration ==="
 echo "  Working directory: $(pwd)"
@@ -206,15 +162,17 @@ if [ -d "${parts_dir}" ] && [ -n "$(ls -A "${parts_dir}" 2>/dev/null)" ]; then
   echo "Found parts directory: ${parts_dir}"
   echo "Using multi-layer push for individual partition files"
 
-  # For ride4/ridesx4 targets, duplicate boot_a as boot_b so both partitions get flashed
+  # For ride4/ridesx4 targets, ensure _b slots exist (normally created by build task;
+  # kept here as idempotent fallback for backwards compatibility with older bundles).
+  # abl_a is only produced on SIG distros (qcom-abl package); glob skips when absent.
   case "$target" in
     ride4*|ridesx4*)
-      for boot_a_file in "${parts_dir}"/boot_a.*; do
-        [ -f "$boot_a_file" ] || continue
-        boot_b_file=$(echo "$boot_a_file" | sed 's/boot_a/boot_b/')
-        if [ ! -f "$boot_b_file" ]; then
-          echo "Duplicating $(basename "$boot_a_file") as $(basename "$boot_b_file") for target $target"
-          cp "$boot_a_file" "$boot_b_file"
+      for a_file in "${parts_dir}"/boot_a.* "${parts_dir}"/abl_a.*; do
+        [ -f "$a_file" ] || continue
+        b_file=$(echo "$a_file" | sed 's/_a\./_b./')
+        if [ ! -f "$b_file" ]; then
+          echo "Duplicating $(basename "$a_file") as $(basename "$b_file") for target $target"
+          cp "$a_file" "$b_file"
         fi
       done
       ;;
@@ -222,7 +180,7 @@ if [ -d "${parts_dir}" ] && [ -n "$(ls -A "${parts_dir}" 2>/dev/null)" ]; then
 
   ls -la "${parts_dir}/"
 
-  cd "${parts_dir}"
+  cd "${parts_dir}" || exit
 
   # Create annotations file in current directory (ORAS container may not have /tmp)
   annotations_file="./oras-annotations.json"
@@ -269,9 +227,9 @@ if [ -d "${parts_dir}" ] && [ -n "$(ls -A "${parts_dir}" 2>/dev/null)" ]; then
 
       # Build JSON with properly escaped values
       if [ -n "$decompressed_size" ]; then
-        layer_annotations_json="${layer_annotations_json}\"${escaped_filename}\":{\"automotive.sdv.cloud.redhat.com/partition\":\"${escaped_partition}\",\"org.opencontainers.image.title\":\"${escaped_filename}\",\"automotive.sdv.cloud.redhat.com/decompressed-size\":\"${escaped_decompressed_size}\"}"
+        layer_annotations_json="${layer_annotations_json}\"${escaped_filename}\":{\"${OCI_LAYER_ANN_PARTITION}\":\"${escaped_partition}\",\"${OCI_LAYER_ANN_ORG_OPENCONTAINERS_IMAGE_TITLE}\":\"${escaped_filename}\",\"${OCI_LAYER_ANN_DECOMPRESSED_SIZE}\":\"${escaped_decompressed_size}\"}"
       else
-        layer_annotations_json="${layer_annotations_json}\"${escaped_filename}\":{\"automotive.sdv.cloud.redhat.com/partition\":\"${escaped_partition}\",\"org.opencontainers.image.title\":\"${escaped_filename}\"}"
+        layer_annotations_json="${layer_annotations_json}\"${escaped_filename}\":{\"${OCI_LAYER_ANN_PARTITION}\":\"${escaped_partition}\",\"${OCI_LAYER_ANN_ORG_OPENCONTAINERS_IMAGE_TITLE}\":\"${escaped_filename}\"}"
       fi
     fi
   done
@@ -289,21 +247,27 @@ if [ -d "${parts_dir}" ] && [ -n "$(ls -A "${parts_dir}" 2>/dev/null)" ]; then
 
   manifest_annotations_json=$(python3 - \
       "$distro" "$target" "$arch" "$file_list" \
-      "$default_partitions" "$builder_image_used" "$aib_version" "$aib_image" "$aib_command" <<'PYEOF'
-import json, sys
-distro, target, arch, parts, default_parts, builder, aib_ver, aib_img, aib_cmd = sys.argv[1:10]
+      "$default_partitions" "$builder_image_used" "$aib_version" "$aib_image" "$aib_command" "$TASK_BUNDLE_REF" \
+      "$CUSTOM_DEFINES" "$AIB_EXTRA_ARGS" "$EXPORT_FORMAT" <<'PYEOF'
+import json, os, sys
+distro, target, arch, parts, default_parts, builder, aib_ver, aib_img, aib_cmd, task_bundle, custom_defs, extra_args, export_fmt = sys.argv[1:14]
+e = os.environ
 a = {
-    "automotive.sdv.cloud.redhat.com/multi-layer": "true",
-    "automotive.sdv.cloud.redhat.com/parts":       parts,
-    "automotive.sdv.cloud.redhat.com/distro":      distro,
-    "automotive.sdv.cloud.redhat.com/target":      target,
-    "automotive.sdv.cloud.redhat.com/arch":        arch,
+    e["OCI_ANN_MULTI_LAYER"]:  "true",
+    e["OCI_ANN_PARTS"]:        parts,
+    e["OCI_ANN_DISTRO"]:       distro,
+    e["OCI_ANN_TARGET"]:       target,
+    e["OCI_ANN_ARCH"]:         arch,
 }
-if default_parts: a["automotive.sdv.cloud.redhat.com/default-partitions"]      = default_parts
-if builder:       a["automotive.sdv.cloud.redhat.com/builder-image"]            = builder
-if aib_ver:       a["automotive.sdv.cloud.redhat.com/aib-version"]              = aib_ver
-if aib_img:       a["automotive.sdv.cloud.redhat.com/automotive-image-builder"] = aib_img
-if aib_cmd:       a["automotive.sdv.cloud.redhat.com/aib-command"]              = aib_cmd
+if default_parts: a[e["OCI_ANN_DEFAULT_PARTITIONS"]]      = default_parts
+if builder:       a[e["OCI_ANN_BUILDER_IMAGE"]]            = builder
+if aib_ver:       a[e["OCI_ANN_AIB_VERSION"]]              = aib_ver
+if aib_img:       a[e["OCI_ANN_AUTOMOTIVE_IMAGE_BUILDER"]] = aib_img
+if aib_cmd:       a[e["OCI_ANN_AIB_COMMAND"]]              = aib_cmd
+if task_bundle:   a[e["OCI_ANN_TASK_BUNDLE_REF"]]          = task_bundle
+if custom_defs:   a[e["OCI_ANN_CUSTOM_DEFINES"]]           = custom_defs
+if extra_args:    a[e["OCI_ANN_AIB_EXTRA_ARGS"]]           = extra_args
+if export_fmt:    a[e["OCI_ANN_EXPORT_FORMAT"]]            = export_fmt
 print(json.dumps(a))
 PYEOF
 )
@@ -326,13 +290,14 @@ EOF
 
   # Push with multi-layer manifest using annotation file
   # Files are pushed from current directory (parts_dir) so they extract flat
-  # shellcheck disable=SC2086
-  "$HOME/bin/oras" push --disable-path-validation \
+  set -o pipefail
+  "$ORAS_BIN" push "${ORAS_EXTRA_ARGS[@]}" --disable-path-validation \
     --image-spec v1.1 \
     --artifact-type "${artifact_type}" \
     --annotation-file "$annotations_file" \
     "${repo_url}" \
-    ${layer_args}
+    ${layer_args} 2>&1 | tee /tmp/oras-push-output.txt
+  set +o pipefail
 
   # Clean up annotation file (also handled by trap)
   rm -f "$annotations_file"
@@ -363,21 +328,27 @@ else
   trap 'rm -f "$single_annotations_file"' EXIT
   python3 - "$single_annotations_file" \
       "$distro" "$target" "$arch" \
-      "$parts_list" "$builder_image_used" "$aib_version" "$aib_image" "$aib_command" <<'PYEOF'
-import json, sys
+      "$parts_list" "$builder_image_used" "$aib_version" "$aib_image" "$aib_command" "$TASK_BUNDLE_REF" \
+      "$CUSTOM_DEFINES" "$AIB_EXTRA_ARGS" "$EXPORT_FORMAT" <<'PYEOF'
+import json, os, sys
 from pathlib import Path
 
-out_file, distro, target, arch, parts, builder, aib_ver, aib_img, aib_cmd = sys.argv[1:10]
+out_file, distro, target, arch, parts, builder, aib_ver, aib_img, aib_cmd, task_bundle, custom_defs, extra_args, export_fmt = sys.argv[1:14]
+e = os.environ
 annotations = {
-    "automotive.sdv.cloud.redhat.com/distro":  distro,
-    "automotive.sdv.cloud.redhat.com/target":  target,
-    "automotive.sdv.cloud.redhat.com/arch":    arch,
+    e["OCI_ANN_DISTRO"]: distro,
+    e["OCI_ANN_TARGET"]: target,
+    e["OCI_ANN_ARCH"]:   arch,
 }
-if parts:    annotations["automotive.sdv.cloud.redhat.com/parts"]                    = parts
-if builder:  annotations["automotive.sdv.cloud.redhat.com/builder-image"]            = builder
-if aib_ver:  annotations["automotive.sdv.cloud.redhat.com/aib-version"]              = aib_ver
-if aib_img:  annotations["automotive.sdv.cloud.redhat.com/automotive-image-builder"] = aib_img
-if aib_cmd:  annotations["automotive.sdv.cloud.redhat.com/aib-command"]              = aib_cmd
+if parts:         annotations[e["OCI_ANN_PARTS"]]                    = parts
+if builder:       annotations[e["OCI_ANN_BUILDER_IMAGE"]]            = builder
+if aib_ver:       annotations[e["OCI_ANN_AIB_VERSION"]]              = aib_ver
+if aib_img:       annotations[e["OCI_ANN_AUTOMOTIVE_IMAGE_BUILDER"]] = aib_img
+if aib_cmd:       annotations[e["OCI_ANN_AIB_COMMAND"]]              = aib_cmd
+if task_bundle:   annotations[e["OCI_ANN_TASK_BUNDLE_REF"]]          = task_bundle
+if custom_defs:   annotations[e["OCI_ANN_CUSTOM_DEFINES"]]           = custom_defs
+if extra_args:    annotations[e["OCI_ANN_AIB_EXTRA_ARGS"]]           = extra_args
+if export_fmt:    annotations[e["OCI_ANN_EXPORT_FORMAT"]]            = export_fmt
 Path(out_file).write_text(json.dumps({"$manifest": annotations}))
 PYEOF
 
@@ -388,15 +359,81 @@ PYEOF
   echo "  Media type: ${media_type}"
   echo "  Annotations: distro=${distro}, target=${target}, arch=${arch}"
 
-  "$HOME/bin/oras" push --disable-path-validation \
+  set -o pipefail
+  "$ORAS_BIN" push "${ORAS_EXTRA_ARGS[@]}" --disable-path-validation \
     --image-spec v1.1 \
     --artifact-type "${media_type}" \
     --annotation-file "$single_annotations_file" \
     "${repo_url}" \
-    "${exportFile}:${media_type}"
+    "${exportFile}:${media_type}" 2>&1 | tee /tmp/oras-push-output.txt
+  set +o pipefail
 
   emit_progress "Pushing artifact" 1 1
 
   echo ""
   echo "=== Artifact pushed successfully ==="
+fi
+
+# Write Tekton Chains type hint results for disk artifact
+DISK_DIGEST=$(sed -n 's/.*Digest: \(sha256:[a-f0-9]*\).*/\1/p' /tmp/oras-push-output.txt 2>/dev/null | head -1)
+if [ -z "$DISK_DIGEST" ]; then
+  echo "ERROR: Could not extract digest from oras push output." >&2
+  echo "Push output was:" >&2
+  cat /tmp/oras-push-output.txt >&2
+  exit 1
+fi
+echo -n "${repo_url}" > /tekton/results/IMAGE_URL
+echo -n "${DISK_DIGEST}" > /tekton/results/IMAGE_DIGEST
+echo "Tekton Chains: IMAGE_URL=${repo_url} IMAGE_DIGEST=${DISK_DIGEST}"
+# Write to workspace for cross-task access (avoids Tekton result-ref issues with skipped tasks)
+mkdir -p /workspace/shared/.chains/disk
+echo -n "${repo_url}" > /workspace/shared/.chains/disk/url
+echo -n "${DISK_DIGEST}" > /workspace/shared/.chains/disk/digest
+
+# Attach osbuild manifest as OCI referrer for supply chain verification.
+# image.json is the fully-resolved osbuild manifest produced by AIB — it contains
+# the complete build recipe (RPMs, stages, filesystem layout).
+OSBUILD_MANIFEST="/workspace/shared/image.json"
+if [ -f "$OSBUILD_MANIFEST" ] && [ -n "$DISK_DIGEST" ]; then
+  echo "Attaching osbuild manifest to ${repo_url}@${DISK_DIGEST}"
+  if ! "$ORAS_BIN" attach --disable-path-validation "${ORAS_EXTRA_ARGS[@]}" \
+    --artifact-type "$OCI_REFERRER_TYPE_OSBUILD_MANIFEST" \
+    "${repo_url}@${DISK_DIGEST}" \
+    "${OSBUILD_MANIFEST}:${OCI_REFERRER_TYPE_OSBUILD_MANIFEST}" 2>&1; then
+    if [ "$SECURE_BUILD" = "true" ]; then
+      echo "ERROR: Failed to attach osbuild manifest (fatal in secure build mode)"
+      exit 1
+    fi
+    echo "WARNING: Failed to attach osbuild manifest — registry may not support OCI referrers (non-fatal)"
+  fi
+else
+  echo "No osbuild manifest found or no digest available, skipping manifest attach"
+fi
+
+# attach_referrer FILE ARTIFACT_TYPE LABEL
+# Attaches a file as an OCI referrer. Fatal on failure in reproducible mode.
+attach_referrer() {
+  local file="$1" artifact_type="$2" label="$3"
+  if [ ! -f "$file" ]; then
+    echo "ERROR: $label not found at $file (required for reproducible build)"
+    exit 1
+  fi
+  echo "Attaching $label ($(du -sh "$file" | cut -f1)) to ${repo_url}@${DISK_DIGEST}"
+  if ! "$ORAS_BIN" attach "${ORAS_EXTRA_ARGS[@]}" \
+    --artifact-type "$artifact_type" \
+    "${repo_url}@${DISK_DIGEST}" \
+    "${file}:${artifact_type}"; then
+    echo "ERROR: Failed to attach $label (fatal in reproducible mode)"
+    exit 1
+  fi
+}
+
+if [ "$REPRODUCIBLE" = "true" ] && [ -n "$DISK_DIGEST" ]; then
+  cd /workspace/shared || { echo "ERROR: cannot cd to /workspace/shared"; exit 1; }
+  echo "=== Attaching reproducibility artifacts ==="
+  attach_referrer "./aib-manifest.yml" \
+    "$OCI_REFERRER_TYPE_AIB_MANIFEST" "AIB input manifest"
+  attach_referrer "./build-sources.tar.gz" \
+    "$OCI_REFERRER_TYPE_BUILD_SOURCES" "osbuild sources archive"
+  echo "=== Reproducibility artifacts attached ==="
 fi

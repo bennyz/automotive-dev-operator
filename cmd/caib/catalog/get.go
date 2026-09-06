@@ -22,6 +22,8 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
+	"text/tabwriter"
 
 	"github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/config"
 	"github.com/spf13/cobra"
@@ -57,12 +59,7 @@ func runGet(cmd *cobra.Command, args []string) error {
 		token = os.Getenv("CAIB_TOKEN")
 	}
 
-	ns := namespace
-	if ns == "" {
-		ns = defaultNamespace
-	}
-
-	reqURL := fmt.Sprintf("%s/v1/catalog/images/%s?namespace=%s", server, name, ns)
+	reqURL := fmt.Sprintf("%s/v1/catalog/images/%s", server, name)
 
 	req, err := http.NewRequest(http.MethodGet, reqURL, nil)
 	if err != nil {
@@ -80,12 +77,12 @@ func runGet(cmd *cobra.Command, args []string) error {
 	}
 	defer func() {
 		if err := resp.Body.Close(); err != nil {
-			fmt.Printf("Warning: failed to close response body: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Warning: failed to close response body: %v\n", err)
 		}
 	}()
 
 	if resp.StatusCode == http.StatusNotFound {
-		return fmt.Errorf("catalog image %q not found in namespace %q", name, ns)
+		return fmt.Errorf("catalog image %q not found", name)
 	}
 
 	if resp.StatusCode != http.StatusOK {
@@ -98,22 +95,116 @@ func runGet(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to read response: %w", err)
 	}
 
-	switch outputFormat {
-	case "json":
-		var result map[string]interface{}
+	format := strings.ToLower(strings.TrimSpace(getOutputFormat(cmd)))
+	switch format {
+	case outputFormatJSON:
+		var result map[string]any
 		if err := json.Unmarshal(body, &result); err != nil {
 			return fmt.Errorf("failed to parse JSON response: %w", err)
 		}
 		output, _ := json.MarshalIndent(result, "", "  ")
 		fmt.Println(string(output))
-	default:
-		var result map[string]interface{}
+	case outputFormatYAML, outputFormatYML:
+		var result map[string]any
 		if err := json.Unmarshal(body, &result); err != nil {
 			return fmt.Errorf("failed to parse JSON response: %w", err)
 		}
 		output, _ := yaml.Marshal(result)
-		fmt.Println(string(output))
+		fmt.Print(string(output))
+	case outputFormatTable:
+		var img CatalogImageResponse
+		if err := json.Unmarshal(body, &img); err != nil {
+			return fmt.Errorf("failed to parse response: %w", err)
+		}
+		printImageDetails(img)
+	default:
+		return fmt.Errorf("invalid output format %q (supported: table, json, yaml)", format)
 	}
 
 	return nil
+}
+
+func printImageDetails(img CatalogImageResponse) {
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	defer func() {
+		if err := w.Flush(); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to flush output: %v\n", err)
+		}
+	}()
+
+	target := ""
+	if len(img.Targets) > 0 {
+		names := make([]string, len(img.Targets))
+		for i, t := range img.Targets {
+			names[i] = t.Name
+		}
+		target = strings.Join(names, ", ")
+	}
+
+	rows := [][2]string{
+		{"Name", img.Name},
+		{"Registry URL", img.RegistryURL},
+		{"Digest", img.Digest},
+		{"Phase", img.Phase},
+		{"Architecture", img.Architecture},
+		{"Distro", img.Distro},
+		{"Targets", target},
+		{"Build Mode", img.BuildMode},
+		{"Export Format", img.ExportFormat},
+		{"Created At", img.CreatedAt},
+		{"Published At", img.PublishedAt},
+	}
+	if img.ScheduleName != "" {
+		rows = append(rows, [2]string{"Schedule", img.ScheduleName})
+	}
+	if img.SourceType != "" {
+		rows = append(rows, [2]string{"Source Type", img.SourceType})
+	}
+	if img.SourceImageBuild != "" {
+		rows = append(rows, [2]string{"Source Build", img.SourceImageBuild})
+	}
+	if len(img.Tags) > 0 {
+		rows = append(rows, [2]string{"Tags", strings.Join(img.Tags, ", ")})
+	}
+	if img.SizeBytes > 0 {
+		rows = append(rows, [2]string{"Size", formatBytes(img.SizeBytes)})
+	}
+	if img.DownloadURL != "" {
+		rows = append(rows, [2]string{"Download URL", img.DownloadURL})
+	}
+	if img.StatusReason != "" {
+		reason := img.StatusReason
+		if img.StatusMessage != "" {
+			reason += ": " + img.StatusMessage
+		}
+		rows = append(rows, [2]string{"Status Reason", reason})
+	}
+
+	for _, row := range rows {
+		if row[1] == "" {
+			continue
+		}
+		if _, err := fmt.Fprintf(w, "%s:\t%s\n", row[0], row[1]); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to write output row: %v\n", err)
+			return
+		}
+	}
+}
+
+func formatBytes(b int64) string {
+	const (
+		kb = 1024
+		mb = 1024 * kb
+		gb = 1024 * mb
+	)
+	switch {
+	case b >= gb:
+		return fmt.Sprintf("%.1f GiB", float64(b)/float64(gb))
+	case b >= mb:
+		return fmt.Sprintf("%.1f MiB", float64(b)/float64(mb))
+	case b >= kb:
+		return fmt.Sprintf("%.1f KiB", float64(b)/float64(kb))
+	default:
+		return fmt.Sprintf("%d B", b)
+	}
 }

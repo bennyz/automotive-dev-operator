@@ -17,6 +17,7 @@ type Options struct {
 	ServerURL       *string
 	AuthToken       *string
 	InsecureSkipTLS *bool
+	OutputFormat    *string
 
 	HandleError func(error)
 }
@@ -56,6 +57,12 @@ func (h *Handler) RunToken(_ *cobra.Command, args []string) {
 	serverURL := strings.TrimSpace(*h.opts.ServerURL)
 	insecureSkipTLS := *h.opts.InsecureSkipTLS
 
+	format, fmtErr := common.ResolveOutputFormat(h.opts.OutputFormat)
+	if fmtErr != nil {
+		h.handleError(fmtErr)
+		return
+	}
+
 	var tok *buildapitypes.TokenResponse
 	err := common.ExecuteWithReauth(serverURL, h.opts.AuthToken, insecureSkipTLS, func(api *buildapiclient.Client) error {
 		var tokenErr error
@@ -67,12 +74,15 @@ func (h *Handler) RunToken(_ *cobra.Command, args []string) {
 		return
 	}
 
-	fmt.Printf("Registry:  %s\n", tok.Registry)
-	fmt.Printf("Image:     %s\n", tok.Image)
-	fmt.Printf("Username:  %s\n", tok.Username)
-	fmt.Printf("Token:     %s\n", tok.Token)
-	fmt.Printf("Expires:   %s\n", tok.ExpiresAt)
-	fmt.Println()
-	fmt.Println("To authenticate:")
-	fmt.Printf("  echo '%s' | podman login %s --username %s --password-stdin\n", tok.Token, tok.Registry, tok.Username)
+	common.RenderFormatted(format, tok, func() error {
+		fmt.Printf("Registry:  %s\n", tok.Registry)
+		fmt.Printf("Image:     %s\n", tok.Image)
+		fmt.Printf("Username:  %s\n", tok.Username)
+		fmt.Printf("Token:     %s\n", tok.Token)
+		fmt.Printf("Expires:   %s\n", tok.ExpiresAt)
+		fmt.Println()
+		fmt.Println("To authenticate:")
+		fmt.Printf("  echo '%s' | podman login %s --username %s --password-stdin\n", tok.Token, tok.Registry, tok.Username)
+		return nil
+	}, h.handleError)
 }

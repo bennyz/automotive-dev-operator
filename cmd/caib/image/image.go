@@ -26,26 +26,29 @@ type Options struct {
 	RunInjectSigned      func(*cobra.Command, []string)
 	RunToken             func(*cobra.Command, []string)
 	RunDelete            func(*cobra.Command, []string)
+	RunCancel            func(*cobra.Command, []string)
+	RunInspect           func(*cobra.Command, []string)
 
 	GetDefaultArch func() string
 
 	ServerURL              *string
 	AuthToken              *string
 	BuildName              *string
-	ShowOutputFormat       *string
 	Distro                 *string
 	Target                 *string
 	Architecture           *string
 	ExportFormat           *string
 	Mode                   *string
 	AutomotiveImageBuilder *string
-	StorageClass           *string
 	OutputDir              *string
 	Timeout                *int
 	WaitForBuild           *bool
 	CustomDefs             *[]string
+	DefineFiles            *[]string
 	AIBExtraArgs           *[]string
+	RootPassword           *string
 	ExtraRepos             *[]string
+	LocalRepo              *string
 	Workspace              *string
 	FollowLogs             *bool
 	CompressionAlgo        *string
@@ -64,10 +67,26 @@ type Options struct {
 	LeaseDuration     *string
 	LeaseName         *string
 	FlashCmd          *string
+	LeaseTags         *[]string
 
 	UseInternalRegistry       *bool
 	InternalRegistryImageName *string
 	InternalRegistryTag       *string
+
+	SecureBuild       *bool
+	Reproducible      *bool
+	TaskBundleRef     *string
+	RestoreSourcesRef *string
+	TTL               *string
+
+	S3Bucket            *string
+	S3Prefix            *string
+	S3Region            *string
+	S3Endpoint          *string
+	S3AccessKeyID       *string
+	S3SecretAccessKey   *string
+	S3CredentialsSecret *string
+	S3Insecure          *bool
 
 	SealedBuilderImage      *string
 	SealedArchitecture      *string
@@ -106,6 +125,7 @@ func NewImageCmd(opts Options) *cobra.Command {
 
 	tokenCmd := newTokenCmd(opts)
 	deleteCmd := newDeleteCmd(opts)
+	cancelCmd := newCancelCmd(opts)
 
 	prepareResealCmd := newPrepareResealCmd(opts)
 	resealCmd := newResealCmd(opts)
@@ -117,15 +137,15 @@ func NewImageCmd(opts Options) *cobra.Command {
 	buildCmd.Flags().StringVar(opts.AuthToken, "token", os.Getenv("CAIB_TOKEN"), "Bearer token for authentication")
 	buildCmd.Flags().StringVarP(opts.BuildName, "name", "n", "", "name for the ImageBuild (auto-generated if omitted)")
 	buildCmd.Flags().StringVarP(opts.Distro, "distro", "d", "autosd", "distribution to build")
-	buildCmd.Flags().StringVarP(opts.Target, "target", "t", "qemu", "target platform")
+	buildCmd.Flags().StringVarP(opts.Target, "target", "t", "", "target platform (default: from manifest, or qemu)")
 	buildCmd.Flags().StringVarP(opts.Architecture, "arch", "a", opts.GetDefaultArch(), "architecture (amd64, arm64)")
 	buildCmd.Flags().StringVar(opts.ContainerPush, "push", "", "push bootc container to registry (optional if --disk is used)")
 	buildCmd.Flags().BoolVar(opts.BuildDiskImage, "disk", false, "also build disk image from container")
-	buildCmd.Flags().StringVarP(opts.OutputDir, "output", "o", "", "download disk image to file from registry (implies --disk; requires --push-disk or --internal-registry)")
+	buildCmd.Flags().StringVarP(opts.OutputDir, "output", "o", "", "download disk image to file from registry (uses --disk and --internal-registry when no --push-disk given)")
 	buildCmd.Flags().StringVar(
 		opts.DiskFormat, "format", "", "disk image format (qcow2, raw, simg); inferred from output filename if not set",
 	)
-	buildCmd.Flags().StringVar(opts.CompressionAlgo, "compress", "gzip", "compression algorithm (gzip, lz4, xz)")
+	buildCmd.Flags().StringVar(opts.CompressionAlgo, "compress", "gzip", "compression algorithm (gzip, xz)")
 	buildCmd.Flags().StringVar(opts.ExportOCI, "push-disk", "", "push disk image as OCI artifact to registry (implies --disk)")
 	buildCmd.Flags().StringVar(
 		opts.RegistryAuthFile,
@@ -139,10 +159,12 @@ func NewImageCmd(opts Options) *cobra.Command {
 	)
 	buildCmd.Flags().StringVar(opts.BuilderImage, "builder-image", "", "custom builder container")
 	buildCmd.Flags().BoolVar(opts.RebuildBuilder, "rebuild-builder", false, "force rebuild of the bootc builder image")
-	buildCmd.Flags().StringVar(opts.StorageClass, "storage-class", "", "Kubernetes storage class for build workspace")
 	buildCmd.Flags().StringArrayVarP(opts.CustomDefs, "define", "D", []string{}, "custom definition KEY=VALUE")
+	buildCmd.Flags().StringArrayVar(opts.DefineFiles, "define-file", []string{}, "load defines from YAML dictionary file (can be repeated)")
 	buildCmd.Flags().StringArrayVar(opts.AIBExtraArgs, "extra-args", []string{}, "extra arguments to pass to AIB (can be repeated)")
-	buildCmd.Flags().StringArrayVar(opts.ExtraRepos, "extra-repo", []string{}, "serve RPMs from workspace as extra repo (workspace:path, can be repeated)")
+	buildCmd.Flags().StringVar(opts.RootPassword, "root-password", "", "set hashed root password (env:VAR or file:PATH)")
+	buildCmd.Flags().StringArrayVar(opts.ExtraRepos, "extra-repo", []string{}, "extra RPM repo (workspace:path or oci:image-ref, can be repeated)")
+	buildCmd.Flags().StringVar(opts.LocalRepo, "local-repo", "", "OCI image with RPM repo to use as primary package source (preferred over network repos)")
 	buildCmd.Flags().StringVar(opts.Workspace, "workspace", "", "workspace name for build caching and lease forwarding")
 	buildCmd.Flags().IntVar(opts.Timeout, "timeout", 60, "timeout in minutes")
 	buildCmd.Flags().BoolVarP(opts.WaitForBuild, "wait", "w", true, "wait for build to complete")
@@ -155,10 +177,19 @@ func NewImageCmd(opts Options) *cobra.Command {
 	buildCmd.Flags().StringVar(opts.LeaseName, "lease", "", "existing Jumpstarter lease name (mutually exclusive with --lease-duration)")
 	buildCmd.Flags().StringVar(opts.FlashCmd, "flash-cmd", "", "override flash command (default: from OperatorConfig target mapping)")
 	buildCmd.Flags().StringVar(opts.ExporterSelector, "exporter", "", "direct exporter selector for flash (alternative to --target lookup)")
+	buildCmd.Flags().StringArrayVar(opts.LeaseTags, "lease-tag", []string{}, "tag for Jumpstarter lease (key=value, can be repeated)")
+	// Secure build
+	buildCmd.Flags().BoolVar(opts.SecureBuild, "secure", false, "resolve tasks from signed Tekton Bundle (requires OperatorConfig taskBundleRef)")
+	buildCmd.Flags().StringVar(opts.TTL, "ttl", "", "time-to-live for the build (e.g. 24h, 72h, 168h); empty=server default, 0=no expiry")
+	// Reproducible build
+	buildCmd.Flags().BoolVar(opts.Reproducible, "reproducible", false, "save RPMs, manifest, and task bundle for future reproduction (requires --secure)")
+	buildCmd.Flags().StringVar(opts.TaskBundleRef, "task-bundle-ref", "", "digest-pinned Tekton bundle ref for reproducible rebuild (e.g. quay.io/org/tasks@sha256:abc...)")
+	buildCmd.Flags().StringVar(opts.RestoreSourcesRef, "restore-sources", "", "OCI image ref from prior build — restores archived sources for exact reproducible rebuild")
 	// Internal registry options
 	buildCmd.Flags().BoolVar(opts.UseInternalRegistry, "internal-registry", false, "push to OpenShift internal registry")
 	buildCmd.Flags().StringVar(opts.InternalRegistryImageName, "image-name", "", "override image name for internal registry (default: build name)")
 	buildCmd.Flags().StringVar(opts.InternalRegistryTag, "image-tag", "", "tag for internal registry image (default: bootc)")
+	addS3Flags(buildCmd, opts)
 
 	listCmd.Flags().StringVar(
 		opts.ServerURL, "server", defaultServer, "REST API server base URL (e.g. https://api.example)",
@@ -173,20 +204,17 @@ func NewImageCmd(opts Options) *cobra.Command {
 	showCmd.Flags().StringVar(
 		opts.AuthToken, "token", os.Getenv("CAIB_TOKEN"),
 		"Bearer token for authentication (e.g., OpenShift access token)",
-	)
-	showCmd.Flags().StringVarP(
-		opts.ShowOutputFormat, "output", "o", "table", "Output format (table, json, yaml)",
 	)
 
 	// disk command flags (create disk from existing container)
 	diskCmd.Flags().StringVar(opts.ServerURL, "server", defaultServer, "REST API server base URL")
 	diskCmd.Flags().StringVar(opts.AuthToken, "token", os.Getenv("CAIB_TOKEN"), "Bearer token for authentication")
 	diskCmd.Flags().StringVarP(opts.BuildName, "name", "n", "", "name for the build job (auto-generated if omitted)")
-	diskCmd.Flags().StringVarP(opts.OutputDir, "output", "o", "", "download disk image to file from registry (requires --push)")
+	diskCmd.Flags().StringVarP(opts.OutputDir, "output", "o", "", "download disk image to file from registry (uses --internal-registry when no --push given)")
 	diskCmd.Flags().StringVar(
 		opts.DiskFormat, "format", "", "disk image format (qcow2, raw, simg); inferred from output filename if not set",
 	)
-	diskCmd.Flags().StringVar(opts.CompressionAlgo, "compress", "gzip", "compression algorithm (gzip, lz4, xz)")
+	diskCmd.Flags().StringVar(opts.CompressionAlgo, "compress", "gzip", "compression algorithm (gzip, xz)")
 	diskCmd.Flags().StringVar(opts.ExportOCI, "push", "", "push disk image as OCI artifact to registry")
 	diskCmd.Flags().StringVar(
 		opts.RegistryAuthFile,
@@ -195,13 +223,12 @@ func NewImageCmd(opts Options) *cobra.Command {
 		"path to Docker/Podman auth file for push authentication (takes precedence over env vars and auto-discovery)",
 	)
 	diskCmd.Flags().StringVarP(opts.Distro, "distro", "d", "autosd", "distribution")
-	diskCmd.Flags().StringVarP(opts.Target, "target", "t", "qemu", "target platform")
+	diskCmd.Flags().StringVarP(opts.Target, "target", "t", "", "target platform (default: qemu)")
 	diskCmd.Flags().StringVarP(opts.Architecture, "arch", "a", opts.GetDefaultArch(), "architecture (amd64, arm64)")
 	diskCmd.Flags().StringVar(
 		opts.AutomotiveImageBuilder, "aib-image",
 		automotivev1alpha1.DefaultAutomotiveImageBuilderImage, "AIB container image",
 	)
-	diskCmd.Flags().StringVar(opts.StorageClass, "storage-class", "", "Kubernetes storage class")
 	diskCmd.Flags().StringArrayVar(opts.AIBExtraArgs, "extra-args", []string{}, "extra arguments to pass to AIB (can be repeated)")
 	diskCmd.Flags().IntVar(opts.Timeout, "timeout", 60, "timeout in minutes")
 	diskCmd.Flags().BoolVarP(opts.WaitForBuild, "wait", "w", false, "wait for build to complete")
@@ -213,22 +240,28 @@ func NewImageCmd(opts Options) *cobra.Command {
 	diskCmd.Flags().StringVar(opts.LeaseName, "lease", "", "existing Jumpstarter lease name (mutually exclusive with --lease-duration)")
 	diskCmd.Flags().StringVar(opts.FlashCmd, "flash-cmd", "", "override flash command (default: from OperatorConfig target mapping)")
 	diskCmd.Flags().StringVar(opts.ExporterSelector, "exporter", "", "direct exporter selector for flash (alternative to --target lookup)")
+	diskCmd.Flags().StringArrayVar(opts.LeaseTags, "lease-tag", []string{}, "tag for Jumpstarter lease (key=value, can be repeated)")
+	// Secure build
+	diskCmd.Flags().BoolVar(opts.SecureBuild, "secure", false, "resolve tasks from signed Tekton Bundle (requires OperatorConfig taskBundleRef)")
+	diskCmd.Flags().StringVar(opts.TTL, "ttl", "", "time-to-live for the build (e.g. 24h, 72h, 168h); empty=server default, 0=no expiry")
+	diskCmd.Flags().StringVar(opts.TaskBundleRef, "task-bundle-ref", "", "digest-pinned Tekton bundle ref for reproducible rebuild (e.g. quay.io/org/tasks@sha256:abc...)")
 	// Internal registry options
 	diskCmd.Flags().BoolVar(opts.UseInternalRegistry, "internal-registry", false, "push to OpenShift internal registry")
 	diskCmd.Flags().StringVar(opts.InternalRegistryImageName, "image-name", "", "override image name for internal registry (default: build name)")
 	diskCmd.Flags().StringVar(opts.InternalRegistryTag, "image-tag", "", "tag for internal registry image (default: disk)")
+	addS3Flags(diskCmd, opts)
 
 	// build-dev command flags (traditional ostree/package builds)
 	buildDevCmd.Flags().StringVar(opts.ServerURL, "server", defaultServer, "REST API server base URL")
 	buildDevCmd.Flags().StringVar(opts.AuthToken, "token", os.Getenv("CAIB_TOKEN"), "Bearer token for authentication")
 	buildDevCmd.Flags().StringVarP(opts.BuildName, "name", "n", "", "name for the ImageBuild")
 	buildDevCmd.Flags().StringVarP(opts.Distro, "distro", "d", "autosd", "distribution to build")
-	buildDevCmd.Flags().StringVarP(opts.Target, "target", "t", "qemu", "target platform")
+	buildDevCmd.Flags().StringVarP(opts.Target, "target", "t", "", "target platform (default: from manifest, or qemu)")
 	buildDevCmd.Flags().StringVarP(opts.Architecture, "arch", "a", opts.GetDefaultArch(), "architecture (amd64, arm64)")
 	buildDevCmd.Flags().StringVar(opts.Mode, "mode", "package", "build mode: image (ostree) or package (package-based)")
 	buildDevCmd.Flags().StringVar(opts.ExportFormat, "format", "", "export format: qcow2, raw, simg, etc.")
-	buildDevCmd.Flags().StringVarP(opts.OutputDir, "output", "o", "", "download artifact to file from registry (requires --push)")
-	buildDevCmd.Flags().StringVar(opts.CompressionAlgo, "compress", "gzip", "compression algorithm (gzip, lz4, xz)")
+	buildDevCmd.Flags().StringVarP(opts.OutputDir, "output", "o", "", "download artifact to file from registry (uses --internal-registry when no --push given)")
+	buildDevCmd.Flags().StringVar(opts.CompressionAlgo, "compress", "gzip", "compression algorithm (gzip, xz)")
 	buildDevCmd.Flags().StringVar(opts.ExportOCI, "push", "", "push disk image as OCI artifact to registry")
 	buildDevCmd.Flags().StringVar(
 		opts.RegistryAuthFile,
@@ -240,10 +273,12 @@ func NewImageCmd(opts Options) *cobra.Command {
 		opts.AutomotiveImageBuilder, "aib-image",
 		automotivev1alpha1.DefaultAutomotiveImageBuilderImage, "AIB container image",
 	)
-	buildDevCmd.Flags().StringVar(opts.StorageClass, "storage-class", "", "Kubernetes storage class")
 	buildDevCmd.Flags().StringArrayVarP(opts.CustomDefs, "define", "D", []string{}, "custom definition KEY=VALUE")
+	buildDevCmd.Flags().StringArrayVar(opts.DefineFiles, "define-file", []string{}, "load defines from YAML dictionary file (can be repeated)")
 	buildDevCmd.Flags().StringArrayVar(opts.AIBExtraArgs, "extra-args", []string{}, "extra arguments to pass to AIB (can be repeated)")
-	buildDevCmd.Flags().StringArrayVar(opts.ExtraRepos, "extra-repo", []string{}, "serve RPMs from workspace as extra repo (workspace:path, can be repeated)")
+	buildDevCmd.Flags().StringVar(opts.RootPassword, "root-password", "", "set hashed root password (env:VAR or file:PATH)")
+	buildDevCmd.Flags().StringArrayVar(opts.ExtraRepos, "extra-repo", []string{}, "extra RPM repo (workspace:path or oci:image-ref, can be repeated)")
+	buildDevCmd.Flags().StringVar(opts.LocalRepo, "local-repo", "", "OCI image with RPM repo to use as primary package source (preferred over network repos)")
 	buildDevCmd.Flags().StringVar(opts.Workspace, "workspace", "", "workspace name for build caching and lease forwarding")
 	buildDevCmd.Flags().IntVar(opts.Timeout, "timeout", 60, "timeout in minutes")
 	buildDevCmd.Flags().BoolVarP(opts.WaitForBuild, "wait", "w", false, "wait for build to complete")
@@ -255,10 +290,19 @@ func NewImageCmd(opts Options) *cobra.Command {
 	buildDevCmd.Flags().StringVar(opts.LeaseName, "lease", "", "existing Jumpstarter lease name (mutually exclusive with --lease-duration)")
 	buildDevCmd.Flags().StringVar(opts.FlashCmd, "flash-cmd", "", "override flash command (default: from OperatorConfig target mapping)")
 	buildDevCmd.Flags().StringVar(opts.ExporterSelector, "exporter", "", "direct exporter selector for flash (alternative to --target lookup)")
+	buildDevCmd.Flags().StringArrayVar(opts.LeaseTags, "lease-tag", []string{}, "tag for Jumpstarter lease (key=value, can be repeated)")
+	// Secure build
+	buildDevCmd.Flags().BoolVar(opts.SecureBuild, "secure", false, "resolve tasks from signed Tekton Bundle (requires OperatorConfig taskBundleRef)")
+	buildDevCmd.Flags().StringVar(opts.TTL, "ttl", "", "time-to-live for the build (e.g. 24h, 72h, 168h); empty=server default, 0=no expiry")
+	// Reproducible build
+	buildDevCmd.Flags().BoolVar(opts.Reproducible, "reproducible", false, "save RPMs, manifest, and task bundle for future reproduction (requires --secure)")
+	buildDevCmd.Flags().StringVar(opts.TaskBundleRef, "task-bundle-ref", "", "digest-pinned Tekton bundle ref for reproducible rebuild (e.g. quay.io/org/tasks@sha256:abc...)")
+	buildDevCmd.Flags().StringVar(opts.RestoreSourcesRef, "restore-sources", "", "OCI image ref from prior build — restores archived sources for exact reproducible rebuild")
 	// Internal registry options
 	buildDevCmd.Flags().BoolVar(opts.UseInternalRegistry, "internal-registry", false, "push to OpenShift internal registry")
 	buildDevCmd.Flags().StringVar(opts.InternalRegistryImageName, "image-name", "", "override image name for internal registry (default: build name)")
 	buildDevCmd.Flags().StringVar(opts.InternalRegistryTag, "image-tag", "", "tag for internal registry image (default: disk)")
+	addS3Flags(buildDevCmd, opts)
 
 	// logs command flags
 	logsCmd.Flags().StringVar(opts.ServerURL, "server", defaultServer, "REST API server base URL")
@@ -278,6 +322,10 @@ func NewImageCmd(opts Options) *cobra.Command {
 	deleteCmd.Flags().StringVar(opts.ServerURL, "server", defaultServer, "REST API server base URL")
 	deleteCmd.Flags().StringVar(opts.AuthToken, "token", os.Getenv("CAIB_TOKEN"), "Bearer token for authentication")
 
+	// cancel command flags
+	cancelCmd.Flags().StringVar(opts.ServerURL, "server", defaultServer, "REST API server base URL")
+	cancelCmd.Flags().StringVar(opts.AuthToken, "token", os.Getenv("CAIB_TOKEN"), "Bearer token for authentication")
+
 	// flash command flags
 	flashCmd.Flags().StringVar(opts.ServerURL, "server", defaultServer, "REST API server base URL")
 	flashCmd.Flags().StringVar(opts.AuthToken, "token", os.Getenv("CAIB_TOKEN"), "Bearer token for authentication")
@@ -288,6 +336,7 @@ func NewImageCmd(opts Options) *cobra.Command {
 	flashCmd.Flags().StringVar(opts.LeaseDuration, "lease-duration", "03:00:00", "device lease duration (HH:MM:SS)")
 	flashCmd.Flags().StringVar(opts.LeaseName, "lease", "", "existing Jumpstarter lease name (mutually exclusive with --lease-duration)")
 	flashCmd.Flags().StringVar(opts.FlashCmd, "flash-cmd", "", "override flash command (default: from OperatorConfig target mapping)")
+	flashCmd.Flags().StringArrayVar(opts.LeaseTags, "lease-tag", []string{}, "tag for Jumpstarter lease (key=value, can be repeated)")
 	flashCmd.Flags().StringVar(
 		opts.RegistryAuthFile,
 		"registry-auth-file",
@@ -296,6 +345,15 @@ func NewImageCmd(opts Options) *cobra.Command {
 	)
 	flashCmd.Flags().BoolVarP(opts.FollowLogs, "follow", "f", false, "follow flash logs (shows full log output instead of progress bar)")
 	flashCmd.Flags().BoolVarP(opts.WaitForBuild, "wait", "w", true, "wait for flash to complete")
+	inspectCmd := newInspectCmd(opts)
+	inspectCmd.Flags().StringVar(
+		opts.RegistryAuthFile,
+		"registry-auth-file",
+		"",
+		"path to Docker/Podman auth file for registry authentication",
+	)
+	inspectCmd.Flags().StringVarP(opts.OutputDir, "output-dir", "o", "", "download referrer artifacts (manifest, RPMs) to this directory")
+
 	// Sealed operation shared flags
 	addSealedFlags(prepareResealCmd, opts, defaultServer)
 	addSealedFlags(resealCmd, opts, defaultServer)
@@ -313,7 +371,9 @@ func NewImageCmd(opts Options) *cobra.Command {
 		logsCmd,
 		tokenCmd,
 		deleteCmd,
+		cancelCmd,
 		flashCmd,
+		inspectCmd,
 		prepareResealCmd,
 		resealCmd,
 		extractForSigningCmd,
@@ -384,16 +444,29 @@ Examples:
 
 func newFlashCmd(opts Options) *cobra.Command {
 	return &cobra.Command{
-		Use:   "flash <oci-registry-reference>",
+		Use:   "flash <oci-registry-reference|catalog-image-name>",
 		Short: "Flash a disk image to hardware via Jumpstarter",
-		Long: `Flash a disk image from an OCI registry to a hardware device using Jumpstarter.
+		Long: `Flash a disk image from an OCI registry or catalog name to a hardware device using Jumpstarter.
+
+A name without '/' is treated as a CatalogImage (for example qa-ebbr). The API
+resolves it to a digest-pinned registry URL. A value containing '/' is an OCI
+reference (quay.io/org/disk:v1).
 
 This command connects to a Jumpstarter exporter to flash the specified disk image
 onto physical hardware. The Jumpstarter client config is auto-detected from
 ~/.config/jumpstarter/ (or $JMP_CLIENT_CONFIG_HOME), or can be specified with --client.
 
+If --target and --exporter are both omitted, the target is auto-detected from the
+OCI image manifest annotations (set by the operator during image push).
+
 Examples:
-  # Flash using auto-detected client config
+  # Flash a catalog head by name
+  caib image flash qa-ebbr --target j784s4evm
+
+  # Flash with auto-detected target (from image annotations)
+  caib image flash quay.io/org/disk:v1
+
+  # Flash with explicit target
   caib image flash quay.io/org/disk:v1 --target j784s4evm
 
   # Flash with explicit client config
@@ -425,7 +498,7 @@ Examples:
   caib image show my-build
 
   # Show details as JSON
-  caib image show my-build -o json`,
+  caib image show my-build --output-format json`,
 		Args: cobra.ExactArgs(1),
 		Run:  opts.RunShow,
 	}
@@ -519,6 +592,50 @@ Examples:
 	}
 }
 
+func newCancelCmd(opts Options) *cobra.Command {
+	return &cobra.Command{
+		Use:   "cancel <build-name>",
+		Short: "Cancel an in-progress build",
+		Long: `Cancel stops an in-progress build by cancelling its Tekton PipelineRun.
+The ImageBuild resource is preserved so you can inspect its logs and status.
+
+Only builds in Pending, Uploading, or Building phase can be cancelled.
+You can only cancel builds that you created.
+
+Examples:
+  # Cancel a running build
+  caib image cancel my-build
+
+  # List builds first, then cancel one
+  caib image list
+  caib image cancel <build-name>`,
+		Args: cobra.ExactArgs(1),
+		Run:  opts.RunCancel,
+	}
+}
+
+func newInspectCmd(opts Options) *cobra.Command {
+	return &cobra.Command{
+		Use:   "inspect <oci-registry-reference>",
+		Short: "Show build provenance and reproducibility info for an OCI artifact",
+		Long: `Inspect reads OCI manifest annotations and referrer artifacts to display
+build provenance information: distro, target, architecture, builder versions,
+and the exact command to reproduce the build.
+
+If --output-dir is given, referrer artifacts (AIB manifest, RPM archive,
+osbuild manifest) are downloaded to the specified directory.
+
+Examples:
+  # Show build provenance
+  caib image inspect quay.io/org/my-os:v1
+
+  # Show provenance and download artifacts for reproduction
+  caib image inspect quay.io/org/my-os:v1 -o ./rebuild/`,
+		Args: cobra.ExactArgs(1),
+		Run:  opts.RunInspect,
+	}
+}
+
 func newPrepareResealCmd(opts Options) *cobra.Command {
 	return &cobra.Command{
 		Use:   "prepare-reseal [source-container] [output-container]",
@@ -575,6 +692,17 @@ Input, signed artifact, and output can be given as positionals or via --input, -
 		Args: cobra.RangeArgs(0, 3),
 		Run:  opts.RunInjectSigned,
 	}
+}
+
+func addS3Flags(cmd *cobra.Command, opts Options) {
+	cmd.Flags().StringVar(opts.S3Bucket, "s3-bucket", "", "S3 bucket name for artifact upload")
+	cmd.Flags().StringVar(opts.S3Prefix, "s3-prefix", "", "S3 key prefix (path within bucket)")
+	cmd.Flags().StringVar(opts.S3Region, "s3-region", "", "S3 region (defaults to us-east-1 if not specified)")
+	cmd.Flags().StringVar(opts.S3Endpoint, "s3-endpoint", "", "Custom S3 endpoint URL (for MinIO/Ceph)")
+	cmd.Flags().StringVar(opts.S3AccessKeyID, "s3-access-key-id", "", "S3 access key ID (env: AWS_ACCESS_KEY_ID)")
+	cmd.Flags().StringVar(opts.S3SecretAccessKey, "s3-secret-access-key", "", "S3 secret access key (env: AWS_SECRET_ACCESS_KEY)")
+	cmd.Flags().StringVar(opts.S3CredentialsSecret, "s3-credentials-secret", "", "Existing K8s secret with S3 credentials")
+	cmd.Flags().BoolVar(opts.S3Insecure, "s3-insecure", false, "Skip TLS verification for S3 endpoint")
 }
 
 func addSealedFlags(cmd *cobra.Command, opts Options, defaultServer string) {

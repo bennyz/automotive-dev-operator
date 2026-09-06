@@ -6,18 +6,20 @@ set -euo pipefail
 # Works on both macOS (podman machine VM) and Linux (native podman).
 # Run this after CRC is ready and before deploy-catalog.sh.
 #
-# Linux:  sudo bash hack/crc/04-expose-default-registry.sh
+# Linux:  bash hack/crc/04-expose-default-registry.sh   (run as crcusr, NOT as root)
 # macOS:  bash hack/crc/04-expose-default-registry.sh
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; CYAN='\033[0;36m'; YELLOW='\033[1;33m'; NC='\033[0m'
+OS="$(uname -s)"
+CRC_API_URL="${CRC_API_URL:-https://api.crc.testing:6443}"
+CRC_USER_HOME="$HOME"
+
 info()  { echo -e "${CYAN}>>> $*${NC}"; }
 ok()    { echo -e "${GREEN}✓ $*${NC}"; }
 warn()  { echo -e "${YELLOW}⚠ $*${NC}"; }
 fail()  { echo -e "${RED}✗ $*${NC}"; exit 1; }
 
-OS="$(uname -s)"
 
-CRC_USER_HOME="$HOME"
 if [[ "$OS" == "Linux" && $EUID -eq 0 ]]; then
     CRC_USER="${CRC_USER:-${SUDO_USER:-}}"
     if [[ -n "$CRC_USER" ]]; then
@@ -85,8 +87,8 @@ ok "Registry host: $HOST"
 ###############################################################################
 # Extract ingress certificate
 ###############################################################################
-CERT_DIR="/tmp/registry-certs"
-mkdir -p "$CERT_DIR"
+CERT_DIR="$(mktemp -d -t registry-certs.XXXXXX)"
+trap 'rm -rf "$CERT_DIR"' EXIT
 
 CERT_SECRET="$(oc get ingresscontroller -n openshift-ingress-operator default -o jsonpath='{.spec.defaultCertificate.name}')"
 CERT_SECRET="${CERT_SECRET:-router-certs-default}"
@@ -173,7 +175,7 @@ if command -v podman >/dev/null 2>&1; then
             KUBE_PASS=$(run_as_user "crc console --credentials 2>/dev/null" | grep kubeadmin | sed "s/.*-p \([^ ]*\) .*/\1/" | head -1)
         fi
         [[ -n "$KUBE_PASS" ]] || fail "Cannot obtain kubeadmin password from 'crc console --credentials'."
-        oc login -u kubeadmin -p "$KUBE_PASS" "https://api.crc.testing:6443" --insecure-skip-tls-verify >/dev/null
+        oc login -u kubeadmin -p "$KUBE_PASS" "$CRC_API_URL" --insecure-skip-tls-verify >/dev/null
         OC_TOKEN="$(oc whoami -t)"
     fi
     SAFE_TOKEN=$(printf '%q' "$OC_TOKEN")

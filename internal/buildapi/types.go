@@ -17,8 +17,23 @@ type Architecture string
 // ExportFormat represents the disk image format (e.g., qcow2, raw, simg).
 type ExportFormat string
 
+// Compression represents the artifact compression algorithm.
+type Compression string
+
 // Mode represents the build mode (bootc, image, package, or disk).
 type Mode string
+
+// Supported CPU architectures.
+const (
+	ArchAMD64 Architecture = "amd64"
+	ArchARM64 Architecture = "arm64"
+)
+
+// Supported compression algorithms for build artifacts.
+const (
+	CompressionGzip Compression = "gzip"
+	CompressionXZ   Compression = "xz"
+)
 
 const (
 	// ModeBootc creates immutable, container-based OS images using bootc (default)
@@ -42,11 +57,38 @@ func (d Distro) IsValid() bool { return IsValid(string(d)) }
 // IsValid returns true if the target value is non-empty.
 func (t Target) IsValid() bool { return IsValid(string(t)) }
 
-// IsValid returns true if the architecture value is non-empty.
-func (a Architecture) IsValid() bool { return IsValid(string(a)) }
+// Normalize maps Linux-convention architecture names to Kubernetes/OCI names.
+func (a Architecture) Normalize() Architecture {
+	switch strings.ToLower(strings.TrimSpace(string(a))) {
+	case "x86_64", "amd64":
+		return ArchAMD64
+	case "aarch64", "arm64":
+		return ArchARM64
+	default:
+		return a
+	}
+}
+
+// IsValid returns true if the architecture is a supported value.
+func (a Architecture) IsValid() bool {
+	switch a {
+	case ArchAMD64, ArchARM64:
+		return true
+	}
+	return false
+}
 
 // IsValid returns true if the export format value is non-empty.
 func (e ExportFormat) IsValid() bool { return IsValid(string(e)) }
+
+// IsValid returns true if the compression value is a supported algorithm.
+func (c Compression) IsValid() bool {
+	switch c {
+	case CompressionGzip, CompressionXZ:
+		return true
+	}
+	return false
+}
 
 // IsValid returns true if the mode value is non-empty.
 func (m Mode) IsValid() bool { return IsValid(string(m)) }
@@ -109,9 +151,11 @@ func ParseMode(s string) (Mode, error) {
 
 // BuildRequest is the payload to create a build via the REST API
 type BuildRequest struct {
-	Name             string `json:"name"`
-	Manifest         string `json:"manifest,omitempty"`
-	ManifestFileName string `json:"manifestFileName,omitempty"`
+	ExternalID       string         `json:"externalId,omitempty"`
+	Callback         *BuildCallback `json:"callback,omitempty"`
+	Name             string         `json:"name"`
+	Manifest         string         `json:"manifest,omitempty"`
+	ManifestFileName string         `json:"manifestFileName,omitempty"`
 	// ContainerRef is for disk mode: existing container to convert
 	ContainerRef           string               `json:"containerRef,omitempty"`
 	Distro                 Distro               `json:"distro"`
@@ -123,9 +167,12 @@ type BuildRequest struct {
 	StorageClass           string               `json:"storageClass"`
 	CustomDefs             []string             `json:"customDefs"`
 	AIBExtraArgs           []string             `json:"aibExtraArgs"`
-	ExtraRepos             []string             `json:"extraRepos,omitempty"` // workspace-name:/path pairs
-	Workspace              string               `json:"workspace,omitempty"`  // workspace name for build caching and lease forwarding
-	Compression            string               `json:"compression,omitempty"`
+	RootPassword           string               `json:"rootPassword,omitempty"`
+	ExtraRepos             []string             `json:"extraRepos,omitempty"`    // workspace-name:/path pairs
+	OCIRepoImages          []string             `json:"ociRepoImages,omitempty"` // OCI image refs containing RPM repos
+	LocalRepo              bool                 `json:"localRepo,omitempty"`     // prefer OCI repo over network repos (priority=1)
+	Workspace              string               `json:"workspace,omitempty"`     // workspace name for build caching and lease forwarding
+	Compression            Compression          `json:"compression,omitempty"`
 	RegistryCredentials    *RegistryCredentials `json:"registryCredentials,omitempty"`
 	PushRepository         string               `json:"pushRepository,omitempty"`
 
@@ -134,11 +181,28 @@ type BuildRequest struct {
 	ExportOCI      string `json:"exportOci,omitempty"`      // Registry URL to push disk as OCI artifact
 	BuilderImage   string `json:"builderImage,omitempty"`   // Custom builder image
 	RebuildBuilder bool   `json:"rebuildBuilder,omitempty"` // Force rebuild of bootc builder image
+	HasLocalFiles  bool   `json:"hasLocalFiles,omitempty"`  // Client has local files to upload (source_path/source_glob)
 
 	// Internal registry push configuration
 	UseInternalRegistry       bool   `json:"useInternalRegistry,omitempty"`       // Push to OpenShift internal registry
 	InternalRegistryImageName string `json:"internalRegistryImageName,omitempty"` // Override image name (default: build name)
 	InternalRegistryTag       string `json:"internalRegistryTag,omitempty"`       // Tag for internal registry image (default: "bootc" for bootc mode, "disk" for disk/traditional mode)
+
+	// Secure build: resolve tasks from signed Tekton Bundle
+	SecureBuild bool `json:"secureBuild,omitempty"`
+
+	// TaskBundleRef overrides OperatorConfig's taskBundleRef (for reproducible rebuilds)
+	TaskBundleRef string `json:"taskBundleRef,omitempty"`
+
+	// Reproducible saves RPMs, AIB manifest, and task bundle ref as OCI referrers
+	Reproducible bool `json:"reproducible,omitempty"`
+
+	// RestoreSourcesRef is an OCI image reference whose archived sources will be
+	// restored into the build's osbuild store before building.
+	RestoreSourcesRef string `json:"restoreSourcesRef,omitempty"`
+
+	// TTL is the time-to-live for the build. Empty uses server default, "0" disables expiry.
+	TTL string `json:"ttl,omitempty"`
 
 	// Flash configuration for Jumpstarter device flashing after build
 	FlashEnabled          bool   `json:"flashEnabled,omitempty"`          // Enable flashing after build
@@ -147,6 +211,16 @@ type BuildRequest struct {
 	FlashLeaseName        string `json:"flashLeaseName,omitempty"`        // Existing lease name (mutually exclusive with FlashLeaseDuration)
 	FlashCmd              string `json:"flashCmd,omitempty"`              // Override flash command from OperatorConfig
 	FlashExporterSelector string `json:"flashExporterSelector,omitempty"` // Override exporter selector from OperatorConfig
+	FlashLeaseTags        string `json:"flashLeaseTags,omitempty"`        // Additional lease tags (comma-separated key=value)
+
+	// S3 configuration for pushing disk artifacts to S3-compatible storage
+	S3Bucket                string         `json:"s3Bucket,omitempty"`                // S3 bucket name
+	S3Prefix                string         `json:"s3Prefix,omitempty"`                // S3 key prefix (path within bucket)
+	S3Endpoint              string         `json:"s3Endpoint,omitempty"`              // S3 endpoint URL (for MinIO/Ceph, empty for AWS)
+	S3Region                string         `json:"s3Region,omitempty"`                // S3 region (default: us-east-1)
+	S3Credentials           *S3Credentials `json:"s3Credentials,omitempty"`           // S3 access credentials (creates new secret)
+	S3CredentialsSecretName string         `json:"s3CredentialsSecretName,omitempty"` // Use existing K8s secret (alternative to s3Credentials)
+	S3InsecureSkipTLSVerify bool           `json:"s3InsecureSkipTLSVerify,omitempty"` // Skip TLS verification for S3 endpoint
 }
 
 // RegistryCredentials contains authentication details for container registries.
@@ -158,6 +232,12 @@ type RegistryCredentials struct {
 	Password     string `json:"password"`
 	Token        string `json:"token"`
 	DockerConfig string `json:"dockerConfig"`
+}
+
+// S3Credentials contains S3 authentication details
+type S3Credentials struct {
+	AccessKeyID     string `json:"accessKeyId"`
+	SecretAccessKey string `json:"secretAccessKey"`
 }
 
 // JumpstarterInfo contains information about Jumpstarter device flashing availability
@@ -174,10 +254,15 @@ type JumpstarterInfo struct {
 
 // FlashRequest is the payload to flash an image via Jumpstarter
 type FlashRequest struct {
+	ExternalID string         `json:"externalId,omitempty"`
+	Callback   *BuildCallback `json:"callback,omitempty"`
 	// Name is the flash job name (auto-generated if omitted)
 	Name string `json:"name"`
 	// ImageRef is the OCI registry reference of the disk image to flash
-	ImageRef string `json:"imageRef"`
+	ImageRef string `json:"imageRef,omitempty"`
+	// CatalogImage is a CatalogImage resource name. When set, the API resolves
+	// it to a digest-pinned registry URL and overwrites ImageRef.
+	CatalogImage string `json:"catalogImage,omitempty"`
 	// Target is the target platform for exporter lookup from OperatorConfig
 	Target string `json:"target,omitempty"`
 	// ExporterSelector is the direct label selector for Jumpstarter exporters (alternative to Target)
@@ -190,45 +275,58 @@ type FlashRequest struct {
 	LeaseDuration string `json:"leaseDuration,omitempty"`
 	// LeaseName is an existing Jumpstarter lease name (mutually exclusive with LeaseDuration)
 	LeaseName string `json:"leaseName,omitempty"`
+	// LeaseTags are additional key=value tags for the lease (comma-separated)
+	LeaseTags string `json:"leaseTags,omitempty"`
 	// RegistryCredentials contains OCI registry auth for pulling the flash image on the exporter
 	RegistryCredentials *RegistryCredentials `json:"registryCredentials,omitempty"`
 }
 
 // FlashResponse is returned by flash operations
 type FlashResponse struct {
-	Name           string `json:"name"`
-	Phase          string `json:"phase"`
-	Message        string `json:"message"`
-	RequestedBy    string `json:"requestedBy,omitempty"`
-	StartTime      string `json:"startTime,omitempty"`
-	CompletionTime string `json:"completionTime,omitempty"`
-	TaskRunName    string `json:"taskRunName,omitempty"`
+	ExternalID     string              `json:"externalId,omitempty"`
+	Notification   *NotificationStatus `json:"notification,omitempty"`
+	Name           string              `json:"name"`
+	Phase          string              `json:"phase"`
+	Message        string              `json:"message"`
+	RequestedBy    string              `json:"requestedBy,omitempty"`
+	StartTime      string              `json:"startTime,omitempty"`
+	CompletionTime string              `json:"completionTime,omitempty"`
+	TaskRunName    string              `json:"taskRunName,omitempty"`
+	LeaseID        string              `json:"leaseId,omitempty"`
 }
 
 // FlashListItem represents a flash TaskRun in the list API
 type FlashListItem struct {
-	Name           string `json:"name"`
-	Phase          string `json:"phase"`
-	Message        string `json:"message"`
-	RequestedBy    string `json:"requestedBy,omitempty"`
-	CreatedAt      string `json:"createdAt"`
-	CompletionTime string `json:"completionTime,omitempty"`
+	ExternalID     string              `json:"externalId,omitempty"`
+	Notification   *NotificationStatus `json:"notification,omitempty"`
+	Name           string              `json:"name"`
+	Phase          string              `json:"phase"`
+	Message        string              `json:"message"`
+	RequestedBy    string              `json:"requestedBy,omitempty"`
+	CreatedAt      string              `json:"createdAt"`
+	CompletionTime string              `json:"completionTime,omitempty"`
 }
 
 // BuildResponse is returned by POST and GET build operations
 type BuildResponse struct {
-	Name           string           `json:"name"`
-	Phase          string           `json:"phase"`
-	Message        string           `json:"message"`
-	RequestedBy    string           `json:"requestedBy,omitempty"`
-	StartTime      string           `json:"startTime,omitempty"`
-	CompletionTime string           `json:"completionTime,omitempty"`
-	ContainerImage string           `json:"containerImage,omitempty"`
-	DiskImage      string           `json:"diskImage,omitempty"`
-	RegistryToken  string           `json:"registryToken,omitempty"`
-	Warning        string           `json:"warning,omitempty"`
-	Jumpstarter    *JumpstarterInfo `json:"jumpstarter,omitempty"`
-	Parameters     *BuildParameters `json:"parameters,omitempty"`
+	ExternalID     string              `json:"externalId,omitempty"`
+	Artifacts      []ArtifactStatus    `json:"artifacts,omitempty"`
+	Flash          *FlashOutcomeStatus `json:"flash,omitempty"`
+	Notification   *NotificationStatus `json:"notification,omitempty"`
+	Name           string              `json:"name"`
+	Phase          string              `json:"phase"`
+	Message        string              `json:"message"`
+	RequestedBy    string              `json:"requestedBy,omitempty"`
+	StartTime      string              `json:"startTime,omitempty"`
+	CompletionTime string              `json:"completionTime,omitempty"`
+	ContainerImage string              `json:"containerImage,omitempty"`
+	DiskImage      string              `json:"diskImage,omitempty"`
+	RegistryToken  string              `json:"registryToken,omitempty"`
+	TraceID        string              `json:"traceId,omitempty"`
+	Warning        string              `json:"warning,omitempty"`
+	ExpiresAt      string              `json:"expiresAt,omitempty"`
+	Jumpstarter    *JumpstarterInfo    `json:"jumpstarter,omitempty"`
+	Parameters     *BuildParameters    `json:"parameters,omitempty"`
 }
 
 // BuildParameters describes the key input parameters that produced an ImageBuild.
@@ -261,15 +359,19 @@ type TokenResponse struct {
 
 // BuildListItem represents a build in the list API
 type BuildListItem struct {
-	Name           string `json:"name"`
-	Phase          string `json:"phase"`
-	Message        string `json:"message"`
-	RequestedBy    string `json:"requestedBy,omitempty"`
-	CreatedAt      string `json:"createdAt"`
-	StartTime      string `json:"startTime,omitempty"`
-	CompletionTime string `json:"completionTime,omitempty"`
-	ContainerImage string `json:"containerImage,omitempty"`
-	DiskImage      string `json:"diskImage,omitempty"`
+	ExternalID     string              `json:"externalId,omitempty"`
+	Artifacts      []ArtifactStatus    `json:"artifacts,omitempty"`
+	Flash          *FlashOutcomeStatus `json:"flash,omitempty"`
+	Notification   *NotificationStatus `json:"notification,omitempty"`
+	Name           string              `json:"name"`
+	Phase          string              `json:"phase"`
+	Message        string              `json:"message"`
+	RequestedBy    string              `json:"requestedBy,omitempty"`
+	CreatedAt      string              `json:"createdAt"`
+	StartTime      string              `json:"startTime,omitempty"`
+	CompletionTime string              `json:"completionTime,omitempty"`
+	ContainerImage string              `json:"containerImage,omitempty"`
+	DiskImage      string              `json:"diskImage,omitempty"`
 }
 
 // JumpstarterTarget contains flash-specific config for a target (from CRD)
@@ -278,11 +380,13 @@ type JumpstarterTarget struct {
 	FlashCmd string `json:"flashCmd,omitempty"`
 }
 
-// TargetDefaults contains build defaults for a target (from ConfigMap)
+// TargetDefaults contains build defaults and validation hints for a target (from ConfigMap)
 type TargetDefaults struct {
-	Architecture  string   `json:"architecture,omitempty"`
-	ExtraArgs     []string `json:"extraArgs,omitempty"`
-	DefaultFormat string   `json:"defaultFormat,omitempty"`
+	Architecture          string   `json:"architecture,omitempty"`
+	ExtraArgs             []string `json:"extraArgs,omitempty"`
+	DefaultFormat         string   `json:"defaultFormat,omitempty"`
+	AcceptedFormats       []string `json:"acceptedFormats,omitempty"`
+	AcceptedArchitectures []string `json:"acceptedArchitectures,omitempty"`
 }
 
 // OperatorConfigResponse returns relevant operator configuration for CLI validation
@@ -291,6 +395,8 @@ type OperatorConfigResponse struct {
 	JumpstarterTargets map[string]JumpstarterTarget `json:"jumpstarterTargets,omitempty"`
 	// TargetDefaults contains build defaults per target (from ConfigMap)
 	TargetDefaults map[string]TargetDefaults `json:"targetDefaults,omitempty"`
+	// AutomotiveImageBuilder is the resolved AIB container image (from OperatorConfig or default)
+	AutomotiveImageBuilder string `json:"automotiveImageBuilder,omitempty"`
 }
 
 type (

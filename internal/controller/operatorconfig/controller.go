@@ -23,13 +23,18 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	automotivev1alpha1 "github.com/centos-automotive-suite/automotive-dev-operator/api/v1alpha1"
 	"github.com/centos-automotive-suite/automotive-dev-operator/internal/common/tasks"
+	controllerutils "github.com/centos-automotive-suite/automotive-dev-operator/internal/controller/controllerutils"
 )
 
 const (
@@ -44,60 +49,41 @@ const (
 // targetDefaultsYAML is the default content for the aib-target-defaults ConfigMap.
 // It defines per-target build defaults (architecture, extra args, partition rules).
 var targetDefaultsYAML = `targets:
-  ridesx4:
-    architecture: arm64
-    extraArgs: ["--separate-partitions"]
-    include: ["system_a", "system_b", "boot_a", "boot_b"]
-    defaultFormat: "simg"
-  ridesx4_r3:
-    architecture: arm64
-    extraArgs: ["--separate-partitions"]
-    include: ["system_a", "system_b", "boot_a", "boot_b"]
-    defaultFormat: "simg"
-  ridesx4_scmi:
-    architecture: arm64
-    extraArgs: ["--separate-partitions"]
-    include: ["system_a", "system_b", "boot_a", "boot_b"]
-    defaultFormat: "simg"
   ride4_sa8775p_sx_r3:
     architecture: arm64
     extraArgs: ["--separate-partitions"]
-    include: ["system_a", "system_b", "boot_a", "boot_b"]
+    include: ["system_a", "system_b", "boot_a", "boot_b", "abl_a", "abl_b"]
     defaultFormat: "simg"
+    acceptedFormats: ["simg"]
+    acceptedArchitectures: ["arm64"]
   ride4_sa8775p_sx:
     architecture: arm64
     extraArgs: ["--separate-partitions"]
-    include: ["system_a", "system_b", "boot_a", "boot_b"]
+    include: ["system_a", "system_b", "boot_a", "boot_b", "abl_a", "abl_b"]
     defaultFormat: "simg"
-  ride4_sa8775p_sx_legacy:
-    architecture: arm64
-    extraArgs: ["--separate-partitions"]
-    include: ["system_a", "system_b", "boot_a", "boot_b"]
-    defaultFormat: "simg"
-  ride4_sa8775p_sx_legacy_r3:
-    architecture: arm64
-    extraArgs: ["--separate-partitions"]
-    include: ["system_a", "system_b", "boot_a", "boot_b"]
-    defaultFormat: "simg"
+    acceptedFormats: ["simg"]
+    acceptedArchitectures: ["arm64"]
   ride4_sa8650p_sx_r3:
     architecture: arm64
     extraArgs: ["--separate-partitions"]
-    include: ["system_a", "system_b", "boot_a", "boot_b"]
+    include: ["system_a", "system_b", "boot_a", "boot_b", "abl_a", "abl_b"]
     defaultFormat: "simg"
+    acceptedFormats: ["simg"]
+    acceptedArchitectures: ["arm64"]
   ebbr:
     architecture: arm64
     defaultFormat: "simg"
-  rcar_s4:
-    architecture: arm64
-    defaultFormat: "simg"
+    acceptedFormats: ["simg", "raw"]
+    acceptedArchitectures: ["arm64"]
   j784s4evm:
     architecture: arm64
     defaultFormat: "simg"
-  s32g_vnp_rdb3:
-    architecture: arm64
-    defaultFormat: "simg"
+    acceptedFormats: ["simg", "raw"]
+    acceptedArchitectures: ["arm64"]
   qemu:
     defaultFormat: "raw"
+    acceptedFormats: ["qcow2", "raw"]
+    acceptedArchitectures: ["amd64", "arm64", "x86_64", "aarch64"]
 `
 
 // isNoMatchError checks if error is "no matches for kind" error (CRD doesn't exist)
@@ -183,20 +169,38 @@ type OperatorConfigReconciler struct {
 	IsJumpstarter *bool
 }
 
-// +kubebuilder:rbac:groups=automotive.sdv.cloud.redhat.com,resources=operatorconfigs,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=automotive.sdv.cloud.redhat.com,resources=operatorconfigs/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=automotive.sdv.cloud.redhat.com,resources=operatorconfigs/finalizers,verbs=update
+// +kubebuilder:rbac:groups=automotive.sdv.cloud.redhat.com,namespace=system,resources=operatorconfigs,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=automotive.sdv.cloud.redhat.com,namespace=system,resources=operatorconfigs/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=automotive.sdv.cloud.redhat.com,namespace=system,resources=operatorconfigs/finalizers,verbs=update
 // +kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list;watch
-// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=serviceaccounts,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles;rolebindings;clusterroles;clusterrolebindings,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=route.openshift.io,resources=routes,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=tekton.dev,resources=tasks;pipelines;pipelineruns,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=apps,namespace=system,resources=deployments,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",namespace=system,resources=services,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",namespace=system,resources=configmaps,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",namespace=system,resources=secrets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",namespace=system,resources=serviceaccounts,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,namespace=system,resources=roles;rolebindings,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles;clusterrolebindings,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=route.openshift.io,namespace=system,resources=routes,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=networking.k8s.io,namespace=system,resources=ingresses,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=tekton.dev,namespace=system,resources=tasks;pipelines;pipelineruns,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=security.openshift.io,resources=securitycontextconstraints,verbs=get;list;watch;create;update;patch;delete;use
+// +kubebuilder:rbac:groups=monitoring.coreos.com,namespace=system,resources=servicemonitors,verbs=get;list;watch;create;update;patch;delete
+
+// setCondition sets a condition on the OperatorConfig status
+func (r *OperatorConfigReconciler) setCondition(
+	config *automotivev1alpha1.OperatorConfig,
+	conditionType string,
+	status metav1.ConditionStatus,
+	reason, message string,
+) {
+	apimeta.SetStatusCondition(&config.Status.Conditions, metav1.Condition{
+		Type:               conditionType,
+		Status:             status,
+		Reason:             reason,
+		Message:            message,
+		ObservedGeneration: config.Generation,
+	})
+}
 
 // Reconcile reconciles the OperatorConfig resource lifecycle.
 func (r *OperatorConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -221,9 +225,7 @@ func (r *OperatorConfigReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			log.Error(err, "Failed to add finalizer")
 			return ctrl.Result{}, err
 		}
-		log.Info("Finalizer added, requeuing")
-		// Requeue to avoid doing more work in this reconciliation
-		return ctrl.Result{Requeue: true}, nil
+		// GenerationChangedPredicate drops this Update; continue here.
 	}
 
 	// Handle deletion
@@ -231,6 +233,10 @@ func (r *OperatorConfigReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		log.Info("Handling deletion")
 		if err := r.cleanupOSBuilds(ctx, config); err != nil {
 			log.Error(err, "Failed to cleanup OSBuilds")
+			return ctrl.Result{}, err
+		}
+		if err := r.cleanupServiceMonitor(ctx, config); err != nil {
+			log.Error(err, "Failed to cleanup ServiceMonitor")
 			return ctrl.Result{}, err
 		}
 		log.Info("Removing finalizer")
@@ -243,65 +249,72 @@ func (r *OperatorConfigReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, nil
 	}
 
-	statusChanged := false
+	r.setCondition(config, automotivev1alpha1.OperatorConfigConditionReconciling, metav1.ConditionTrue, "Reconciling", "Reconciliation in progress")
 
 	// Reconcile OSBuilds
 	log.Info("Processing OSBuilds configuration", "osBuilds", config.Spec.OSBuilds, "generation", config.Generation)
 	if config.Spec.OSBuilds != nil && config.Spec.OSBuilds.Enabled {
 		if err := r.deployOSBuilds(ctx, config); err != nil {
 			log.Error(err, "Failed to deploy OSBuilds")
-			if config.Status.Phase != phaseFailed || config.Status.OSBuildsDeployed {
-				config.Status.Phase = phaseFailed
-				config.Status.Message = fmt.Sprintf("Failed to deploy OSBuilds: %v", err)
-				config.Status.OSBuildsDeployed = false
-				statusChanged = true
-			}
-			if statusChanged {
-				_ = r.Status().Update(ctx, config)
+			failMsg := fmt.Sprintf("Failed to deploy OSBuilds: %v", err)
+			config.Status.Phase = phaseFailed
+			config.Status.Message = failMsg
+			config.Status.OSBuildsDeployed = false
+			r.setCondition(config, automotivev1alpha1.OperatorConfigConditionReady, metav1.ConditionFalse, "DeployFailed", failMsg)
+			r.setCondition(config, automotivev1alpha1.OperatorConfigConditionDegraded, metav1.ConditionTrue, "DeployFailed", failMsg)
+			r.setCondition(config, automotivev1alpha1.OperatorConfigConditionReconciling, metav1.ConditionFalse, "ReconcileFailed", failMsg)
+			if updateErr := r.Status().Update(ctx, config); updateErr != nil {
+				log.Error(updateErr, "Failed to update status on deploy error")
 			}
 			return ctrl.Result{}, err
 		}
-		if !config.Status.OSBuildsDeployed {
-			config.Status.OSBuildsDeployed = true
-			config.Status.Phase = "Ready"
-			config.Status.Message = "OSBuilds deployed successfully"
-			statusChanged = true
-		}
+		config.Status.OSBuildsDeployed = true
+		config.Status.Phase = "Ready"
+		config.Status.Message = "OSBuilds deployed successfully"
 	} else {
 		if err := r.cleanupOSBuilds(ctx, config); err != nil {
 			log.Error(err, "Failed to cleanup OSBuilds")
-			if config.Status.Phase != phaseFailed {
-				config.Status.Phase = phaseFailed
-				config.Status.Message = fmt.Sprintf("Failed to cleanup OSBuilds: %v", err)
-				statusChanged = true
-			}
-			if statusChanged {
-				_ = r.Status().Update(ctx, config)
+			failMsg := fmt.Sprintf("Failed to cleanup OSBuilds: %v", err)
+			config.Status.Phase = phaseFailed
+			config.Status.Message = failMsg
+			r.setCondition(config, automotivev1alpha1.OperatorConfigConditionReady, metav1.ConditionFalse, "CleanupFailed", failMsg)
+			r.setCondition(config, automotivev1alpha1.OperatorConfigConditionDegraded, metav1.ConditionTrue, "CleanupFailed", failMsg)
+			r.setCondition(config, automotivev1alpha1.OperatorConfigConditionReconciling, metav1.ConditionFalse, "ReconcileFailed", failMsg)
+			if updateErr := r.Status().Update(ctx, config); updateErr != nil {
+				log.Error(updateErr, "Failed to update status on cleanup error")
 			}
 			return ctrl.Result{}, err
 		}
-		if config.Status.OSBuildsDeployed {
-			config.Status.OSBuildsDeployed = false
-			statusChanged = true
-		}
+		config.Status.OSBuildsDeployed = false
+		config.Status.Phase = "Ready"
+		config.Status.Message = "OSBuilds disabled"
 	}
 
 	// Detect Jumpstarter availability: explicitly configured or auto-detected from local CRDs
-	jumpstarterAvailable := config.Spec.Jumpstarter != nil || r.detectJumpstarter(ctx)
-	if config.Status.JumpstarterAvailable != jumpstarterAvailable {
-		config.Status.JumpstarterAvailable = jumpstarterAvailable
-		statusChanged = true
+	config.Status.JumpstarterAvailable = config.Spec.Jumpstarter != nil || r.detectJumpstarter(ctx)
+
+	// Reconciliation succeeded -- set final conditions
+	r.setCondition(config, automotivev1alpha1.OperatorConfigConditionReady, metav1.ConditionTrue, "ReconcileSucceeded", "OperatorConfig reconciled successfully")
+	r.setCondition(config, automotivev1alpha1.OperatorConfigConditionDegraded, metav1.ConditionFalse, "ReconcileSucceeded", "OperatorConfig reconciled successfully")
+	r.setCondition(config, automotivev1alpha1.OperatorConfigConditionReconciling, metav1.ConditionFalse, "ReconcileSucceeded", "Reconciliation complete")
+
+	// Reconcile monitoring and tracing status
+	if _, err := r.reconcileMonitoring(ctx, config); err != nil {
+		return ctrl.Result{}, err
 	}
 
-	if statusChanged {
-		log.Info("Updating status",
-			"phase", config.Status.Phase,
-			"osBuildsDeployed", config.Status.OSBuildsDeployed,
-			"jumpstarterAvailable", config.Status.JumpstarterAvailable)
-		if err := r.Status().Update(ctx, config); err != nil {
-			log.Error(err, "Failed to update status")
-			return ctrl.Result{}, err
-		}
+	tracingEnabled := config.Spec.Tracing != nil && config.Spec.Tracing.Enabled
+	config.Status.TracingEnabled = tracingEnabled
+
+	log.Info("Updating status",
+		"phase", config.Status.Phase,
+		"osBuildsDeployed", config.Status.OSBuildsDeployed,
+		"jumpstarterAvailable", config.Status.JumpstarterAvailable,
+		"monitoringEnabled", config.Status.MonitoringEnabled,
+		"tracingEnabled", config.Status.TracingEnabled)
+	if err := r.Status().Update(ctx, config); err != nil {
+		log.Error(err, "Failed to update status")
+		return ctrl.Result{}, err
 	}
 
 	log.Info("=== Reconciliation completed successfully ===")
@@ -310,12 +323,6 @@ func (r *OperatorConfigReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 func (r *OperatorConfigReconciler) deployBuildAPI(ctx context.Context, owner *automotivev1alpha1.OperatorConfig) error {
 	r.Log.Info("Starting Build-API deployment")
-
-	// Ensure OAuth secret for build-api
-	if err := r.ensureBuildAPIOAuthSecret(ctx, owner); err != nil {
-		r.Log.Error(err, "Failed to ensure build-api OAuth secret")
-		return fmt.Errorf("failed to ensure build-api OAuth secret: %w", err)
-	}
 
 	// Ensure internal JWT secret for build-api
 	if err := r.ensureBuildAPIInternalJWTSecret(ctx, owner); err != nil {
@@ -327,17 +334,9 @@ func (r *OperatorConfigReconciler) deployBuildAPI(ctx context.Context, owner *au
 	// No need to generate ConfigMap anymore
 	r.Log.Info("Build API will read authentication config directly from OperatorConfig")
 
-	// Update ServiceAccount with build-api OAuth redirect annotation
-	if err := r.updateBuildAPIServiceAccountAnnotation(ctx, owner); err != nil {
-		r.Log.Error(err, "Failed to update ServiceAccount build-api OAuth annotation")
-		return fmt.Errorf("failed to update ServiceAccount build-api OAuth annotation: %w", err)
-	}
-
-	isOpenShift := r.detectOpenShift(ctx, owner.Namespace)
-
 	// Create/update build-api deployment
 	r.Log.Info("Creating/updating build-api deployment")
-	buildAPIDeployment := r.buildBuildAPIDeployment(owner.Namespace, isOpenShift, owner)
+	buildAPIDeployment := r.buildBuildAPIDeployment(owner.Namespace, owner)
 	if err := r.createOrUpdate(ctx, buildAPIDeployment, owner); err != nil {
 		r.Log.Error(err, "Failed to create/update build-api deployment")
 		return fmt.Errorf("failed to create/update build-api deployment: %w", err)
@@ -346,7 +345,7 @@ func (r *OperatorConfigReconciler) deployBuildAPI(ctx context.Context, owner *au
 
 	// Create/update build-api service
 	r.Log.Info("Creating/updating build-api service")
-	buildAPIService := r.buildBuildAPIService(owner.Namespace, isOpenShift)
+	buildAPIService := r.buildBuildAPIService(owner.Namespace)
 	if err := r.createOrUpdate(ctx, buildAPIService, owner); err != nil {
 		r.Log.Error(err, "Failed to create/update build-api service")
 		return fmt.Errorf("failed to create/update build-api service: %w", err)
@@ -373,53 +372,6 @@ func (r *OperatorConfigReconciler) deployBuildAPI(ctx context.Context, owner *au
 	}
 
 	r.Log.Info("Build-API deployment completed successfully")
-	return nil
-}
-
-func (r *OperatorConfigReconciler) ensureBuildAPIOAuthSecret(
-	ctx context.Context,
-	owner *automotivev1alpha1.OperatorConfig,
-) error {
-	secretName := "ado-build-api-oauth-proxy"
-	secret := &corev1.Secret{}
-	err := r.Get(ctx, client.ObjectKey{Name: secretName, Namespace: owner.Namespace}, secret)
-
-	if err != nil {
-		if !errors.IsNotFound(err) {
-			return fmt.Errorf("failed to get secret %s: %w", secretName, err)
-		}
-		// Secret doesn't exist, create it
-		secret = r.buildOAuthSecret(secretName, owner.Namespace)
-		if err := r.Create(ctx, secret); err != nil {
-			return fmt.Errorf("failed to create secret %s: %w", secretName, err)
-		}
-		r.Log.Info("Created OAuth secret", "name", secretName)
-	}
-	return nil
-}
-
-func (r *OperatorConfigReconciler) updateBuildAPIServiceAccountAnnotation(ctx context.Context, owner *automotivev1alpha1.OperatorConfig) error {
-	sa := &corev1.ServiceAccount{}
-	if err := r.Get(ctx, client.ObjectKey{Name: "ado-operator", Namespace: owner.Namespace}, sa); err != nil {
-		return fmt.Errorf("failed to get service account: %w", err)
-	}
-
-	if sa.Annotations == nil {
-		sa.Annotations = make(map[string]string)
-	}
-
-	buildAPIAnnotation := `{"kind":"OAuthRedirectReference","apiVersion":"v1",` +
-		`"reference":{"kind":"Route","name":"ado-build-api"}}`
-	annotationKey := "serviceaccounts.openshift.io/oauth-redirectreference.buildapi"
-	if sa.Annotations[annotationKey] == buildAPIAnnotation {
-		return nil // Already set
-	}
-
-	sa.Annotations["serviceaccounts.openshift.io/oauth-redirectreference.buildapi"] = buildAPIAnnotation
-	if err := r.Update(ctx, sa); err != nil {
-		return fmt.Errorf("failed to update service account: %w", err)
-	}
-	r.Log.Info("Updated ServiceAccount with build-api OAuth annotation")
 	return nil
 }
 
@@ -454,14 +406,6 @@ func (r *OperatorConfigReconciler) cleanupBuildAPI(ctx context.Context, config *
 	ingress.Namespace = config.Namespace
 	if err := r.Delete(ctx, ingress); err != nil && !errors.IsNotFound(err) {
 		return fmt.Errorf("failed to delete build-api ingress: %w", err)
-	}
-
-	// Delete build-api OAuth secret
-	secret := &corev1.Secret{}
-	secret.Name = "ado-build-api-oauth-proxy"
-	secret.Namespace = config.Namespace
-	if err := r.Delete(ctx, secret); err != nil && !errors.IsNotFound(err) {
-		return fmt.Errorf("failed to delete build-api OAuth secret: %w", err)
 	}
 
 	// Delete build-api internal JWT secret
@@ -642,6 +586,11 @@ func (r *OperatorConfigReconciler) deployOSBuilds(
 			buildConfig.TrustedCABundleKind = config.Spec.OSBuilds.Certificates.TrustedCABundle.Kind
 			buildConfig.TrustedCABundleName = config.Spec.OSBuilds.Certificates.TrustedCABundle.Name
 		}
+		if config.Spec.OSBuilds.TaskBundleRef != "" {
+			buildConfig.TaskBundleRef = config.Spec.OSBuilds.TaskBundleRef
+		}
+
+		controllerutils.ApplyOCIVolumesConfig(buildConfig, &config.Spec)
 	}
 
 	// Create target defaults ConfigMap (architecture, partition rules, etc.)
@@ -651,9 +600,10 @@ func (r *OperatorConfigReconciler) deployOSBuilds(
 	}
 
 	// Generate and deploy Tekton tasks
-	tektonTasks := []*tektonv1.Task{
+	tektonTasks := []*tektonv1.Task{ //nolint:prealloc // sealed tasks appended below
 		tasks.GenerateBuildAutomotiveImageTask(config.Namespace, buildConfig, ""),
 		tasks.GeneratePushArtifactRegistryTask(config.Namespace, buildConfig),
+		tasks.GeneratePushArtifactS3Task(config.Namespace, buildConfig),
 		tasks.GenerateFlashTask(config.Namespace, buildConfig),
 	}
 	tektonTasks = append(tektonTasks, tasks.GenerateSealedTasks(config.Namespace, buildConfig)...)
@@ -864,7 +814,7 @@ func (r *OperatorConfigReconciler) cleanupOSBuilds(ctx context.Context, config *
 
 	// Delete Tekton tasks
 	taskNames := []string{
-		"build-automotive-image", "push-artifact-registry", "prepare-builder", "flash-image",
+		"build-automotive-image", "push-artifact-registry", "push-artifact-s3", "prepare-builder", "flash-image",
 		"sealed-prepare-reseal", "sealed-reseal", "sealed-extract-for-signing", "sealed-inject-signed",
 	}
 	for _, taskName := range taskNames {
@@ -983,7 +933,7 @@ func (r *OperatorConfigReconciler) cleanupWorkspaceInfra(ctx context.Context, co
 
 	scc := &securityv1.SecurityContextConstraints{}
 	scc.Name = workspaceSCCName
-	if err := r.Delete(ctx, scc); err != nil && !errors.IsNotFound(err) {
+	if err := r.Delete(ctx, scc); err != nil && !errors.IsNotFound(err) && !isNoMatchError(err) {
 		return fmt.Errorf("failed to delete workspace SCC: %w", err)
 	}
 
@@ -1004,6 +954,105 @@ func (r *OperatorConfigReconciler) cleanupWorkspaceInfra(ctx context.Context, co
 	return nil
 }
 
+func (r *OperatorConfigReconciler) reconcileMonitoring(ctx context.Context, config *automotivev1alpha1.OperatorConfig) (bool, error) {
+	if config.Spec.Monitoring != nil && config.Spec.Monitoring.Enabled {
+		deployed, err := r.deployServiceMonitor(ctx, config)
+		if err != nil {
+			r.Log.Error(err, "Failed to deploy ServiceMonitor")
+			return false, fmt.Errorf("failed to deploy ServiceMonitor: %w", err)
+		}
+		if config.Status.MonitoringEnabled != deployed {
+			config.Status.MonitoringEnabled = deployed
+			return true, nil
+		}
+		return false, nil
+	}
+
+	if err := r.cleanupServiceMonitor(ctx, config); err != nil {
+		r.Log.Error(err, "Failed to cleanup ServiceMonitor")
+		return false, fmt.Errorf("failed to cleanup ServiceMonitor: %w", err)
+	}
+	if config.Status.MonitoringEnabled {
+		config.Status.MonitoringEnabled = false
+		return true, nil
+	}
+	return false, nil
+}
+
+func (r *OperatorConfigReconciler) deployServiceMonitor(ctx context.Context, config *automotivev1alpha1.OperatorConfig) (bool, error) {
+	tokenSecret := r.buildMetricsTokenSecret(config.Namespace)
+	if err := r.createOrUpdate(ctx, tokenSecret, config); err != nil {
+		return false, fmt.Errorf("failed to create/update metrics token secret: %w", err)
+	}
+
+	role := r.buildMetricsReaderRole(config.Namespace)
+	if err := r.createOrUpdate(ctx, role, config); err != nil {
+		return false, fmt.Errorf("failed to create/update metrics reader role: %w", err)
+	}
+
+	binding := r.buildMetricsReaderRoleBinding(config.Namespace)
+	if err := r.createOrUpdate(ctx, binding, config); err != nil {
+		return false, fmt.Errorf("failed to create/update metrics reader role binding: %w", err)
+	}
+
+	clusterBinding := r.buildMetricsReaderClusterRoleBinding(config.Namespace)
+	if err := r.createOrUpdate(ctx, clusterBinding, config); err != nil {
+		return false, fmt.Errorf("failed to create/update metrics reader cluster role binding: %w", err)
+	}
+
+	sm := r.buildServiceMonitor(config.Namespace, config.Spec.Monitoring)
+	if err := r.createOrUpdate(ctx, sm, config); err != nil {
+		if apimeta.IsNoMatchError(err) {
+			r.Log.Info("ServiceMonitor CRD not available, skipping (install Prometheus Operator to enable)")
+			return false, nil
+		}
+		return false, fmt.Errorf("failed to create/update ServiceMonitor: %w", err)
+	}
+	return true, nil
+}
+
+func (r *OperatorConfigReconciler) cleanupServiceMonitor(ctx context.Context, config *automotivev1alpha1.OperatorConfig) error {
+	sm := &unstructured.Unstructured{}
+	sm.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "monitoring.coreos.com",
+		Version: "v1",
+		Kind:    "ServiceMonitor",
+	})
+	sm.SetName(serviceMonitorName)
+	sm.SetNamespace(config.Namespace)
+	if err := r.Delete(ctx, sm); err != nil && !errors.IsNotFound(err) && !apimeta.IsNoMatchError(err) {
+		return fmt.Errorf("failed to delete ServiceMonitor: %w", err)
+	}
+
+	secret := &corev1.Secret{}
+	secret.Name = serviceMonitorTokenSecret
+	secret.Namespace = config.Namespace
+	if err := r.Delete(ctx, secret); err != nil && !errors.IsNotFound(err) {
+		return fmt.Errorf("failed to delete metrics token secret: %w", err)
+	}
+
+	role := &rbacv1.Role{}
+	role.Name = metricsReaderRoleName
+	role.Namespace = config.Namespace
+	if err := r.Delete(ctx, role); err != nil && !errors.IsNotFound(err) {
+		return fmt.Errorf("failed to delete metrics reader role: %w", err)
+	}
+
+	binding := &rbacv1.RoleBinding{}
+	binding.Name = metricsReaderRoleName
+	binding.Namespace = config.Namespace
+	if err := r.Delete(ctx, binding); err != nil && !errors.IsNotFound(err) {
+		return fmt.Errorf("failed to delete metrics reader role binding: %w", err)
+	}
+
+	clusterBinding := &rbacv1.ClusterRoleBinding{}
+	clusterBinding.Name = metricsReaderBindingName
+	if err := r.Delete(ctx, clusterBinding); err != nil && !errors.IsNotFound(err) {
+		return fmt.Errorf("failed to delete metrics reader cluster role binding: %w", err)
+	}
+	return nil
+}
+
 func (r *OperatorConfigReconciler) createOrUpdateTask(ctx context.Context, task *tektonv1.Task) error {
 	return r.createOrUpdate(ctx, task, nil)
 }
@@ -1015,7 +1064,7 @@ func (r *OperatorConfigReconciler) createOrUpdatePipeline(ctx context.Context, p
 // SetupWithManager sets up the controller with the Manager.
 func (r *OperatorConfigReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&automotivev1alpha1.OperatorConfig{}).
+		For(&automotivev1alpha1.OperatorConfig{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Owns(&appsv1.Deployment{}).
 		Owns(&corev1.Service{}).
 		Owns(&corev1.ConfigMap{}).

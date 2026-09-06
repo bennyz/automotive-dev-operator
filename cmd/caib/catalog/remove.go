@@ -24,6 +24,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/clilog"
 	"github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/config"
 	"github.com/spf13/cobra"
 )
@@ -63,25 +64,31 @@ func runRemove(cmd *cobra.Command, args []string) error {
 		token = os.Getenv("CAIB_TOKEN")
 	}
 
-	ns := namespace
-	if ns == "" {
-		ns = defaultNamespace
-	}
-
 	// Confirm deletion
 	if !removeForce {
-		fmt.Printf("Removing catalog image %q...\n", name)
-		fmt.Print("Are you sure you want to remove this image from the catalog? (y/N): ")
+		format := strings.ToLower(strings.TrimSpace(getOutputFormat(cmd)))
+		structured := format == outputFormatJSON || format == outputFormatYAML || format == outputFormatYML
+		if clilog.IsQuiet() || structured {
+			// Structured output modes must keep stdout parseable, and quiet mode
+			// suppresses informational output, so send this notice to stderr
+			// instead of using clilog.Infoln (which writes to stdout).
+			if !clilog.IsQuiet() {
+				fmt.Fprintln(os.Stderr, "Cancelled (use --force to skip confirmation)")
+			}
+			return nil
+		}
+		clilog.Infof("Removing catalog image %q...\n", name)
+		fmt.Fprint(os.Stderr, "Are you sure you want to remove this image from the catalog? (y/N): ")
 		reader := bufio.NewReader(os.Stdin)
 		response, _ := reader.ReadString('\n')
 		response = strings.TrimSpace(strings.ToLower(response))
 		if response != "y" && response != "yes" {
-			fmt.Println("Cancelled")
+			clilog.Infoln("Cancelled")
 			return nil
 		}
 	}
 
-	reqURL := fmt.Sprintf("%s/v1/catalog/images/%s?namespace=%s", server, name, ns)
+	reqURL := fmt.Sprintf("%s/v1/catalog/images/%s", server, name)
 	req, err := http.NewRequest(http.MethodDelete, reqURL, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
@@ -103,7 +110,7 @@ func runRemove(cmd *cobra.Command, args []string) error {
 	}()
 
 	if resp.StatusCode == http.StatusNotFound {
-		return fmt.Errorf("catalog image %q not found in namespace %q", name, ns)
+		return fmt.Errorf("catalog image %q not found", name)
 	}
 
 	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
@@ -111,6 +118,6 @@ func runRemove(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("request failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
-	fmt.Println("✓ Removed successfully")
+	clilog.Infoln("✓ Removed successfully")
 	return nil
 }

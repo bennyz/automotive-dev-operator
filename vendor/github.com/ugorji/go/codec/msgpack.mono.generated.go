@@ -1,4 +1,4 @@
-//go:build !notmono && !codec.notmono 
+//go:build !notmono && !codec.notmono
 
 // Copyright (c) 2012-2020 Ugorji Nwoke. All rights reserved.
 // Use of this source code is governed by a MIT license found in the LICENSE file.
@@ -921,6 +921,10 @@ func (e *encoderMsgpackBytes) MustEncode(v interface{}) {
 	return
 }
 
+func (e *encoderMsgpackBytes) NumBytesWritten() int {
+	return e.e.NumBytesWritten()
+}
+
 func (e *encoderMsgpackBytes) mustEncode(v interface{}) {
 	halt.onerror(e.err)
 	if e.hh == nil {
@@ -1138,11 +1142,11 @@ func (e *encoderMsgpackBytes) rawBytes(vv Raw) {
 }
 
 func (e *encoderMsgpackBytes) fn(t reflect.Type) *encFnMsgpackBytes {
-	return e.dh.encFnViaBH(t, e.rtidFn, e.h, e.fp, false)
+	return e.dh.encFnViaBH(t, e.rtidFn, e.h, e.fp, true)
 }
 
 func (e *encoderMsgpackBytes) fnNoExt(t reflect.Type) *encFnMsgpackBytes {
-	return e.dh.encFnViaBH(t, e.rtidFnNoExt, e.h, e.fp, true)
+	return e.dh.encFnViaBH(t, e.rtidFnNoExt, e.h, e.fp, false)
 }
 
 func (e *encoderMsgpackBytes) mapStart(length int) {
@@ -1616,7 +1620,7 @@ func (d *decoderMsgpackBytes) kInterfaceNaked(f *decFnInfo) (rvn reflect.Value) 
 			} else {
 				rvn = reflect.New(bfn.rt)
 				if bfn.ext == SelfExt {
-					sideDecode(d.hh, &d.h.sideDecPool, func(sd decoderI) { oneOffDecode(sd, rv2i(rvn), bytes, bfn.rt, true) })
+					sideDecode(d.hh, &d.h.sideDecPool, func(sd decoderI) { oneOffDecode(sd, rv2i(rvn), bytes, bfn.rt, false) })
 				} else {
 					bfn.ext.ReadExt(rv2i(rvn), bytes)
 				}
@@ -2195,7 +2199,8 @@ func (d *decoderMsgpackBytes) kChan(f *decFnInfo, rv reflect.Value) {
 	}
 
 	rtelem := ti.elem
-	useTransient := decUseTransient && ti.elemkind != byte(reflect.Ptr) && ti.tielem.flagCanTransient
+	useTransient := decUseTransient && ti.tielem.flagCanTransient &&
+		ti.elemkind != byte(reflect.Slice) && ti.elemkind != byte(reflect.Ptr)
 
 	for k := reflect.Kind(ti.elemkind); k == reflect.Ptr; k = rtelem.Kind() {
 		rtelem = rtelem.Elem()
@@ -2286,7 +2291,7 @@ func (d *decoderMsgpackBytes) kMap(f *decFnInfo, rv reflect.Value) {
 	vtypePtr := vtypeKind == reflect.Ptr
 	ktypePtr := ktypeKind == reflect.Ptr
 
-	vTransient := decUseTransient && !vtypePtr && ti.tielem.flagCanTransient
+	vTransient := decUseTransient && !vtypePtr && ti.tielem.flagCanTransient && vtypeKind != reflect.Slice
 
 	kTransient := vTransient && !ktypePtr && ti.tikey.flagCanTransient
 
@@ -2847,11 +2852,11 @@ func (d *decoderMsgpackBytes) interfaceExtConvertAndDecode(v interface{}, ext In
 }
 
 func (d *decoderMsgpackBytes) fn(t reflect.Type) *decFnMsgpackBytes {
-	return d.dh.decFnViaBH(t, d.rtidFn, d.h, d.fp, false)
+	return d.dh.decFnViaBH(t, d.rtidFn, d.h, d.fp, true)
 }
 
 func (d *decoderMsgpackBytes) fnNoExt(t reflect.Type) *decFnMsgpackBytes {
-	return d.dh.decFnViaBH(t, d.rtidFnNoExt, d.h, d.fp, true)
+	return d.dh.decFnViaBH(t, d.rtidFnNoExt, d.h, d.fp, false)
 }
 
 func (helperDecDriverMsgpackBytes) newDecoderBytes(in []byte, h Handle) *decoderMsgpackBytes {
@@ -3216,7 +3221,7 @@ func (e *msgpackEncDriverBytes) EncodeExt(v interface{}, basetype reflect.Type, 
 	if ext == SelfExt {
 		bs0 = e.e.blist.get(1024)
 		bs = bs0
-		sideEncode(e.h, &e.h.sideEncPool, func(se encoderI) { oneOffEncode(se, v, &bs, basetype, true) })
+		sideEncode(e.h, &e.h.sideEncPool, func(se encoderI) { oneOffEncode(se, v, &bs, basetype, false) })
 	} else {
 		bs = ext.WriteExt(v)
 	}
@@ -3352,9 +3357,11 @@ func (e *msgpackEncDriverBytes) writeContainerLen(ct msgpackContainerType, l int
 	} else if l < 65536 {
 		e.w.writen1(ct.b16)
 		e.w.writen2(bigen.PutUint16(uint16(l)))
-	} else {
+	} else if uint(l) <= mpMaxLen {
 		e.w.writen1(ct.b32)
 		e.w.writen4(bigen.PutUint32(uint32(l)))
+	} else {
+		halt.errorf("%s: %d", mpMaxLenOverflowErrorMsgPrefix, l)
 	}
 }
 
@@ -3928,7 +3935,7 @@ func (d *msgpackDecDriverBytes) DecodeExt(rv interface{}, basetype reflect.Type,
 		return
 	}
 	if ext == SelfExt {
-		sideDecode(d.h, &d.h.sideDecPool, func(sd decoderI) { oneOffDecode(sd, rv, xbs, basetype, true) })
+		sideDecode(d.h, &d.h.sideDecPool, func(sd decoderI) { oneOffDecode(sd, rv, xbs, basetype, false) })
 	} else {
 		ext.ReadExt(rv, xbs)
 	}
@@ -3986,6 +3993,7 @@ func (d *msgpackEncDriverBytes) init(hh Handle, shared *encoderBase, enc encoder
 	return
 }
 
+func (e *msgpackEncDriverBytes) NumBytesWritten() int    { return e.w.numWrite() }
 func (e *msgpackEncDriverBytes) writeBytesAsis(b []byte) { e.w.writeb(b) }
 
 func (e *msgpackEncDriverBytes) writerEnd() { e.w.end() }
@@ -4021,7 +4029,7 @@ func (d *msgpackDecDriverBytes) resetInBytes(in []byte) {
 }
 
 func (d *msgpackDecDriverBytes) resetInIO(r io.Reader) {
-	d.r.resetIO(r, d.h.ReaderBufferSize, d.h.MaxInitLen, &d.d.blist)
+	d.r.resetIO(r, d.h.ReaderBufferSize, d.h.maxBytes2Read(), &d.d.blist)
 }
 
 func (d *msgpackDecDriverBytes) descBd() string {
@@ -4934,6 +4942,10 @@ func (e *encoderMsgpackIO) MustEncode(v interface{}) {
 	return
 }
 
+func (e *encoderMsgpackIO) NumBytesWritten() int {
+	return e.e.NumBytesWritten()
+}
+
 func (e *encoderMsgpackIO) mustEncode(v interface{}) {
 	halt.onerror(e.err)
 	if e.hh == nil {
@@ -5151,11 +5163,11 @@ func (e *encoderMsgpackIO) rawBytes(vv Raw) {
 }
 
 func (e *encoderMsgpackIO) fn(t reflect.Type) *encFnMsgpackIO {
-	return e.dh.encFnViaBH(t, e.rtidFn, e.h, e.fp, false)
+	return e.dh.encFnViaBH(t, e.rtidFn, e.h, e.fp, true)
 }
 
 func (e *encoderMsgpackIO) fnNoExt(t reflect.Type) *encFnMsgpackIO {
-	return e.dh.encFnViaBH(t, e.rtidFnNoExt, e.h, e.fp, true)
+	return e.dh.encFnViaBH(t, e.rtidFnNoExt, e.h, e.fp, false)
 }
 
 func (e *encoderMsgpackIO) mapStart(length int) {
@@ -5629,7 +5641,7 @@ func (d *decoderMsgpackIO) kInterfaceNaked(f *decFnInfo) (rvn reflect.Value) {
 			} else {
 				rvn = reflect.New(bfn.rt)
 				if bfn.ext == SelfExt {
-					sideDecode(d.hh, &d.h.sideDecPool, func(sd decoderI) { oneOffDecode(sd, rv2i(rvn), bytes, bfn.rt, true) })
+					sideDecode(d.hh, &d.h.sideDecPool, func(sd decoderI) { oneOffDecode(sd, rv2i(rvn), bytes, bfn.rt, false) })
 				} else {
 					bfn.ext.ReadExt(rv2i(rvn), bytes)
 				}
@@ -6208,7 +6220,8 @@ func (d *decoderMsgpackIO) kChan(f *decFnInfo, rv reflect.Value) {
 	}
 
 	rtelem := ti.elem
-	useTransient := decUseTransient && ti.elemkind != byte(reflect.Ptr) && ti.tielem.flagCanTransient
+	useTransient := decUseTransient && ti.tielem.flagCanTransient &&
+		ti.elemkind != byte(reflect.Slice) && ti.elemkind != byte(reflect.Ptr)
 
 	for k := reflect.Kind(ti.elemkind); k == reflect.Ptr; k = rtelem.Kind() {
 		rtelem = rtelem.Elem()
@@ -6299,7 +6312,7 @@ func (d *decoderMsgpackIO) kMap(f *decFnInfo, rv reflect.Value) {
 	vtypePtr := vtypeKind == reflect.Ptr
 	ktypePtr := ktypeKind == reflect.Ptr
 
-	vTransient := decUseTransient && !vtypePtr && ti.tielem.flagCanTransient
+	vTransient := decUseTransient && !vtypePtr && ti.tielem.flagCanTransient && vtypeKind != reflect.Slice
 
 	kTransient := vTransient && !ktypePtr && ti.tikey.flagCanTransient
 
@@ -6860,11 +6873,11 @@ func (d *decoderMsgpackIO) interfaceExtConvertAndDecode(v interface{}, ext Inter
 }
 
 func (d *decoderMsgpackIO) fn(t reflect.Type) *decFnMsgpackIO {
-	return d.dh.decFnViaBH(t, d.rtidFn, d.h, d.fp, false)
+	return d.dh.decFnViaBH(t, d.rtidFn, d.h, d.fp, true)
 }
 
 func (d *decoderMsgpackIO) fnNoExt(t reflect.Type) *decFnMsgpackIO {
-	return d.dh.decFnViaBH(t, d.rtidFnNoExt, d.h, d.fp, true)
+	return d.dh.decFnViaBH(t, d.rtidFnNoExt, d.h, d.fp, false)
 }
 
 func (helperDecDriverMsgpackIO) newDecoderBytes(in []byte, h Handle) *decoderMsgpackIO {
@@ -7229,7 +7242,7 @@ func (e *msgpackEncDriverIO) EncodeExt(v interface{}, basetype reflect.Type, xta
 	if ext == SelfExt {
 		bs0 = e.e.blist.get(1024)
 		bs = bs0
-		sideEncode(e.h, &e.h.sideEncPool, func(se encoderI) { oneOffEncode(se, v, &bs, basetype, true) })
+		sideEncode(e.h, &e.h.sideEncPool, func(se encoderI) { oneOffEncode(se, v, &bs, basetype, false) })
 	} else {
 		bs = ext.WriteExt(v)
 	}
@@ -7365,9 +7378,11 @@ func (e *msgpackEncDriverIO) writeContainerLen(ct msgpackContainerType, l int) {
 	} else if l < 65536 {
 		e.w.writen1(ct.b16)
 		e.w.writen2(bigen.PutUint16(uint16(l)))
-	} else {
+	} else if uint(l) <= mpMaxLen {
 		e.w.writen1(ct.b32)
 		e.w.writen4(bigen.PutUint32(uint32(l)))
+	} else {
+		halt.errorf("%s: %d", mpMaxLenOverflowErrorMsgPrefix, l)
 	}
 }
 
@@ -7941,7 +7956,7 @@ func (d *msgpackDecDriverIO) DecodeExt(rv interface{}, basetype reflect.Type, xt
 		return
 	}
 	if ext == SelfExt {
-		sideDecode(d.h, &d.h.sideDecPool, func(sd decoderI) { oneOffDecode(sd, rv, xbs, basetype, true) })
+		sideDecode(d.h, &d.h.sideDecPool, func(sd decoderI) { oneOffDecode(sd, rv, xbs, basetype, false) })
 	} else {
 		ext.ReadExt(rv, xbs)
 	}
@@ -7999,6 +8014,7 @@ func (d *msgpackEncDriverIO) init(hh Handle, shared *encoderBase, enc encoderI) 
 	return
 }
 
+func (e *msgpackEncDriverIO) NumBytesWritten() int    { return e.w.numWrite() }
 func (e *msgpackEncDriverIO) writeBytesAsis(b []byte) { e.w.writeb(b) }
 
 func (e *msgpackEncDriverIO) writerEnd() { e.w.end() }
@@ -8034,7 +8050,7 @@ func (d *msgpackDecDriverIO) resetInBytes(in []byte) {
 }
 
 func (d *msgpackDecDriverIO) resetInIO(r io.Reader) {
-	d.r.resetIO(r, d.h.ReaderBufferSize, d.h.MaxInitLen, &d.d.blist)
+	d.r.resetIO(r, d.h.ReaderBufferSize, d.h.maxBytes2Read(), &d.d.blist)
 }
 
 func (d *msgpackDecDriverIO) descBd() string {

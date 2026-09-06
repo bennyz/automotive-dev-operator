@@ -1,21 +1,18 @@
 ARG BUILDPLATFORM
-FROM --platform=$BUILDPLATFORM registry.access.redhat.com/ubi9/go-toolset:1.24.6 AS builder
+FROM --platform=$BUILDPLATFORM registry.access.redhat.com/ubi10/go-toolset:10.2-1787080020 AS builder
 ARG TARGETOS=linux
 ARG TARGETARCH
 
 WORKDIR /workspace
 
-# Copy files as root first
 COPY go.mod go.mod
 COPY go.sum go.sum
 COPY vendor/ vendor/
 COPY cmd/main.go cmd/main.go
 COPY cmd/build-api/main.go cmd/build-api/main.go
-COPY cmd/init-secrets/main.go cmd/init-secrets/main.go
 COPY api/ api/
 COPY internal/ internal/
 
-# Set ownership and switch to non-root user (go-toolset runs as 1001)
 USER root
 RUN chown -R 1001:0 /workspace && chmod -R 775 /workspace
 USER 1001
@@ -24,16 +21,26 @@ ENV CGO_ENABLED=0
 ENV GOCACHE=/workspace/.cache
 RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -mod=vendor -trimpath -ldflags "-s -w" -o manager cmd/main.go
 RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -mod=vendor -trimpath -ldflags "-s -w" -o build-api cmd/build-api/main.go
-RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -mod=vendor -trimpath -ldflags "-s -w" -o init-secrets cmd/init-secrets/main.go
 
-# Runtime stage uses the target platform
-FROM --platform=$TARGETPLATFORM gcr.io/distroless/static:nonroot
+FROM --platform=$TARGETPLATFORM registry.access.redhat.com/ubi10/ubi-minimal:latest
+
+ARG VERSION=0.0.0
+LABEL com.redhat.component="automotive-dev-operator-container" \
+      name="automotive-dev-operator" \
+      summary="Automotive Dev Operator" \
+      description="OpenShift operator for automotive OS development" \
+      io.k8s.display-name="Automotive Dev Operator" \
+      io.k8s.description="Kubernetes operator for automotive OS development" \
+      io.openshift.tags="automotive,operator" \
+      vendor="Red Hat" \
+      version="${VERSION}" \
+      release="1"
+
+COPY LICENSE /licenses/LICENSE
+
 WORKDIR /
 COPY --from=builder /workspace/manager .
 COPY --from=builder /workspace/build-api .
-COPY --from=builder /workspace/init-secrets .
-COPY --from=builder /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem /etc/ssl/certs/ca-certificates.crt
-COPY --from=builder /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem /etc/pki/tls/certs/ca-bundle.crt
 USER 65532:65532
 
 ENTRYPOINT ["/manager"]

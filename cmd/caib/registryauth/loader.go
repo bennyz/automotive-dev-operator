@@ -72,7 +72,8 @@ func authFileHasAnyCredentials(content []byte) (bool, error) {
 	return false, nil
 }
 
-func registryAuthFileCandidates() []string {
+// FileCandidates returns candidate auth file paths in priority order.
+func FileCandidates() []string {
 	candidates := make([]string, 0, 4)
 	seen := map[string]struct{}{}
 	add := func(path string) {
@@ -138,7 +139,7 @@ func LoadAuthFileForRegistry(
 	}
 
 	var errs []string
-	for _, candidate := range registryAuthFileCandidates() {
+	for _, candidate := range FileCandidates() {
 		content, err := os.ReadFile(candidate)
 		if err != nil {
 			if !os.IsNotExist(err) && !os.IsPermission(err) {

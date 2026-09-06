@@ -7,4 +7,4 @@ configurations:
 images:
 - name: controller
   newName: quay.io/rh-sdv-cloud/automotive-dev-operator
-  newTag: v0.1.0
+  newTag: v0.2.0-dev

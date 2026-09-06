@@ -9,6 +9,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/clilog"
 )
 
 // State stores reconnect and stream progress state.
@@ -19,6 +21,7 @@ type State struct {
 	StartTime    time.Time
 	Completed    bool
 	LeaseID      string
+	LineHandler  func(line string)
 }
 
 // CanRetry reports whether another reconnect attempt should be made.
@@ -38,8 +41,17 @@ func (s *State) Reset() {
 	s.WarningShown = false
 }
 
-// StreamLogsToStdout streams response body line-by-line to stdout.
-func StreamLogsToStdout(body io.Reader, state *State, captureLeaseID bool) error {
+// LogWriter returns the appropriate writer for log output: os.Stderr when
+// quiet mode is active (structured output requested), os.Stdout otherwise.
+func LogWriter() io.Writer {
+	if clilog.IsQuiet() {
+		return os.Stderr
+	}
+	return os.Stdout
+}
+
+// StreamLogs streams response body line-by-line to the provided writer.
+func StreamLogs(w io.Writer, body io.Reader, state *State, captureLeaseID bool) error {
 	if state == nil {
 		return fmt.Errorf("stream state is required")
 	}
@@ -47,7 +59,7 @@ func StreamLogsToStdout(body io.Reader, state *State, captureLeaseID bool) error
 	firstStream := state.StartTime.IsZero()
 	if firstStream {
 		state.StartTime = time.Now()
-		fmt.Println("Streaming logs...")
+		clilog.Infoln("Streaming logs...")
 	}
 	state.Active = true
 	state.Reset()
@@ -56,8 +68,14 @@ func StreamLogsToStdout(body io.Reader, state *State, captureLeaseID bool) error
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	for scanner.Scan() {
 		line := scanner.Text()
-		fmt.Println(line)
+		if _, err := fmt.Fprintln(w, line); err != nil {
+			state.Active = false
+			return fmt.Errorf("writing log line: %w", err)
+		}
 		state.StartTime = time.Now()
+		if state.LineHandler != nil {
+			state.LineHandler(line)
+		}
 
 		if !captureLeaseID {
 			continue
@@ -90,25 +108,21 @@ func StreamLogsToStdout(body io.Reader, state *State, captureLeaseID bool) error
 	return nil
 }
 
+const maxLogErrorBodyBytes = 64 * 1024
+
 // HandleLogStreamError handles common stream endpoint failures.
+// Callers must close resp.Body themselves (typically via defer).
 func HandleLogStreamError(resp *http.Response, state *State, maxRetries int) error {
 	if resp == nil || resp.Body == nil {
 		return fmt.Errorf("log stream failed: empty response")
 	}
 
-	body, readErr := io.ReadAll(resp.Body)
-	closeErr := resp.Body.Close()
-	if readErr != nil {
-		return fmt.Errorf("failed to read log stream error body: %w", readErr)
-	}
-	if closeErr != nil {
-		return fmt.Errorf("failed to close log stream error body: %w", closeErr)
-	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxLogErrorBodyBytes))
 	msg := strings.TrimSpace(string(body))
 
 	if resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusGatewayTimeout {
 		if state != nil && !state.WarningShown {
-			fmt.Fprintf(os.Stderr, "log stream not ready (HTTP %d). Retrying... (attempt %d/%d)\n",
+			clilog.Infof("log stream not ready (HTTP %d). Retrying... (attempt %d/%d)\n",
 				resp.StatusCode, state.RetryCount+1, maxRetries)
 			state.WarningShown = true
 		}
@@ -116,9 +130,7 @@ func HandleLogStreamError(resp *http.Response, state *State, maxRetries int) err
 	}
 
 	if msg != "" {
-		fmt.Fprintf(os.Stderr, "log stream error (%d): %s\n", resp.StatusCode, msg)
-	} else {
-		fmt.Fprintf(os.Stderr, "log stream error: HTTP %d\n", resp.StatusCode)
+		return fmt.Errorf("log stream failed: HTTP %d - %s", resp.StatusCode, msg)
 	}
-	return fmt.Errorf("log stream failed with HTTP %d", resp.StatusCode)
+	return fmt.Errorf("log stream failed: HTTP %d", resp.StatusCode)
 }

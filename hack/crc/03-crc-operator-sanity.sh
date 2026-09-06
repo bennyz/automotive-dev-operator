@@ -5,6 +5,7 @@
 # Run after 02-deploy-operator.sh to confirm everything is working.
 
 NAMESPACE="automotive-dev-operator-system"
+BUILD_API_HEALTH_ENDPOINT="/v1/healthz"
 
 if [[ -f "$HOME/.crc_env" ]]; then
     source "$HOME/.crc_env"
@@ -93,7 +94,8 @@ check "Build API route exists" oc get route ado-build-api -n "$NAMESPACE"
 
 BUILD_API_URL=$(oc get route ado-build-api -n "$NAMESPACE" -o jsonpath='{.spec.host}' 2>/dev/null)
 if [ -n "$BUILD_API_URL" ]; then
-    check "Build API endpoint responds" curl -fsSk --max-time 10 "https://${BUILD_API_URL}/v1/healthz"
+    BUILD_API_HEALTH_URL="https://${BUILD_API_URL}${BUILD_API_HEALTH_ENDPOINT}"
+    check "Build API endpoint responds" curl -fsSk --max-time 10 "$BUILD_API_HEALTH_URL"
 fi
 
 echo ""
@@ -110,6 +112,17 @@ check "Pipeline: automotive-build-pipeline" oc get pipeline automotive-build-pip
 echo ""
 echo -e "${CYAN}=== OpenShift Pipelines Operator ===${NC}"
 check "Pipelines operator CSV succeeded" test "$(oc get csv -n openshift-operators -l operators.coreos.com/openshift-pipelines-operator-rh.openshift-operators= -o jsonpath='{.items[0].status.phase}' 2>/dev/null)" = "Succeeded"
+
+echo ""
+echo -e "${CYAN}=== OpenShift Builds (Shipwright) ===${NC}"
+if oc get crd builds.shipwright.io &>/dev/null; then
+    check "Shipwright CRD: builds.shipwright.io" oc get crd builds.shipwright.io
+    check "Shipwright CRD: buildruns.shipwright.io" oc get crd buildruns.shipwright.io
+    check "ShipwrightBuild CR exists" oc get shipwrightbuild openshift-builds
+    check "Builds operator CSV succeeded" test "$(oc get csv -n openshift-operators -l operators.coreos.com/openshift-builds-operator.openshift-operators= -o jsonpath='{.items[0].status.phase}' 2>/dev/null)" = "Succeeded"
+else
+    echo -e "  ${CYAN}SKIP${NC}  OpenShift Builds not installed (optional)"
+fi
 
 ###############################################################################
 # End-to-end build test (optional, pass --sanity to enable)

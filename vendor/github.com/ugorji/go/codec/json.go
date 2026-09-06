@@ -630,6 +630,11 @@ func (d *jsonDecDriver[T]) nextValueBytes() []byte {
 	switch d.tok {
 	default:
 		_, d.tok = d.r.jsonReadNum()
+		// special case: trim last read token if a valid byte in stream
+		if d.tok != 0 {
+			vv := d.r.stopRecording()
+			return vv[:len(vv)-1]
+		}
 	case 'n':
 		d.checkLit3([3]byte{'u', 'l', 'l'}, d.r.readn3())
 	case 'f':
@@ -1161,6 +1166,7 @@ func (d *jsonEncDriver[T]) init(hh Handle, shared *encoderBase, enc encoderI) (f
 	return
 }
 
+func (e *jsonEncDriver[T]) NumBytesWritten() int    { return e.w.numWrite() }
 func (e *jsonEncDriver[T]) writeBytesAsis(b []byte) { e.w.writeb(b) }
 
 // func (e *jsonEncDriver[T]) writeStringAsisDblQuoted(v string) { e.w.writeqstr(v) }
@@ -1199,7 +1205,7 @@ func (d *jsonDecDriver[T]) resetInBytes(in []byte) {
 }
 
 func (d *jsonDecDriver[T]) resetInIO(r io.Reader) {
-	d.r.resetIO(r, d.h.ReaderBufferSize, d.h.MaxInitLen, &d.d.blist)
+	d.r.resetIO(r, d.h.ReaderBufferSize, d.h.maxBytes2Read(), &d.d.blist)
 }
 
 // ---- (custom stanza)

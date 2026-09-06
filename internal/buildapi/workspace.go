@@ -8,12 +8,14 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	automotivev1alpha1 "github.com/centos-automotive-suite/automotive-dev-operator/api/v1alpha1"
+	"github.com/centos-automotive-suite/automotive-dev-operator/internal/common/labels"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 	corev1 "k8s.io/api/core/v1"
@@ -37,6 +39,38 @@ func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
+// validateWorkspaceRelPath rejects empty, absolute, and path-traversal
+// relative paths. Names that contain ".." as a substring but are not
+// traversal (e.g. "notes..old") are allowed.
+func validateWorkspaceRelPath(p string) error {
+	if p == "" || strings.HasPrefix(p, "/") || strings.ContainsRune(p, 0) {
+		return fmt.Errorf("invalid path: %s", p)
+	}
+	cleaned := path.Clean(p)
+	if cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, "../") {
+		return fmt.Errorf("invalid path: %s", p)
+	}
+	return nil
+}
+
+// buildSyncDeleteScript removes the given relative paths under /workspace/src
+// and prunes empty parent directories of those paths only.
+func buildSyncDeleteScript(files []string) string {
+	var b strings.Builder
+	b.WriteString("set -e\n")
+	b.WriteString("cd /workspace/src || exit 1\n")
+	for _, p := range files {
+		q := shellQuote(p)
+		fmt.Fprintf(&b, "rm -f -- %s\n", q)
+		fmt.Fprintf(&b, "dir=$(dirname -- %s)\n", q)
+		b.WriteString("while [ \"$dir\" != \".\" ] && [ \"$dir\" != \"/\" ]; do\n")
+		b.WriteString("  rmdir -- \"$dir\" 2>/dev/null || break\n")
+		b.WriteString("  dir=$(dirname -- \"$dir\")\n")
+		b.WriteString("done\n")
+	}
+	return b.String()
+}
+
 // WorkspaceRequest is the payload to create a workspace.
 type WorkspaceRequest struct {
 	Name                    string `json:"name"`
@@ -55,6 +89,8 @@ type WorkspaceRequest struct {
 type WorkspaceResponse struct {
 	Name             string `json:"name"`
 	Phase            string `json:"phase"`
+	Reason           string `json:"reason,omitempty"`
+	Message          string `json:"message,omitempty"`
 	Lease            string `json:"lease,omitempty"`
 	Arch             string `json:"architecture"`
 	PodName          string `json:"podName,omitempty"`
@@ -70,13 +106,21 @@ type WorkspaceExecRequest struct {
 
 // SyncPlanRequest is the manifest sent by the client to compute a sync diff.
 type SyncPlanRequest struct {
-	Files map[string]string `json:"files"` // relative path -> hex-encoded sha256
+	Files          map[string]string `json:"files"`                    // relative path -> hex-encoded sha256
+	IncludeDeleted bool              `json:"includeDeleted,omitempty"` // when true, report remote-only files in Deleted
 }
 
 // SyncPlanResponse tells the client which files need uploading.
 type SyncPlanResponse struct {
-	Changed   []string `json:"changed"`   // files to upload (new or modified)
-	Unchanged int      `json:"unchanged"` // count of files already up to date
+	Changed        []string `json:"changed"`                  // files to upload (new or modified)
+	Unchanged      int      `json:"unchanged"`                // count of files already up to date
+	Deleted        []string `json:"deleted,omitempty"`        // files on remote not in local manifest (only when IncludeDeleted)
+	IncludeDeleted bool     `json:"includeDeleted,omitempty"` // echoed so clients can detect servers that ignore IncludeDeleted
+}
+
+// SyncDeleteRequest is the payload to delete files from a workspace.
+type SyncDeleteRequest struct {
+	Files []string `json:"files"` // relative paths under /workspace/src/ to remove
 }
 
 // ArtifactMapping maps a source path inside the workspace to a destination on the board.
@@ -96,83 +140,28 @@ func (a *APIServer) registerWorkspaceRoutes(v1 *gin.RouterGroup) {
 	workspaceGroup := v1.Group("/workspaces")
 	workspaceGroup.Use(a.authMiddleware())
 	{
-		workspaceGroup.POST("", a.handleCreateWorkspace)
-		workspaceGroup.GET("", a.handleListWorkspaces)
-		workspaceGroup.GET("/:name", a.handleGetWorkspace)
-		workspaceGroup.DELETE("/:name", a.handleDeleteWorkspace)
-		workspaceGroup.POST("/:name/start", a.handleStartWorkspace)
-		workspaceGroup.POST("/:name/stop", a.handleStopWorkspace)
-		workspaceGroup.POST("/:name/sync", a.handleSyncWorkspace)
-		workspaceGroup.POST("/:name/sync/plan", a.handleSyncPlanWorkspace)
-		workspaceGroup.POST("/:name/exec", a.handleExecWorkspace)
-		workspaceGroup.GET("/:name/shell", a.handleShellWorkspace)
-		workspaceGroup.POST("/:name/deploy", a.handleDeployWorkspace)
+		workspaceGroup.POST("", a.wrapHandler("create workspace", a.createWorkspace))
+		workspaceGroup.GET("", a.wrapHandler("list workspaces", a.listWorkspaces))
+		workspaceGroup.GET("/:name", a.wrapNamedHandler("get workspace", a.getWorkspace))
+		workspaceGroup.DELETE("/:name", a.wrapNamedHandler("delete workspace", a.deleteWorkspace))
+		workspaceGroup.POST("/:name/start", a.wrapNamedHandler("start workspace", a.startWorkspace))
+		workspaceGroup.POST("/:name/stop", a.wrapNamedHandler("stop workspace", a.stopWorkspace))
+		workspaceGroup.POST("/:name/sync", a.wrapNamedHandler("sync workspace", a.syncWorkspace))
+		workspaceGroup.POST("/:name/sync/plan", a.wrapNamedHandler("sync plan workspace", a.syncPlanWorkspace))
+		workspaceGroup.POST("/:name/sync/delete", a.wrapNamedHandler("delete workspace files", a.syncDeleteWorkspace))
+		workspaceGroup.POST("/:name/exec", a.wrapNamedHandler("exec workspace", a.execWorkspace))
+		workspaceGroup.GET("/:name/shell", a.wrapNamedHandler("shell workspace", a.shellWorkspace))
+		workspaceGroup.POST("/:name/deploy", a.wrapNamedHandler("deploy workspace", a.deployWorkspace))
 		workspaceGroup.PUT("/:name/lease", a.handleSetWorkspaceLease)
 	}
 }
 
-func (a *APIServer) handleCreateWorkspace(c *gin.Context) {
-	a.log.Info("create workspace", "reqID", c.GetString("reqID"))
-	a.createWorkspace(c)
-}
-
-func (a *APIServer) handleListWorkspaces(c *gin.Context) {
-	a.log.Info("list workspaces", "reqID", c.GetString("reqID"))
-	a.listWorkspaces(c)
-}
-
-func (a *APIServer) handleGetWorkspace(c *gin.Context) {
-	name := c.Param("name")
-	a.log.Info("get workspace", "name", name, "reqID", c.GetString("reqID"))
-	a.getWorkspace(c, name)
-}
-
-func (a *APIServer) handleDeleteWorkspace(c *gin.Context) {
-	name := c.Param("name")
-	a.log.Info("delete workspace", "name", name, "reqID", c.GetString("reqID"))
-	a.deleteWorkspace(c, name)
-}
-
-func (a *APIServer) handleSyncWorkspace(c *gin.Context) {
-	name := c.Param("name")
-	a.log.Info("sync workspace", "name", name, "reqID", c.GetString("reqID"))
-	a.syncWorkspace(c, name)
-}
-
-func (a *APIServer) handleSyncPlanWorkspace(c *gin.Context) {
-	name := c.Param("name")
-	a.log.Info("sync plan workspace", "name", name, "reqID", c.GetString("reqID"))
-	a.syncPlanWorkspace(c, name)
-}
-
-func (a *APIServer) handleExecWorkspace(c *gin.Context) {
-	name := c.Param("name")
-	a.log.Info("exec workspace", "name", name, "reqID", c.GetString("reqID"))
-	a.execWorkspace(c, name)
-}
-
-func (a *APIServer) handleShellWorkspace(c *gin.Context) {
-	name := c.Param("name")
-	a.log.Info("shell workspace", "name", name, "reqID", c.GetString("reqID"))
-	a.shellWorkspace(c, name)
-}
-
-func (a *APIServer) handleStartWorkspace(c *gin.Context) {
-	name := c.Param("name")
-	a.log.Info("start workspace", "name", name, "reqID", c.GetString("reqID"))
+func (a *APIServer) startWorkspace(c *gin.Context, name string) {
 	a.setWorkspaceStopped(c, name, false)
 }
 
-func (a *APIServer) handleStopWorkspace(c *gin.Context) {
-	name := c.Param("name")
-	a.log.Info("stop workspace", "name", name, "reqID", c.GetString("reqID"))
+func (a *APIServer) stopWorkspace(c *gin.Context, name string) {
 	a.setWorkspaceStopped(c, name, true)
-}
-
-func (a *APIServer) handleDeployWorkspace(c *gin.Context) {
-	name := c.Param("name")
-	a.log.Info("deploy workspace", "name", name, "reqID", c.GetString("reqID"))
-	a.deployWorkspace(c, name)
 }
 
 func (a *APIServer) createWorkspace(c *gin.Context) {
@@ -187,9 +176,8 @@ func (a *APIServer) createWorkspace(c *gin.Context) {
 		return
 	}
 
-	k8sClient, err := getClientFromRequest(c)
+	k8sClient, err := getK8sClientOrFail(c)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create kubernetes client"})
 		return
 	}
 
@@ -214,6 +202,14 @@ func (a *APIServer) createWorkspace(c *gin.Context) {
 	image := req.Image
 	if image == "" {
 		image = wsConfig.GetToolchainImage()
+	}
+	if wsConfig != nil && !wsConfig.IsImageAllowed(image) {
+		c.JSON(http.StatusForbidden, gin.H{"error": fmt.Sprintf("image %q is not in the allowed images list", image)})
+		return
+	}
+	if status, verifyErr := verifyWorkspaceImage(c.Request.Context(), k8sClient, namespace, wsConfig, image, wsConfig.GetImagePullSecrets()); verifyErr != nil {
+		c.JSON(status, gin.H{"error": verifyErr.Error()})
+		return
 	}
 	pvcSize := wsConfig.GetPVCSize()
 
@@ -310,9 +306,8 @@ func (a *APIServer) createWorkspace(c *gin.Context) {
 }
 
 func (a *APIServer) listWorkspaces(c *gin.Context) {
-	k8sClient, err := getClientFromRequest(c)
+	k8sClient, err := getK8sClientOrFail(c)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create kubernetes client"})
 		return
 	}
 
@@ -358,9 +353,8 @@ func (a *APIServer) deleteWorkspace(c *gin.Context, name string) {
 		return // response already sent
 	}
 
-	k8sClient, err := getClientFromRequest(c)
+	k8sClient, err := getK8sClientOrFail(c)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create kubernetes client"})
 		return
 	}
 
@@ -392,9 +386,8 @@ func (a *APIServer) setWorkspaceStopped(c *gin.Context, name string, stopped boo
 		return
 	}
 
-	k8sClient, err := getClientFromRequest(c)
+	k8sClient, err := getK8sClientOrFail(c)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create kubernetes client"})
 		return
 	}
 
@@ -428,9 +421,8 @@ func (a *APIServer) handleSetWorkspaceLease(c *gin.Context) {
 		return
 	}
 
-	k8sClient, err := getClientFromRequest(c)
+	k8sClient, err := getK8sClientOrFail(c)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create kubernetes client"})
 		return
 	}
 
@@ -445,10 +437,9 @@ func (a *APIServer) handleSetWorkspaceLease(c *gin.Context) {
 }
 
 func (a *APIServer) getOwnedWorkspace(c *gin.Context, name string) (*automotivev1alpha1.Workspace, error) {
-	k8sClient, err := getClientFromRequest(c)
+	k8sClient, err := getK8sClientOrFail(c)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create kubernetes client"})
-		return nil, err
+		return nil, fmt.Errorf("failed to create kubernetes client")
 	}
 
 	namespace := resolveNamespace()
@@ -479,9 +470,9 @@ func (a *APIServer) touchWorkspaceActivity(c *gin.Context, ws *automotivev1alpha
 	if ws.Spec.Stopped {
 		return
 	}
-	k8sClient, err := getClientFromRequest(c)
+	k8sClient, err := getClientFromRequestFn(c)
 	if err != nil {
-		return // best-effort, don't fail the operation
+		return
 	}
 
 	now := metav1.Now()
@@ -535,9 +526,34 @@ func (a *APIServer) syncWorkspace(c *gin.Context, name string) {
 		return
 	}
 
-	if err := copyToPod(c.Request.Context(), restCfg, namespace, podName, workspaceContainerName, tmpFile, "/workspace/src/"); err != nil {
+	destDir := "/workspace/src/"
+	clean := c.Query("clean") == "true"
+	if clean {
+		// Extract into a sidecar directory first so a failed upload leaves
+		// the existing /workspace/src tree intact.
+		prepCmd := []string{"/bin/sh", "-c", "rm -rf /workspace/src.next && mkdir -p /workspace/src.next"}
+		if err := podExec(c.Request.Context(), restCfg, namespace, podName, workspaceContainerName, prepCmd, io.Discard); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to prepare clean sync: %v", err)})
+			return
+		}
+		destDir = "/workspace/src.next/"
+	}
+
+	if err := copyToPod(c.Request.Context(), restCfg, namespace, podName, workspaceContainerName, tmpFile, destDir); err != nil {
+		if clean {
+			_ = podExec(c.Request.Context(), restCfg, namespace, podName, workspaceContainerName,
+				[]string{"/bin/sh", "-c", "rm -rf /workspace/src.next"}, io.Discard)
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to sync files: %v", err)})
 		return
+	}
+
+	if clean {
+		swapCmd := []string{"/bin/sh", "-c", "set -e; rm -rf /workspace/src.old; mv /workspace/src /workspace/src.old; mv /workspace/src.next /workspace/src; rm -rf /workspace/src.old"}
+		if err := podExec(c.Request.Context(), restCfg, namespace, podName, workspaceContainerName, swapCmd, io.Discard); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to replace workspace after clean sync: %v", err)})
+			return
+		}
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "files synced"})
@@ -572,10 +588,10 @@ func (a *APIServer) syncPlanWorkspace(c *gin.Context, name string) {
 	// Build a shell script that hashes only the files the client cares about.
 	// This avoids scanning build artifacts or other untracked content.
 	var scriptBuf strings.Builder
-	scriptBuf.WriteString("cd /workspace/src\n")
-	for path := range req.Files {
+	scriptBuf.WriteString("cd /workspace/src || exit 1\n")
+	for relPath := range req.Files {
 		// Only hash regular files that exist; skip missing ones silently
-		scriptBuf.WriteString(fmt.Sprintf("[ -f %s ] && sha256sum %s\n", shellQuote(path), shellQuote(path)))
+		fmt.Fprintf(&scriptBuf, "[ -f %s ] && sha256sum %s\n", shellQuote(relPath), shellQuote(relPath))
 	}
 	scriptBuf.WriteString("true\n") // ensure exit 0
 
@@ -588,7 +604,7 @@ func (a *APIServer) syncPlanWorkspace(c *gin.Context, name string) {
 
 	// Parse remote checksums into map: relativePath -> hash
 	remote := make(map[string]string, len(req.Files))
-	for _, line := range strings.Split(checksumBuf.String(), "\n") {
+	for line := range strings.SplitSeq(checksumBuf.String(), "\n") {
 		// sha256sum output: "hash  path/to/file"
 		parts := strings.SplitN(strings.TrimSpace(line), "  ", 2)
 		if len(parts) != 2 {
@@ -608,10 +624,74 @@ func (a *APIServer) syncPlanWorkspace(c *gin.Context, name string) {
 		}
 	}
 
+	var deleted []string
+	if req.IncludeDeleted {
+		var findBuf bytes.Buffer
+		findCmd := []string{"/bin/sh", "-c", "cd /workspace/src || exit 1; find . \\( -type f -o -type l \\) | sed 's|^\\./||'"}
+		if err := podExec(c.Request.Context(), restCfg, ws.Namespace, ws.Status.PodName, workspaceContainerName, findCmd, &findBuf); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to list remote files: %v", err)})
+			return
+		}
+		for line := range strings.SplitSeq(findBuf.String(), "\n") {
+			p := strings.TrimSpace(line)
+			if p == "" || p == "." {
+				continue
+			}
+			if _, inManifest := req.Files[p]; !inManifest {
+				deleted = append(deleted, p)
+			}
+		}
+	}
+
 	c.JSON(http.StatusOK, SyncPlanResponse{
-		Changed:   changed,
-		Unchanged: unchanged,
+		Changed:        changed,
+		Unchanged:      unchanged,
+		Deleted:        deleted,
+		IncludeDeleted: req.IncludeDeleted,
 	})
+}
+
+func (a *APIServer) syncDeleteWorkspace(c *gin.Context, name string) {
+	var req SyncDeleteRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid JSON request"})
+		return
+	}
+	if len(req.Files) == 0 {
+		c.JSON(http.StatusOK, gin.H{"message": "nothing to delete"})
+		return
+	}
+
+	for _, p := range req.Files {
+		if err := validateWorkspaceRelPath(p); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+	}
+
+	ws, err := a.getOwnedWorkspace(c, name)
+	if err != nil {
+		return
+	}
+	if ws.Status.Phase != phaseRunning {
+		c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf("workspace %q is not running (phase: %s)", name, ws.Status.Phase)})
+		return
+	}
+	a.touchWorkspaceActivity(c, ws)
+
+	restCfg, err := getRESTConfigFromRequest(c)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to get kubernetes config"})
+		return
+	}
+
+	cmd := []string{"/bin/sh", "-c", buildSyncDeleteScript(req.Files)}
+	if err := podExec(c.Request.Context(), restCfg, ws.Namespace, ws.Status.PodName, workspaceContainerName, cmd, io.Discard); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to delete files: %v", err)})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": fmt.Sprintf("%d file(s) deleted", len(req.Files))})
 }
 
 func (a *APIServer) execWorkspace(c *gin.Context, name string) {
@@ -934,6 +1014,10 @@ func buildWorkspaceResources(cpu, memory string, wsConfig *automotivev1alpha1.Wo
 		if err != nil {
 			return nil, fmt.Errorf("invalid --memory value %q: %v", memory, err)
 		}
+		minMemory := resource.MustParse("6Mi")
+		if q.Cmp(minMemory) < 0 {
+			return nil, fmt.Errorf("invalid --memory value %q: must be at least %s", memory, minMemory.String())
+		}
 		if wsConfig != nil && wsConfig.MaxResources != nil {
 			if maxMem, ok := wsConfig.MaxResources.Limits[corev1.ResourceMemory]; ok && q.Cmp(maxMem) > 0 {
 				return nil, fmt.Errorf("requested memory %s exceeds maximum %s", memory, maxMem.String())
@@ -948,14 +1032,18 @@ func buildWorkspaceResources(cpu, memory string, wsConfig *automotivev1alpha1.Wo
 
 func workspaceResponseFromCR(ws *automotivev1alpha1.Workspace) WorkspaceResponse {
 	phase := ws.Status.Phase
+	reason := ws.Status.Reason
+	message := ws.Status.Message
 	if phase == "" {
 		phase = "Pending"
 	}
 	// Reflect spec intent when status hasn't caught up yet
 	if ws.Spec.Stopped && phase != "Stopped" {
 		phase = "Stopping"
+		reason, message = "", ""
 	} else if !ws.Spec.Stopped && phase == "Stopped" {
 		phase = "Starting"
+		reason, message = "", ""
 	}
 	age := ""
 	if !ws.CreationTimestamp.IsZero() {
@@ -984,6 +1072,8 @@ func workspaceResponseFromCR(ws *automotivev1alpha1.Workspace) WorkspaceResponse
 	return WorkspaceResponse{
 		Name:             ws.Name,
 		Phase:            phase,
+		Reason:           string(reason),
+		Message:          message,
 		Lease:            ws.Spec.LeaseID,
 		Arch:             ws.Spec.Architecture,
 		PodName:          ws.Status.PodName,
@@ -999,7 +1089,7 @@ func (a *APIServer) resolveLeaseFromBuild(ctx context.Context, k8sClient client.
 	if err := k8sClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: buildName}, build); err != nil {
 		return "", fmt.Errorf("ImageBuild %q not found: %w", buildName, err)
 	}
-	if owner := build.Annotations["automotive.sdv.cloud.redhat.com/requested-by"]; owner != requester {
+	if owner := build.Annotations[labels.RequestedBy]; owner != requester {
 		return "", fmt.Errorf("ImageBuild %q is owned by a different user", buildName)
 	}
 	if build.Status.LeaseID == "" {

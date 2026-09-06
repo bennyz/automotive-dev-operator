@@ -1,0 +1,192 @@
+name: Setup Kind E2E Environment
+description: >
+  Provision a Kind cluster with a local container registry, Tekton Pipelines,
+  and an NGINX ingress controller for running E2E tests.
+
+inputs:
+  helm-version:
+    description: Helm version to install
+    default: v3.17.0
+  kind-version:
+    description: Kind version to install
+    default: v0.24.0
+  kubectl-version:
+    description: kubectl version to install
+    default: v1.31.0
+  tekton-version:
+    description: Tekton Pipelines version to install
+    default: v1.9.1
+  ingress-nginx-version:
+    description: NGINX Ingress Controller version to install
+    default: v1.14.3
+  cluster-name:
+    description: Kind cluster name
+    default: automotive-dev-e2e
+  registry-name:
+    description: Local registry container name
+    default: kind-registry
+  registry-port:
+    description: Host port for the local registry
+    default: '5001'
+  registry-host:
+    description: Hostname used to reach the registry from inside the cluster
+    default: image-registry.openshift-image-registry.svc
+  arch:
+    description: Target architecture (arm64 or amd64)
+    default: arm64
+
+runs:
+  using: composite
+  steps:
+    - name: Install system dependencies
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y jq
+
+    - name: Install Helm
+      shell: bash
+      run: |
+        HELM_REQUESTED="${{ inputs.helm-version }}"
+        install_helm() {
+          curl -fsSL https://get.helm.sh/helm-${{ inputs.helm-version }}-linux-${{ inputs.arch }}.tar.gz \
+            | tar xz --strip-components=1 -C /tmp linux-${{ inputs.arch }}/helm
+          sudo mv /tmp/helm /usr/local/bin/helm
+          echo "Installed Helm ${{ inputs.helm-version }}"
+        }
+        if command -v helm &>/dev/null; then
+          HELM_CURRENT=$(helm version --short 2>/dev/null | cut -d: -f2 | xargs)
+          if [ "$HELM_CURRENT" = "$HELM_REQUESTED" ]; then
+            echo "Helm $HELM_REQUESTED already installed"
+          else
+            echo "Helm version mismatch (current: $HELM_CURRENT, requested: $HELM_REQUESTED); installing requested version..."
+            install_helm
+          fi
+        else
+          install_helm
+        fi
+        helm version --short
+
+    - name: Install kubectl
+      shell: bash
+      run: |
+        curl -LO "https://dl.k8s.io/release/${{ inputs.kubectl-version }}/bin/linux/${{ inputs.arch }}/kubectl"
+        chmod +x kubectl
+        sudo mv kubectl /usr/local/bin/
+        kubectl version --client
+
+    - name: Install Kind
+      shell: bash
+      run: |
+        curl -Lo ./kind "https://kind.sigs.k8s.io/dl/${{ inputs.kind-version }}/kind-linux-${{ inputs.arch }}"
+        chmod +x ./kind
+        sudo mv ./kind /usr/local/bin/kind
+        kind version
+
+    - name: Set up local registry
+      shell: bash
+      run: |
+        docker run -d --restart=always \
+          -p "127.0.0.1:${{ inputs.registry-port }}:5000" \
+          --name "${{ inputs.registry-name }}" \
+          registry:2
+
+        echo "127.0.0.1 ${{ inputs.registry-host }}" | sudo tee -a /etc/hosts
+
+        mkdir -p "${HOME}/.config/containers/registries.conf.d"
+        tee "${HOME}/.config/containers/registries.conf.d/kind-e2e-registry.conf" <<EOF
+        [[registry]]
+        location = "${{ inputs.registry-host }}:5000"
+        insecure = true
+        EOF
+
+    - name: Create Kind cluster
+      shell: bash
+      run: |
+        kind create cluster --name "${{ inputs.cluster-name }}" --wait 5m
+        kubectl cluster-info --context "kind-${{ inputs.cluster-name }}"
+        kubectl label nodes --all aib=true
+        kubectl get nodes --show-labels
+
+    - name: Connect registry to Kind network
+      shell: bash
+      run: |
+        docker network connect kind "${{ inputs.registry-name }}"
+        for node in $(kind get nodes --name "${{ inputs.cluster-name }}"); do
+          kubectl annotate node "${node}" "kind.x-k8s.io/registry=localhost:${{ inputs.registry-port }}" --overwrite
+        done
+        kubectl wait --for=condition=Ready nodes --all --timeout=60s
+
+    - name: Set up registry DNS spoof
+      shell: bash
+      run: |
+        cat <<EOF | kubectl apply -f -
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: local-registry-hosting
+          namespace: kube-public
+        data:
+          localRegistryHosting.v1: |
+            host: "localhost:${{ inputs.registry-port }}"
+            help: "https://kind.sigs.k8s.io/docs/user/local-registry/"
+        EOF
+
+        kubectl create namespace openshift-image-registry --dry-run=client -o yaml | kubectl apply -f -
+
+        REGISTRY_IP=""
+        for i in $(seq 1 30); do
+          REGISTRY_IP=$(docker inspect -f '{{.NetworkSettings.Networks.kind.IPAddress}}' "${{ inputs.registry-name }}" 2>/dev/null || true)
+          if [ -n "$REGISTRY_IP" ]; then
+            echo "Registry IP found: $REGISTRY_IP"
+            break;
+          fi
+          echo "Waiting for registry IP... (attempt $i/30)"
+          sleep 1
+        done
+        echo "Registry IP: $REGISTRY_IP"
+        if [ -z "$REGISTRY_IP" ]; then
+          echo "Failed to discover a Kind-network IP for ${{ inputs.registry-name }}" >&2
+          exit 1
+        fi
+
+        cat <<EOF | kubectl apply -f -
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: image-registry
+          namespace: openshift-image-registry
+        spec:
+          ports:
+          - port: 5000
+            protocol: TCP
+            targetPort: 5000
+          clusterIP: None
+        ---
+        apiVersion: v1
+        kind: Endpoints
+        metadata:
+          name: image-registry
+          namespace: openshift-image-registry
+        subsets:
+        - addresses:
+          - ip: ${REGISTRY_IP}
+          ports:
+          - port: 5000
+            name: registry
+            protocol: TCP
+        EOF
+
+    - name: Install Tekton Pipelines
+      shell: bash
+      run: |
+        kubectl apply --filename https://infra.tekton.dev/tekton-releases/pipeline/previous/${{ inputs.tekton-version }}/release.yaml
+        echo "Waiting for Tekton Pipelines to be ready..."
+        kubectl wait --for=condition=ready pod --all -n tekton-pipelines --timeout=5m
+
+    - name: Install NGINX Ingress Controller
+      shell: bash
+      run: |
+        kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-${{ inputs.ingress-nginx-version }}/deploy/static/provider/kind/deploy.yaml
+        echo "Waiting for NGINX Ingress Controller to be ready..."
+        kubectl wait --namespace ingress-nginx --for=condition=ready pod --selector=app.kubernetes.io/component=controller --timeout=3m

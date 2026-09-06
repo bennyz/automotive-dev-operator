@@ -20,9 +20,44 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// ImageBuild phase constants for Status.Phase.
+const (
+	ImageBuildPhasePending   = "Pending"
+	ImageBuildPhaseUploading = "Uploading"
+	ImageBuildPhaseBuilding  = "Building"
+	ImageBuildPhasePushing   = "Pushing"
+	ImageBuildPhaseFlashing  = "Flashing"
+	ImageBuildPhaseCompleted = "Completed"
+	ImageBuildPhaseFailed    = "Failed"
+	ImageBuildPhaseCancelled = "Cancelled"
+	ImageBuildPhaseExpired   = "Expired"
+)
+
+// ImageBuild condition types for Status.Conditions.
+const (
+	ImageBuildConditionReady       = "Ready"
+	ImageBuildConditionProgressing = "Progressing"
+)
+
+// IsTerminalBuildPhase reports whether phase is a final build state.
+func IsTerminalBuildPhase(phase string) bool {
+	return phase == ImageBuildPhaseCompleted || phase == ImageBuildPhaseFailed ||
+		phase == ImageBuildPhaseCancelled || phase == ImageBuildPhaseExpired
+}
+
 // ImageBuildSpec defines the desired state of ImageBuild
 // +kubebuilder:printcolumn:name="StorageClass",type=string,JSONPath=`.spec.storageClass`
+// +kubebuilder:validation:XValidation:rule="!has(self.reproducible) || !self.reproducible || self.secureBuild",message="reproducible builds require secureBuild to be true"
+// +kubebuilder:validation:XValidation:rule="!(has(self.export) && has(self.export.disk) && has(self.export.disk.oci) && size(self.export.disk.oci) > 0) || size(self.secretRef) > 0 || (has(self.export) && has(self.export.useServiceAccountAuth) && self.export.useServiceAccountAuth)",message="secretRef is required when export.disk.oci is set (unless useServiceAccountAuth is true)"
+// +kubebuilder:validation:XValidation:rule="!(has(self.export) && has(self.export.container) && size(self.export.container) > 0) || size(self.secretRef) > 0 || (has(self.export) && has(self.export.useServiceAccountAuth) && self.export.useServiceAccountAuth)",message="secretRef is required when export.container is set (unless useServiceAccountAuth is true)"
 type ImageBuildSpec struct {
+	// +kubebuilder:validation:MaxLength=512
+	// +optional
+	ExternalID string `json:"externalId,omitempty"`
+	// CallbackSecretRef holds the endpoint and HMAC key outside this resource.
+	// +kubebuilder:validation:MaxLength=253
+	// +optional
+	CallbackSecretRef string `json:"callbackSecretRef,omitempty"`
 	// ─── Common fields ───
 
 	// Architecture specifies the target architecture (e.g., "amd64", "arm64")
@@ -64,6 +99,39 @@ type ImageBuildSpec struct {
 	// on completion so subsequent builds can reuse it.
 	// +optional
 	Workspace string `json:"workspace,omitempty"`
+
+	// SecureBuild enables supply chain security for this build.
+	// When true, pipeline tasks are resolved from the signed Tekton Bundle
+	// specified in TaskBundleRef instead of cluster-installed tasks.
+	// +optional
+	SecureBuild bool `json:"secureBuild,omitempty"`
+
+	// TaskBundleRef is the digest-pinned OCI reference to the Tekton Bundle
+	// used for this build. Set automatically by the Build API from the
+	// OperatorConfig at request time to prevent TOCTOU races.
+	// +optional
+	TaskBundleRef string `json:"taskBundleRef,omitempty"`
+
+	// Reproducible enables full build provenance: saves RPMs, AIB manifest,
+	// and task bundle ref as OCI referrers for future reproduction.
+	// Requires SecureBuild to be true for task bundle pinning.
+	// +optional
+	Reproducible bool `json:"reproducible,omitempty"`
+
+	// RestoreSourcesRef is the OCI image reference from a prior reproducible build.
+	// The build pod will pull the sources archive (OCI referrer) attached to this
+	// image and pre-populate the osbuild store, ensuring identical RPM inputs.
+	// +optional
+	RestoreSourcesRef string `json:"restoreSourcesRef,omitempty"`
+
+	// TTL is the time-to-live for this build. After this duration past its
+	// completion, the build transitions to the Expired phase and its resources
+	// (PipelineRuns, TaskRuns, PVCs, registry images) are cleaned up.
+	// The ImageBuild CR itself is preserved. In-progress builds never expire.
+	// Uses Go duration format (e.g. "24h", "72h", "168h").
+	// Empty uses the OperatorConfig default. Set to "0" to disable expiry.
+	// +optional
+	TTL string `json:"ttl,omitempty"`
 }
 
 // FlashSpec defines configuration for flashing images to hardware via Jumpstarter
@@ -92,6 +160,10 @@ type FlashSpec struct {
 	// When set, the target-based lookup is skipped entirely
 	// +optional
 	ExporterSelector string `json:"exporterSelector,omitempty"`
+
+	// LeaseTags are additional key=value tags for the Jumpstarter lease (comma-separated)
+	// +optional
+	LeaseTags string `json:"leaseTags,omitempty"`
 }
 
 // AIBSpec defines the automotive-image-builder configuration
@@ -110,6 +182,7 @@ type AIBSpec struct {
 	Mode string `json:"mode,omitempty"`
 
 	// Manifest holds the inline AIB manifest YAML content
+	// +kubebuilder:validation:MaxLength=921600
 	Manifest string `json:"manifest,omitempty" yaml:"manifest,omitempty"`
 
 	// ManifestFileName is the original filename of the manifest, used for naming the file
@@ -140,16 +213,28 @@ type AIBSpec struct {
 
 	// AIBExtraArgs are extra arguments to pass to automotive-image-builder
 	AIBExtraArgs []string `json:"aibExtraArgs,omitempty"`
+
+	// OCIRepoImages are OCI image references containing RPM repositories.
+	// Each image is mounted as a read-only volume via ImageVolumeSource in the build pod,
+	// providing RPM repos at file:///extra-repos/oci-repo-N paths.
+	// +kubebuilder:validation:MaxItems=1
+	// +optional
+	OCIRepoImages []string `json:"ociRepoImages,omitempty"`
+
+	// RootPassword is a hashed root password passed to AIB's --root-password flag.
+	// See crypt(5) for supported hash formats.
+	RootPassword string `json:"rootPassword,omitempty"`
 }
 
 // ExportSpec defines the configuration for exporting build artifacts
 type ExportSpec struct {
-	// Format specifies the disk image output format (e.g., raw, qcow2, simg, or any AIB-supported format)
-	// +kubebuilder:default=qcow2
+	// Format specifies the disk image output format (e.g., raw, qcow2, simg, or any AIB-supported format).
+	// When omitted, the controller resolves the format from the aib-target-defaults ConfigMap,
+	// falling back to qcow2 if no target default is configured.
 	Format string `json:"format,omitempty"`
 
 	// Compression specifies the compression algorithm for artifacts
-	// +kubebuilder:validation:Enum=lz4;gzip;xz
+	// +kubebuilder:validation:Enum=gzip;xz
 	// +kubebuilder:default=gzip
 	Compression string `json:"compression,omitempty"`
 
@@ -168,24 +253,69 @@ type ExportSpec struct {
 }
 
 // DiskExport defines where to export the disk image
-// Currently supports OCI registries, extensible for future storage types
+// Currently supports OCI registries and S3-compatible storage
 type DiskExport struct {
 	// OCI is the registry URL to push the disk image as an OCI artifact
 	OCI string `json:"oci,omitempty"`
 
+	// S3 contains configuration for pushing to S3-compatible storage
+	S3 *S3Export `json:"s3,omitempty"`
+
 	// Future storage options:
-	// S3 *S3Export `json:"s3,omitempty"`
 	// PVC *PVCExport `json:"pvc,omitempty"`
 }
 
+// S3Export defines S3 storage configuration
+type S3Export struct {
+	// Bucket is the S3 bucket name
+	// +kubebuilder:validation:Required
+	Bucket string `json:"bucket"`
+
+	// Prefix is the S3 key prefix (path within bucket)
+	// Defaults to "builds/<build-name>" if not specified
+	// +optional
+	Prefix string `json:"prefix,omitempty"`
+
+	// Endpoint is the S3 endpoint URL (for MinIO, Ceph, etc.)
+	// Leave empty for AWS S3
+	// +optional
+	Endpoint string `json:"endpoint,omitempty"`
+
+	// Region is the S3 region
+	// +kubebuilder:default="us-east-1"
+	// +optional
+	Region string `json:"region,omitempty"`
+
+	// CredentialsSecret is the name of a secret containing AWS credentials
+	// Should have keys: access-key-id, secret-access-key
+	// If not provided, the build pod will use IAM role or environment credentials, allows users to grant write access
+	// to the operator AWS IAM User + Role, instead of providing credentials with every request.
+	// +optional
+	CredentialsSecret string `json:"credentialsSecret,omitempty"`
+
+	// InsecureSkipTLSVerify disables TLS certificate verification for the S3 endpoint.
+	// Only relevant when Endpoint is set. When false (default), the operator's
+	// trusted CA bundle is used to verify the endpoint certificate.
+	// +optional
+	InsecureSkipTLSVerify bool `json:"insecureSkipTLSVerify,omitempty"`
+}
+
 // ImageBuildStatus defines the observed state of ImageBuild
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.terminalResult) || has(self.terminalResult)",message="terminal result cannot be removed"
 type ImageBuildStatus struct {
+	// +kubebuilder:validation:MaxItems=64
+	// +optional
+	Artifacts []ArtifactStatus `json:"artifacts,omitempty"`
+	// +optional
+	Flash *FlashOutcomeStatus `json:"flash,omitempty"`
+	// +optional
+	TerminalResult *BuildTerminalResult `json:"terminalResult,omitempty"`
 	// ObservedGeneration is the most recent generation observed by the controller.
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 
-	// Phase represents the current phase of the build (Building, Completed, Failed)
-	// +kubebuilder:validation:Enum=Pending;Uploading;Building;Pushing;Flashing;Completed;Failed
+	// Phase represents the current phase of the build
+	// +kubebuilder:validation:Enum=Pending;Uploading;Building;Pushing;Flashing;Completed;Failed;Cancelled;Expired
 	Phase string `json:"phase,omitempty"`
 
 	// StartTime is when the build started
@@ -227,6 +357,24 @@ type ImageBuildStatus struct {
 	// LeaseID is the Jumpstarter lease ID acquired during flash
 	// +optional
 	LeaseID string `json:"leaseId,omitempty"`
+
+	// ExpiresAt is when this build will transition to the Expired phase
+	// and have its associated resources cleaned up. The ImageBuild CR itself
+	// is preserved. Nil if expiry is disabled (TTL "0", no-expire annotation,
+	// or workspace build).
+	// +optional
+	ExpiresAt *metav1.Time `json:"expiresAt,omitempty"`
+
+	// PreviousPhase is the phase the build was in before transitioning to Expired.
+	// Used to determine whether an expired build originally succeeded or failed.
+	// +optional
+	PreviousPhase string `json:"previousPhase,omitempty"`
+
+	// ResolvedExportFormat is the export format resolved at build creation time.
+	// Persisted so the push task uses the same format even if the
+	// aib-target-defaults ConfigMap changes between build and push.
+	// +optional
+	ResolvedExportFormat string `json:"resolvedExportFormat,omitempty"`
 }
 
 // +kubebuilder:object:root=true
@@ -336,12 +484,28 @@ func (s *ImageBuildSpec) GetCustomDefs() []string {
 	return nil
 }
 
+// GetOCIRepoImages returns the OCI image references for RPM repo volumes
+func (s *ImageBuildSpec) GetOCIRepoImages() []string {
+	if s.AIB != nil {
+		return s.AIB.OCIRepoImages
+	}
+	return nil
+}
+
 // GetAIBExtraArgs returns extra arguments to pass to automotive-image-builder
 func (s *ImageBuildSpec) GetAIBExtraArgs() []string {
 	if s.AIB != nil {
 		return s.AIB.AIBExtraArgs
 	}
 	return nil
+}
+
+// GetRootPassword returns the root password value from AIB spec
+func (s *ImageBuildSpec) GetRootPassword() string {
+	if s.AIB != nil {
+		return s.AIB.RootPassword
+	}
+	return ""
 }
 
 // GetExportFormat returns the export format, or "qcow2" as default
@@ -387,6 +551,51 @@ func (s *ImageBuildSpec) GetExportOCI() string {
 		return s.Export.Disk.OCI
 	}
 	return ""
+}
+
+// GetS3Bucket returns the S3 bucket name for artifact push
+func (s *ImageBuildSpec) GetS3Bucket() string {
+	if s.Export != nil && s.Export.Disk != nil && s.Export.Disk.S3 != nil {
+		return s.Export.Disk.S3.Bucket
+	}
+	return ""
+}
+
+// GetS3Prefix returns the S3 key prefix for artifact push
+func (s *ImageBuildSpec) GetS3Prefix() string {
+	if s.Export != nil && s.Export.Disk != nil && s.Export.Disk.S3 != nil {
+		return s.Export.Disk.S3.Prefix
+	}
+	return ""
+}
+
+// GetS3Endpoint returns the S3 endpoint URL for artifact push
+func (s *ImageBuildSpec) GetS3Endpoint() string {
+	if s.Export != nil && s.Export.Disk != nil && s.Export.Disk.S3 != nil {
+		return s.Export.Disk.S3.Endpoint
+	}
+	return ""
+}
+
+// GetS3Region returns the S3 region for artifact push
+func (s *ImageBuildSpec) GetS3Region() string {
+	if s.Export != nil && s.Export.Disk != nil && s.Export.Disk.S3 != nil {
+		return s.Export.Disk.S3.Region
+	}
+	return "us-east-1" // default region
+}
+
+// GetS3CredentialsSecret returns the S3 credentials secret name
+func (s *ImageBuildSpec) GetS3CredentialsSecret() string {
+	if s.Export != nil && s.Export.Disk != nil && s.Export.Disk.S3 != nil {
+		return s.Export.Disk.S3.CredentialsSecret
+	}
+	return ""
+}
+
+// GetS3InsecureSkipTLSVerify returns whether TLS verification should be skipped for the S3 endpoint
+func (s *ImageBuildSpec) GetS3InsecureSkipTLSVerify() bool {
+	return s.Export != nil && s.Export.Disk != nil && s.Export.Disk.S3 != nil && s.Export.Disk.S3.InsecureSkipTLSVerify
 }
 
 // GetUseServiceAccountAuth returns whether service account auth is enabled for registry push
@@ -481,4 +690,17 @@ func (s *ImageBuildSpec) GetFlashLeaseName() string {
 		return s.Flash.LeaseName
 	}
 	return ""
+}
+
+// GetFlashLeaseTags returns the user-provided lease tags, or empty string
+func (s *ImageBuildSpec) GetFlashLeaseTags() string {
+	if s.Flash != nil {
+		return s.Flash.LeaseTags
+	}
+	return ""
+}
+
+// GetTTL returns the per-build TTL string, or empty if not set
+func (s *ImageBuildSpec) GetTTL() string {
+	return s.TTL
 }

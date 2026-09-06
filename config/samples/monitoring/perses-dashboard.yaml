@@ -1,0 +1,474 @@
+# Automotive Dev Operator - Perses Dashboard
+#
+# Prerequisites:
+#   1. Cluster Observability Operator (COO) installed
+#   2. UIPlugin with Perses enabled:
+#        oc apply -f uiplugin.yaml
+#   3. Operator monitoring enabled in OperatorConfig:
+#        spec:
+#          monitoring:
+#            enabled: true
+#
+# Usage:
+#   oc apply -f perses-dashboard.yaml
+#
+# Note: Queries use namespace "automotive-dev-operator-system".
+#       Update if operator is deployed to a different namespace.
+#
+# View in OCP Console: Observe → Dashboards (Perses)
+---
+apiVersion: perses.dev/v1alpha2
+kind: PersesDashboard
+metadata:
+  name: automotive-dev-operator
+  namespace: openshift-cluster-observability-operator
+  labels:
+    app.kubernetes.io/part-of: automotive-dev-operator
+spec:
+  config:
+    display:
+      name: "Automotive Dev Operator"
+    duration: "6h"
+    refreshInterval: "30s"
+    panels:
+      activeBuilds:
+        kind: Panel
+        spec:
+          display:
+            name: "Active Builds"
+          plugin:
+            kind: "StatChart"
+            spec:
+              calculation: "last-number"
+              format:
+                unit: "decimal"
+                decimalPlaces: 0
+          queries:
+            - kind: "TimeSeriesQuery"
+              spec:
+                plugin:
+                  kind: "PrometheusTimeSeriesQuery"
+                  spec:
+                    query: 'sum(ado_build_active{namespace="automotive-dev-operator-system"}) or vector(0)'
+      successRate:
+        kind: Panel
+        spec:
+          display:
+            name: "Success Rate"
+          plugin:
+            kind: "StatChart"
+            spec:
+              calculation: "last-number"
+              format:
+                unit: "percent-decimal"
+                decimalPlaces: 1
+              thresholds:
+                steps:
+                  - value: 0
+                    color: "#e74c3c"
+                  - value: 0.8
+                    color: "#f39c12"
+                  - value: 0.95
+                    color: "#27ae60"
+          queries:
+            - kind: "TimeSeriesQuery"
+              spec:
+                plugin:
+                  kind: "PrometheusTimeSeriesQuery"
+                  spec:
+                    query: '(sum(ado_build_total{namespace="automotive-dev-operator-system",status="success"}) or vector(0)) / clamp_min(sum(ado_build_total{namespace="automotive-dev-operator-system"}), 1)'
+      avgDuration:
+        kind: Panel
+        spec:
+          display:
+            name: "Avg Build Duration"
+          plugin:
+            kind: "StatChart"
+            spec:
+              calculation: "last-number"
+              format:
+                unit: "seconds"
+                decimalPlaces: 0
+          queries:
+            - kind: "TimeSeriesQuery"
+              spec:
+                plugin:
+                  kind: "PrometheusTimeSeriesQuery"
+                  spec:
+                    query: '(sum(ado_build_duration_seconds_sum{namespace="automotive-dev-operator-system"}) or vector(0)) / clamp_min(sum(ado_build_duration_seconds_count{namespace="automotive-dev-operator-system"}), 1)'
+      totalBuilds:
+        kind: Panel
+        spec:
+          display:
+            name: "Total Builds"
+          plugin:
+            kind: "StatChart"
+            spec:
+              calculation: "last-number"
+              format:
+                unit: "decimal"
+                decimalPlaces: 0
+          queries:
+            - kind: "TimeSeriesQuery"
+              spec:
+                plugin:
+                  kind: "PrometheusTimeSeriesQuery"
+                  spec:
+                    query: 'sum(ado_build_total{namespace="automotive-dev-operator-system"}) or vector(0)'
+      failedBuilds:
+        kind: Panel
+        spec:
+          display:
+            name: "Failed Builds"
+          plugin:
+            kind: "StatChart"
+            spec:
+              calculation: "last-number"
+              format:
+                unit: "decimal"
+                decimalPlaces: 0
+              thresholds:
+                steps:
+                  - value: 0
+                    color: "#27ae60"
+                  - value: 1
+                    color: "#f39c12"
+                  - value: 5
+                    color: "#e74c3c"
+          queries:
+            - kind: "TimeSeriesQuery"
+              spec:
+                plugin:
+                  kind: "PrometheusTimeSeriesQuery"
+                  spec:
+                    query: 'sum(ado_build_total{namespace="automotive-dev-operator-system",status="failure"}) or vector(0)'
+      buildRate:
+        kind: Panel
+        spec:
+          display:
+            name: "Build Rate"
+          plugin:
+            kind: "TimeSeriesChart"
+            spec:
+              yAxis:
+                label: "builds/sec"
+              legend:
+                position: "bottom"
+                mode: "list"
+          queries:
+            - kind: "TimeSeriesQuery"
+              spec:
+                plugin:
+                  kind: "PrometheusTimeSeriesQuery"
+                  spec:
+                    query: 'sum by (status) (rate(ado_build_total{namespace="automotive-dev-operator-system"}[5m]))'
+                    seriesNameFormat: "{{status}}"
+      durationByTarget:
+        kind: Panel
+        spec:
+          display:
+            name: "Build Duration by Target"
+          plugin:
+            kind: "TimeSeriesChart"
+            spec:
+              yAxis:
+                label: "seconds"
+              legend:
+                position: "bottom"
+                mode: "list"
+          queries:
+            - kind: "TimeSeriesQuery"
+              spec:
+                plugin:
+                  kind: "PrometheusTimeSeriesQuery"
+                  spec:
+                    query: '(sum by (target) (rate(ado_build_duration_seconds_sum{namespace="automotive-dev-operator-system"}[5m])) or vector(0)) / clamp_min(sum by (target) (rate(ado_build_duration_seconds_count{namespace="automotive-dev-operator-system"}[5m])), 1)'
+                    seriesNameFormat: "{{target}}"
+      phaseDuration:
+        kind: Panel
+        spec:
+          display:
+            name: "Build Phase Duration"
+          plugin:
+            kind: "TimeSeriesChart"
+            spec:
+              yAxis:
+                label: "seconds"
+              legend:
+                position: "bottom"
+                mode: "list"
+          queries:
+            - kind: "TimeSeriesQuery"
+              spec:
+                plugin:
+                  kind: "PrometheusTimeSeriesQuery"
+                  spec:
+                    query: '(sum by (phase) (rate(ado_build_phase_duration_seconds_sum{namespace="automotive-dev-operator-system"}[5m])) or vector(0)) / clamp_min(sum by (phase) (rate(ado_build_phase_duration_seconds_count{namespace="automotive-dev-operator-system"}[5m])), 1)'
+                    seriesNameFormat: "{{phase}}"
+      buildsByTarget:
+        kind: Panel
+        spec:
+          display:
+            name: "Builds by Target"
+          plugin:
+            kind: "TimeSeriesChart"
+            spec:
+              yAxis:
+                label: "builds"
+              legend:
+                position: "bottom"
+                mode: "list"
+          queries:
+            - kind: "TimeSeriesQuery"
+              spec:
+                plugin:
+                  kind: "PrometheusTimeSeriesQuery"
+                  spec:
+                    query: 'round(sum by (target) (ado_build_total{namespace="automotive-dev-operator-system"})) or vector(0)'
+                    seriesNameFormat: "{{target}}"
+      buildsByMode:
+        kind: Panel
+        spec:
+          display:
+            name: "Builds by Mode"
+          plugin:
+            kind: "TimeSeriesChart"
+            spec:
+              yAxis:
+                label: "builds"
+              legend:
+                position: "bottom"
+                mode: "list"
+          queries:
+            - kind: "TimeSeriesQuery"
+              spec:
+                plugin:
+                  kind: "PrometheusTimeSeriesQuery"
+                  spec:
+                    query: 'round(sum by (mode) (ado_build_total{namespace="automotive-dev-operator-system"})) or vector(0)'
+                    seriesNameFormat: "{{mode}}"
+      buildsByDistro:
+        kind: Panel
+        spec:
+          display:
+            name: "Builds by Distro"
+          plugin:
+            kind: "TimeSeriesChart"
+            spec:
+              yAxis:
+                label: "builds"
+              legend:
+                position: "bottom"
+                mode: "list"
+          queries:
+            - kind: "TimeSeriesQuery"
+              spec:
+                plugin:
+                  kind: "PrometheusTimeSeriesQuery"
+                  spec:
+                    query: 'round(sum by (distro) (ado_build_total{namespace="automotive-dev-operator-system"})) or vector(0)'
+                    seriesNameFormat: "{{distro}}"
+      buildsByArch:
+        kind: Panel
+        spec:
+          display:
+            name: "Builds by Architecture"
+          plugin:
+            kind: "TimeSeriesChart"
+            spec:
+              yAxis:
+                label: "builds"
+              legend:
+                position: "bottom"
+                mode: "list"
+          queries:
+            - kind: "TimeSeriesQuery"
+              spec:
+                plugin:
+                  kind: "PrometheusTimeSeriesQuery"
+                  spec:
+                    query: 'round(sum by (arch) (ado_build_total{namespace="automotive-dev-operator-system"})) or vector(0)'
+                    seriesNameFormat: "{{arch}}"
+      flashTotal:
+        kind: Panel
+        spec:
+          display:
+            name: "Flash Operations"
+          plugin:
+            kind: "StatChart"
+            spec:
+              calculation: "last-number"
+              format:
+                unit: "decimal"
+                decimalPlaces: 0
+          queries:
+            - kind: "TimeSeriesQuery"
+              spec:
+                plugin:
+                  kind: "PrometheusTimeSeriesQuery"
+                  spec:
+                    query: 'sum(ado_flash_total{namespace="automotive-dev-operator-system"}) or vector(0)'
+      flashSuccessRate:
+        kind: Panel
+        spec:
+          display:
+            name: "Flash Success Rate"
+          plugin:
+            kind: "StatChart"
+            spec:
+              calculation: "last-number"
+              format:
+                unit: "percent-decimal"
+                decimalPlaces: 1
+              thresholds:
+                steps:
+                  - value: 0
+                    color: "#e74c3c"
+                  - value: 0.8
+                    color: "#f39c12"
+                  - value: 0.95
+                    color: "#27ae60"
+          queries:
+            - kind: "TimeSeriesQuery"
+              spec:
+                plugin:
+                  kind: "PrometheusTimeSeriesQuery"
+                  spec:
+                    query: '(sum(ado_flash_total{namespace="automotive-dev-operator-system",status="success"}) or vector(0)) / clamp_min(sum(ado_flash_total{namespace="automotive-dev-operator-system"}), 1)'
+      flashDuration:
+        kind: Panel
+        spec:
+          display:
+            name: "Flash Duration by Target"
+          plugin:
+            kind: "TimeSeriesChart"
+            spec:
+              yAxis:
+                label: "seconds"
+              legend:
+                position: "bottom"
+                mode: "list"
+          queries:
+            - kind: "TimeSeriesQuery"
+              spec:
+                plugin:
+                  kind: "PrometheusTimeSeriesQuery"
+                  spec:
+                    query: '(sum by (target) (rate(ado_flash_duration_seconds_sum{namespace="automotive-dev-operator-system"}[5m])) or vector(0)) / clamp_min(sum by (target) (rate(ado_flash_duration_seconds_count{namespace="automotive-dev-operator-system"}[5m])), 1)'
+                    seriesNameFormat: "{{target}}"
+    layouts:
+      - kind: "Grid"
+        spec:
+          display:
+            title: "Overview"
+          items:
+            - x: 0
+              y: 0
+              width: 8
+              height: 4
+              content:
+                $ref: "#/spec/panels/activeBuilds"
+            - x: 8
+              y: 0
+              width: 8
+              height: 4
+              content:
+                $ref: "#/spec/panels/successRate"
+            - x: 16
+              y: 0
+              width: 8
+              height: 4
+              content:
+                $ref: "#/spec/panels/avgDuration"
+      - kind: "Grid"
+        spec:
+          display:
+            title: "Build Details"
+          items:
+            - x: 0
+              y: 0
+              width: 12
+              height: 4
+              content:
+                $ref: "#/spec/panels/totalBuilds"
+            - x: 12
+              y: 0
+              width: 12
+              height: 4
+              content:
+                $ref: "#/spec/panels/failedBuilds"
+            - x: 0
+              y: 4
+              width: 24
+              height: 8
+              content:
+                $ref: "#/spec/panels/buildRate"
+      - kind: "Grid"
+        spec:
+          display:
+            title: "Build Duration"
+          items:
+            - x: 0
+              y: 0
+              width: 12
+              height: 8
+              content:
+                $ref: "#/spec/panels/durationByTarget"
+            - x: 12
+              y: 0
+              width: 12
+              height: 8
+              content:
+                $ref: "#/spec/panels/phaseDuration"
+      - kind: "Grid"
+        spec:
+          display:
+            title: "Build Breakdown"
+          items:
+            - x: 0
+              y: 0
+              width: 12
+              height: 8
+              content:
+                $ref: "#/spec/panels/buildsByTarget"
+            - x: 12
+              y: 0
+              width: 12
+              height: 8
+              content:
+                $ref: "#/spec/panels/buildsByMode"
+            - x: 0
+              y: 8
+              width: 12
+              height: 8
+              content:
+                $ref: "#/spec/panels/buildsByDistro"
+            - x: 12
+              y: 8
+              width: 12
+              height: 8
+              content:
+                $ref: "#/spec/panels/buildsByArch"
+      - kind: "Grid"
+        spec:
+          display:
+            title: "Flash Operations"
+          items:
+            - x: 0
+              y: 0
+              width: 8
+              height: 4
+              content:
+                $ref: "#/spec/panels/flashTotal"
+            - x: 8
+              y: 0
+              width: 8
+              height: 4
+              content:
+                $ref: "#/spec/panels/flashSuccessRate"
+            - x: 16
+              y: 0
+              width: 8
+              height: 8
+              content:
+                $ref: "#/spec/panels/flashDuration"

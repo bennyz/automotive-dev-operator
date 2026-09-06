@@ -34,6 +34,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/spf13/cobra"
 
+	"github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/clilog"
+	caibcommon "github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/common"
 	"github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/config"
 	"github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/registryauth"
 	"github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/ui"
@@ -135,24 +137,31 @@ func runBuildContainer(_ *cobra.Command, args []string) {
 	}
 
 	absContextDir, containerfile := resolveContainerBuildContext(contextDir)
-	fmt.Printf("Context: %s\n", absContextDir)
-	fmt.Printf("Containerfile: %s\n", filepath.Join(absContextDir, containerfile))
+	clilog.Infof("Context: %s\n", absContextDir)
+	clilog.Infof("Containerfile: %s\n", filepath.Join(absContextDir, containerfile))
 
 	if serverURL == "" {
-		handleError(fmt.Errorf("server URL required (use --server, CAIB_SERVER, run 'caib login <server-url>' or 'jmp login <endpoint>')"))
+		handleError(caibcommon.ServerURLRequiredError("caib container build --server <server-url> ."))
 	}
 
 	if containerBuildPush != "" && useInternalRegistry {
-		handleError(fmt.Errorf("--push and --internal-registry are mutually exclusive"))
+		handleError(caibcommon.NewActionableError(
+			fmt.Errorf("--push and --internal-registry are mutually exclusive"),
+			fmt.Sprintf("caib container build --push %s .", containerBuildPush),
+		))
 	}
 	if containerBuildPush == "" && !useInternalRegistry {
-		handleError(fmt.Errorf("either --push or --internal-registry is required"))
+		handleError(caibcommon.NewActionableError(
+			fmt.Errorf("either --push or --internal-registry is required"),
+			"caib container build --push <registry/image:tag> .",
+			"caib container build --internal-registry .",
+		))
 	}
 
 	if buildName == "" {
 		dirName := filepath.Base(absContextDir)
 		buildName = fmt.Sprintf("cb-%s-%s", sanitizeBuildName(dirName), uuid.New().String()[:5])
-		fmt.Printf("Auto-generated build name: %s\n", buildName)
+		clilog.Infof("Auto-generated build name: %s\n", buildName)
 	} else {
 		validateBuildName(buildName)
 	}
@@ -176,11 +185,11 @@ func runBuildContainer(_ *cobra.Command, args []string) {
 
 	// Create the container build
 	if useInternalRegistry {
-		fmt.Println("Using OpenShift internal registry")
+		clilog.Infoln("Using OpenShift internal registry")
 	}
-	fmt.Println("Creating container build...")
+	clilog.Infoln("Creating container build...")
 	var createResp *buildapitypes.ContainerBuildResponse
-	err := executeWithReauth(serverURL, &authToken, func(client *buildapiclient.Client) error {
+	err := caibcommon.ExecuteWithReauth(serverURL, &authToken, insecureSkipTLS, func(client *buildapiclient.Client) error {
 		resp, cerr := client.CreateContainerBuild(ctx, buildapitypes.ContainerBuildRequest{
 			Name:                buildName,
 			Output:              containerBuildPush,
@@ -203,21 +212,22 @@ func runBuildContainer(_ *cobra.Command, args []string) {
 	}
 
 	colorFormatter := NewColorFormatter()
-	fmt.Printf("%s %s - %s\n", colorFormatter.LabelColor("Build "+createResp.Name+" accepted:"), createResp.Phase, createResp.Message)
+	clilog.Infof("%s %s - %s\n", colorFormatter.LabelColor("Build "+createResp.Name+" accepted:"), createResp.Phase, createResp.Message)
 	if createResp.OutputImage != "" {
-		fmt.Printf("%s %s\n", colorFormatter.LabelColor("Output image:"), colorFormatter.ValueColor(createResp.OutputImage))
+		clilog.Infof("%s %s\n", colorFormatter.LabelColor("Output image:"), colorFormatter.ValueColor(createResp.OutputImage))
 	}
-	fmt.Printf("\n%s\n  %s\n\n", colorFormatter.LabelColor("View build logs:"), colorFormatter.CommandColor("caib container logs "+createResp.Name))
+	if !clilog.IsQuiet() {
+		fmt.Printf("\n%s\n  %s\n\n", colorFormatter.LabelColor("View build logs:"), colorFormatter.CommandColor("caib container logs "+createResp.Name))
+	}
 
-	// Create tarball and upload
-	fmt.Printf("Packaging context directory: %s\n", absContextDir)
+	clilog.Infof("Packaging context directory: %s\n", absContextDir)
 	tarball, err := createContextTarball(absContextDir)
 	if err != nil {
 		handleError(fmt.Errorf("failed to create context tarball: %w", err))
 	}
 	tarballPath := tarball.Name()
 	if info, err := tarball.Stat(); err == nil {
-		fmt.Printf("Context tarball: %s (%.1f MB)\n", tarballPath, float64(info.Size())/(1024*1024))
+		clilog.Infof("Context tarball: %s (%.1f MB)\n", tarballPath, float64(info.Size())/(1024*1024))
 	}
 	defer func() {
 		if err := tarball.Close(); err != nil {
@@ -264,15 +274,21 @@ func resolveContainerBuildContext(contextDir string) (string, string) {
 		handleError(fmt.Errorf("--containerfile (-f) is required. Specify path to Containerfile or Dockerfile"))
 	}
 
-	cfPath := containerfile
-	if !filepath.IsAbs(cfPath) {
-		cfPath = filepath.Join(absContextDir, cfPath)
+	// Match docker/podman -f semantics: resolve relative to CWD, not context dir
+	cfPath, err := filepath.Abs(containerfile)
+	if err != nil {
+		handleError(fmt.Errorf("failed to resolve containerfile path: %w", err))
 	}
 	if _, err := os.Stat(cfPath); err != nil {
 		handleError(fmt.Errorf("containerfile not found: %s", cfPath))
 	}
 
-	return absContextDir, containerfile
+	relPath, err := filepath.Rel(absContextDir, cfPath)
+	if err != nil || strings.HasPrefix(relPath, "..") {
+		handleError(fmt.Errorf("containerfile %s is not inside context directory %s", cfPath, absContextDir))
+	}
+
+	return absContextDir, relPath
 }
 
 // parseContainerBuildArgs parses KEY=VALUE build arguments.
@@ -302,7 +318,7 @@ func waitForContainerBuildUploadReady(ctx context.Context, name string) {
 			handleError(fmt.Errorf("timed out waiting for build to reach Uploading phase"))
 		case <-ticker.C:
 			var status *buildapitypes.ContainerBuildResponse
-			err := executeWithReauth(serverURL, &authToken, func(client *buildapiclient.Client) error {
+			err := caibcommon.ExecuteWithReauth(serverURL, &authToken, insecureSkipTLS, func(client *buildapiclient.Client) error {
 				s, serr := client.GetContainerBuild(ctx, name)
 				if serr != nil {
 					return serr
@@ -342,7 +358,7 @@ func uploadContainerBuildContext(ctx context.Context, name string, tarballPath s
 			handleError(fmt.Errorf("failed to open tarball: %w", err))
 		}
 
-		err = executeWithReauth(serverURL, &authToken, func(client *buildapiclient.Client) error {
+		err = caibcommon.ExecuteWithReauth(serverURL, &authToken, insecureSkipTLS, func(client *buildapiclient.Client) error {
 			// Seek to beginning in case of auth retries
 			_, seekErr := tarball.Seek(0, io.SeekStart)
 			if seekErr != nil {
@@ -376,7 +392,7 @@ func isContainerBuildTerminal(phase string) bool {
 // getContainerBuildStatus retrieves the current build status.
 func getContainerBuildStatus(ctx context.Context, name string) (*buildapitypes.ContainerBuildResponse, error) {
 	var status *buildapitypes.ContainerBuildResponse
-	err := executeWithReauth(serverURL, &authToken, func(client *buildapiclient.Client) error {
+	err := caibcommon.ExecuteWithReauth(serverURL, &authToken, insecureSkipTLS, func(client *buildapiclient.Client) error {
 		s, serr := client.GetContainerBuild(ctx, name)
 		if serr != nil {
 			return serr
@@ -393,10 +409,7 @@ func getContainerBuildStatus(ctx context.Context, name string) (*buildapitypes.C
 // waitForContainerBuildCompletion polls until the build reaches a terminal state.
 func waitForContainerBuildCompletion(ctx context.Context, name string, pb *ui.ProgressBar) *buildapitypes.ContainerBuildResponse {
 	// Add extra headroom for queueing and status propagation beyond task timeout.
-	waitTimeout := time.Duration(containerBuildTimeout+10) * time.Minute
-	if waitTimeout < 15*time.Minute {
-		waitTimeout = 15 * time.Minute
-	}
+	waitTimeout := max(time.Duration(containerBuildTimeout+10)*time.Minute, 15*time.Minute)
 
 	timeout := time.After(waitTimeout)
 	ticker := time.NewTicker(2 * time.Second)
@@ -433,41 +446,57 @@ func waitForContainerBuildCompletion(ctx context.Context, name string, pb *ui.Pr
 	}
 }
 
-// displayContainerBuildResult shows the final build result.
 func displayContainerBuildResult(finalStatus *buildapitypes.ContainerBuildResponse) {
+	if clilog.IsQuiet() {
+		if finalStatus.Phase == phaseFailed {
+			handleError(fmt.Errorf("build failed"))
+		}
+		if finalStatus.OutputImage != "" {
+			fmt.Println(finalStatus.OutputImage)
+		}
+		if finalStatus.RegistryToken != "" {
+			credsFile, err := writeRegistryCredentialsFile(finalStatus.RegistryToken)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to write registry credentials file: %v\n", err)
+			} else {
+				fmt.Println(credsFile)
+			}
+		}
+		return
+	}
 	colorFormatter := NewColorFormatter()
 
 	fmt.Printf("\n%s %s\n", colorFormatter.LabelColor("Build "+finalStatus.Name+":"), finalStatus.Phase)
 	if finalStatus.Message != "" {
 		fmt.Printf("%s %s\n", colorFormatter.LabelColor("Message:"), finalStatus.Message)
 	}
-	if finalStatus.OutputImage != "" {
-		fmt.Printf("%s %s\n", colorFormatter.LabelColor("Output image:"), colorFormatter.ValueColor(finalStatus.OutputImage))
-	}
-	if finalStatus.RegistryToken != "" {
-		credsFile, err := writeRegistryCredentialsFile(finalStatus.RegistryToken)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to write registry credentials file: %v\n", err)
-			fmt.Printf("\n%s\n", colorFormatter.LabelColor("Registry credentials (valid ~4 hours):"))
-			fmt.Printf("  %s %s\n", colorFormatter.LabelColor("Username:"), colorFormatter.ValueColor("serviceaccount"))
-			fmt.Printf("  %s %s\n", colorFormatter.LabelColor("Token:"), colorFormatter.ValueColor(finalStatus.RegistryToken))
-			fmt.Printf("\n%s\n", colorFormatter.LabelColor("To pull this image:"))
-			fmt.Printf("  %s\n", colorFormatter.CommandColor(
-				fmt.Sprintf("podman pull --creds serviceaccount:<token> %s", finalStatus.OutputImage)))
-		} else {
-			fmt.Printf("\n%s %s (valid ~4 hours)\n",
-				colorFormatter.LabelColor("Registry credentials written to:"),
-				colorFormatter.ValueColor(credsFile))
-			fmt.Printf("\n%s\n", colorFormatter.LabelColor("To pull this image:"))
-			fmt.Printf("  %s\n", colorFormatter.CommandColor(
-				fmt.Sprintf("podman pull --creds serviceaccount:$(jq -r .token %s) %s", credsFile, finalStatus.OutputImage)))
-		}
-	}
 	switch finalStatus.Phase {
 	case phaseFailed:
 		fmt.Printf("\n%s\n  %s\n", colorFormatter.LabelColor("View build logs:"), colorFormatter.CommandColor("caib container logs "+finalStatus.Name))
 		handleError(fmt.Errorf("build failed"))
 	case phaseCompleted:
+		if finalStatus.OutputImage != "" {
+			fmt.Printf("%s %s\n", colorFormatter.LabelColor("Output image:"), colorFormatter.ValueColor(finalStatus.OutputImage))
+		}
+		if finalStatus.RegistryToken != "" {
+			credsFile, err := writeRegistryCredentialsFile(finalStatus.RegistryToken)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to write registry credentials file: %v\n", err)
+				fmt.Printf("\n%s\n", colorFormatter.LabelColor("Registry credentials (valid ~4 hours):"))
+				fmt.Printf("  %s %s\n", colorFormatter.LabelColor("Username:"), colorFormatter.ValueColor("serviceaccount"))
+				fmt.Printf("  %s %s\n", colorFormatter.LabelColor("Token:"), colorFormatter.ValueColor(finalStatus.RegistryToken))
+				fmt.Printf("\n%s\n", colorFormatter.LabelColor("To pull this image:"))
+				fmt.Printf("  %s\n", colorFormatter.CommandColor(
+					fmt.Sprintf("podman pull --creds serviceaccount:<token> %s", finalStatus.OutputImage)))
+			} else {
+				fmt.Printf("\n%s %s (valid ~4 hours)\n",
+					colorFormatter.LabelColor("Registry credentials written to:"),
+					colorFormatter.ValueColor(credsFile))
+				fmt.Printf("\n%s\n", colorFormatter.LabelColor("To pull this image:"))
+				fmt.Printf("  %s\n", colorFormatter.CommandColor(
+					fmt.Sprintf("podman pull --creds serviceaccount:$(jq -r .token %s) %s", credsFile, finalStatus.OutputImage)))
+			}
+		}
 		fmt.Printf("\n%s %s\n", colorFormatter.ValueColor("✓"), colorFormatter.ValueColor("Build completed successfully!"))
 	default:
 	}

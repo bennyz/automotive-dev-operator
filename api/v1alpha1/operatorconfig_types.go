@@ -17,6 +17,9 @@ limitations under the License.
 package v1alpha1
 
 import (
+	"strconv"
+	"strings"
+
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -25,13 +28,10 @@ import (
 
 const (
 	// DefaultAutomotiveImageBuilderImage is the default container image for automotive-image-builder
-	DefaultAutomotiveImageBuilderImage = "quay.io/centos-sig-automotive/automotive-image-builder:1.1.14"
+	DefaultAutomotiveImageBuilderImage = "quay.io/centos-sig-automotive/automotive-image-builder:1.3.4"
 
 	// DefaultYQHelperImage is the default yq helper image used in Tekton task steps
 	DefaultYQHelperImage = "quay.io/konflux-ci/yq:latest"
-
-	// DefaultOAuthProxyImage is the default OAuth proxy sidecar image for OpenShift
-	DefaultOAuthProxyImage = "registry.redhat.io/openshift4/ose-oauth-proxy:latest"
 
 	// DefaultOperatorImage is the default operator container image
 	DefaultOperatorImage = "quay.io/rh-sdv-cloud/automotive-dev-operator:latest"
@@ -48,6 +48,12 @@ const (
 	// DefaultFlashLeaseDuration is the default Jumpstarter lease duration in HH:MM:SS format
 	DefaultFlashLeaseDuration = "03:00:00"
 
+	// DefaultFlashLeaseTags is the fallback lease tags when none configured in OperatorConfig
+	DefaultFlashLeaseTags = "platform=caib"
+
+	// DefaultOrasImage is the default ORAS CLI image mounted as an OCI volume
+	DefaultOrasImage = "ghcr.io/oras-project/oras:v1.2.0"
+
 	// DefaultToolchainImage is the default container image for workspace toolchains
 	DefaultToolchainImage = "quay.io/rh-sdv-cloud/autosd-toolchain:latest"
 
@@ -59,6 +65,15 @@ const (
 
 	// DefaultAutoPauseTimeoutMinutes is the default idle timeout in minutes before a workspace is auto-paused
 	DefaultAutoPauseTimeoutMinutes int32 = 30
+
+	// DefaultBuildTTL is the default time-to-live for builds (all phases, including in-progress).
+	DefaultBuildTTL = "24h"
+
+	// DefaultRegistryTokenLifetimeSeconds is the default SA token lifetime for internal registry auth.
+	DefaultRegistryTokenLifetimeSeconds int64 = 4 * 3600 // 4 hours
+
+	// NoExpireAnnotation prevents automatic expiry when set to "true" on an ImageBuild
+	NoExpireAnnotation = "automotive.sdv.cloud.redhat.com/no-expire"
 
 	// BuildServiceAccountName is the dedicated SA used by build pods and token minting.
 	// Using a dedicated SA avoids collisions with the shared "pipeline" SA.
@@ -75,13 +90,14 @@ type ImagesConfig struct {
 	// +optional
 	YQHelper string `json:"yqHelper,omitempty"`
 
-	// OAuthProxy is the OAuth proxy sidecar image for OpenShift deployments
-	// +optional
-	OAuthProxy string `json:"oauthProxy,omitempty"`
-
 	// Operator is the operator container image (overridden by OPERATOR_IMAGE env var when set)
 	// +optional
 	Operator string `json:"operator,omitempty"`
+
+	// Oras is the ORAS CLI image mounted as an OCI volume in build pods.
+	// Only used when the OCIVolumes feature gate is enabled.
+	// +optional
+	Oras string `json:"oras,omitempty"`
 }
 
 // GetAutomotiveImageBuilderImage returns the AIB image, falling back to the default
@@ -100,14 +116,6 @@ func (c *ImagesConfig) GetYQHelperImage() string {
 	return DefaultYQHelperImage
 }
 
-// GetOAuthProxyImage returns the OAuth proxy image, falling back to the default
-func (c *ImagesConfig) GetOAuthProxyImage() string {
-	if c != nil && c.OAuthProxy != "" {
-		return c.OAuthProxy
-	}
-	return DefaultOAuthProxyImage
-}
-
 // GetOperatorImage returns the operator image, falling back to the default
 func (c *ImagesConfig) GetOperatorImage() string {
 	if c != nil && c.Operator != "" {
@@ -116,15 +124,19 @@ func (c *ImagesConfig) GetOperatorImage() string {
 	return DefaultOperatorImage
 }
 
+// GetOrasImage returns the ORAS CLI image, falling back to the default
+func (c *ImagesConfig) GetOrasImage() string {
+	if c != nil && c.Oras != "" {
+		return c.Oras
+	}
+	return DefaultOrasImage
+}
+
 // BuildAPIResourcesConfig defines resource requirements for Build API components
 type BuildAPIResourcesConfig struct {
 	// BuildAPI defines resource requirements for the Build API container
 	// +optional
 	BuildAPI *corev1.ResourceRequirements `json:"buildAPI,omitempty"`
-
-	// OAuthProxy defines resource requirements for the OAuth proxy sidecar
-	// +optional
-	OAuthProxy *corev1.ResourceRequirements `json:"oauthProxy,omitempty"`
 
 	// BuildController defines resource requirements for the build controller container
 	// +optional
@@ -144,23 +156,6 @@ func (c *BuildAPIResourcesConfig) GetBuildAPIResources() corev1.ResourceRequirem
 		Limits: corev1.ResourceList{
 			corev1.ResourceCPU:    resource.MustParse("200m"),
 			corev1.ResourceMemory: resource.MustParse("512Mi"),
-		},
-	}
-}
-
-// GetOAuthProxyResources returns the OAuth proxy resource requirements with defaults
-func (c *BuildAPIResourcesConfig) GetOAuthProxyResources() corev1.ResourceRequirements {
-	if c != nil && c.OAuthProxy != nil {
-		return *c.OAuthProxy
-	}
-	return corev1.ResourceRequirements{
-		Requests: corev1.ResourceList{
-			corev1.ResourceCPU:    resource.MustParse("10m"),
-			corev1.ResourceMemory: resource.MustParse("32Mi"),
-		},
-		Limits: corev1.ResourceList{
-			corev1.ResourceCPU:    resource.MustParse("100m"),
-			corev1.ResourceMemory: resource.MustParse("128Mi"),
 		},
 	}
 }
@@ -222,6 +217,11 @@ type JumpstarterConfig struct {
 	// +optional
 	DefaultLeaseDuration string `json:"defaultLeaseDuration,omitempty"`
 
+	// DefaultLeaseTags are key=value tags applied to all Jumpstarter leases created by the operator
+	// Format: comma-separated key=value pairs (e.g. "platform=caib,env=prod")
+	// +optional
+	DefaultLeaseTags string `json:"defaultLeaseTags,omitempty"`
+
 	// TargetMappings maps build targets to Jumpstarter exporter configurations
 	// +optional
 	TargetMappings map[string]JumpstarterTargetMapping `json:"targetMappings,omitempty"`
@@ -241,6 +241,14 @@ func (c *JumpstarterConfig) GetDefaultLeaseDuration() string {
 		return c.DefaultLeaseDuration
 	}
 	return DefaultFlashLeaseDuration
+}
+
+// GetDefaultLeaseTags returns the default lease tags, falling back to "platform=caib"
+func (c *JumpstarterConfig) GetDefaultLeaseTags() string {
+	if c != nil && c.DefaultLeaseTags != "" {
+		return c.DefaultLeaseTags
+	}
+	return DefaultFlashLeaseTags
 }
 
 // BuildAPIConfig defines configuration for the Build API server
@@ -290,7 +298,7 @@ type AuthenticationConfig struct {
 
 	// JWT authentication configuration for OIDC providers.
 	// +optional
-	JWT []apiserverv1beta1.JWTAuthenticator `json:"jwt,omitempty"`
+	JWT []JWTAuthenticatorConfig `json:"jwt,omitempty"`
 
 	// OIDC client ID for caib CLI.
 	// +optional
@@ -305,6 +313,96 @@ type InternalAuthConfig struct {
 	Prefix string `json:"prefix,omitempty"`
 }
 
+// SecretKeySelector references a key in a Kubernetes Secret.
+type SecretKeySelector struct {
+	// Name of the Secret.
+	Name string `json:"name"`
+
+	// Namespace of the Secret. If omitted, the operator's namespace is used.
+	// +optional
+	Namespace string `json:"namespace,omitempty"`
+
+	// Key within the Secret whose value is the PEM-encoded CA certificate.
+	Key string `json:"key"`
+}
+
+// ConfigMapKeySelector references a key in a Kubernetes ConfigMap.
+type ConfigMapKeySelector struct {
+	// Name of the ConfigMap.
+	Name string `json:"name"`
+
+	// Namespace of the ConfigMap. If omitted, the operator's namespace is used.
+	// +optional
+	Namespace string `json:"namespace,omitempty"`
+
+	// Key within the ConfigMap whose value is the PEM-encoded CA certificate.
+	Key string `json:"key"`
+}
+
+// JWTIssuerConfig extends the upstream JWTIssuer with Kubernetes-native CA references.
+// +kubebuilder:validation:XValidation:rule="[has(self.certificateAuthority), has(self.certificateAuthoritySecret), has(self.certificateAuthorityConfigMap)].filter(x, x).size() <= 1",message="at most one of certificateAuthority, certificateAuthoritySecret, or certificateAuthorityConfigMap may be set"
+type JWTIssuerConfig struct {
+	// URL is the base URL of the OIDC provider.
+	// +kubebuilder:validation:Required
+	URL string `json:"url"`
+
+	// DiscoveryURL overrides the OIDC discovery endpoint when it differs from URL.
+	// +optional
+	DiscoveryURL string `json:"discoveryURL,omitempty"`
+
+	// Audiences is the set of acceptable JWT audiences.
+	// +kubebuilder:validation:MinItems=1
+	Audiences []string `json:"audiences"`
+
+	// AudienceMatchPolicy controls how audiences are matched.
+	// +optional
+	AudienceMatchPolicy string `json:"audienceMatchPolicy,omitempty"`
+
+	// EgressSelectorType specifies which egress selector should be used for
+	// OIDC-related network traffic (discovery, JWKS, distributed claims, etc).
+	// Valid values are "controlplane" and "cluster".
+	// +optional
+	EgressSelectorType string `json:"egressSelectorType,omitempty"`
+
+	// CertificateAuthority is an inline PEM-encoded CA certificate used to verify
+	// the OIDC provider's TLS certificate.
+	// +optional
+	CertificateAuthority string `json:"certificateAuthority,omitempty"`
+
+	// CertificateAuthoritySecret references a Kubernetes Secret containing the
+	// PEM-encoded CA certificate. The build API watches the Secret for changes so
+	// CA rotations are picked up immediately without restarting the server.
+	// +optional
+	CertificateAuthoritySecret *SecretKeySelector `json:"certificateAuthoritySecret,omitempty"`
+
+	// CertificateAuthorityConfigMap references a Kubernetes ConfigMap containing the
+	// PEM-encoded CA certificate. The build API watches the ConfigMap for changes so
+	// CA rotations are picked up immediately without restarting the server.
+	// +optional
+	CertificateAuthorityConfigMap *ConfigMapKeySelector `json:"certificateAuthorityConfigMap,omitempty"`
+}
+
+// JWTAuthenticatorConfig configures a single external JWT/OIDC authenticator.
+// It mirrors apiserverv1beta1.JWTAuthenticator but replaces the issuer with
+// JWTIssuerConfig to support Kubernetes-native CA references.
+type JWTAuthenticatorConfig struct {
+	// Issuer configures the OIDC provider.
+	// +kubebuilder:validation:Required
+	Issuer JWTIssuerConfig `json:"issuer"`
+
+	// ClaimMappings maps OIDC claims to Kubernetes user attributes.
+	// +kubebuilder:validation:Required
+	ClaimMappings apiserverv1beta1.ClaimMappings `json:"claimMappings"`
+
+	// ClaimValidationRules are additional rules applied to incoming JWT claims.
+	// +optional
+	ClaimValidationRules []apiserverv1beta1.ClaimValidationRule `json:"claimValidationRules,omitempty"`
+
+	// UserValidationRules are additional rules applied to the authenticated user.
+	// +optional
+	UserValidationRules []apiserverv1beta1.UserValidationRule `json:"userValidationRules,omitempty"`
+}
+
 // ContainerBuildsConfig defines configuration for container build operations
 type ContainerBuildsConfig struct {
 	// UploadTimeoutMinutes is the maximum time in minutes to wait for source uploads
@@ -313,9 +411,26 @@ type ContainerBuildsConfig struct {
 	// +kubebuilder:validation:Minimum=1
 	// +optional
 	UploadTimeoutMinutes int32 `json:"uploadTimeoutMinutes,omitempty"`
+
+	// DefaultBuildTTL is the default time-to-live for container builds.
+	// After this duration past completion, a build transitions to Expired
+	// and its BuildRun is cleaned up. Uses Go duration format (e.g. "24h").
+	// Set to "0" to disable expiry by default.
+	// +optional
+	DefaultBuildTTL string `json:"defaultBuildTTL,omitempty"`
+}
+
+// GetDefaultBuildTTL returns the configured default TTL for container builds,
+// falling back to the shared DefaultBuildTTL constant ("24h").
+func (c *ContainerBuildsConfig) GetDefaultBuildTTL() string {
+	if c != nil && c.DefaultBuildTTL != "" {
+		return c.DefaultBuildTTL
+	}
+	return DefaultBuildTTL
 }
 
 // WorkspacesConfig defines configuration for developer workspaces
+// +kubebuilder:validation:XValidation:rule="!has(self.imageVerify) || !self.imageVerify || has(self.imageCosignKeyRef)",message="imageCosignKeyRef is required when imageVerify is true"
 type WorkspacesConfig struct {
 	// ToolchainImage is the container image for workspace toolchains
 	// +optional
@@ -366,6 +481,28 @@ type WorkspacesConfig struct {
 	// Default: 30
 	// +optional
 	AutoPauseTimeoutMinutes int32 `json:"autoPauseTimeoutMinutes,omitempty"`
+
+	// ImagePullSecrets is a list of secret references for pulling private workspace images
+	// +optional
+	ImagePullSecrets []corev1.LocalObjectReference `json:"imagePullSecrets,omitempty"`
+
+	// AllowedImages restricts which container images users may run in workspaces.
+	// Supports exact matches and prefix globs (e.g., "quay.io/my-org/*").
+	// When empty, only the configured toolchain image is allowed.
+	// The toolchain image is always implicitly permitted.
+	// +optional
+	AllowedImages []string `json:"allowedImages,omitempty"`
+
+	// ImageVerify enables cosign signature verification for workspace images.
+	// When true, images must be signed with the key in ImageCosignKeyRef.
+	// +optional
+	ImageVerify bool `json:"imageVerify,omitempty"`
+
+	// ImageCosignKeyRef references a ConfigMap key containing the cosign public key
+	// (PEM-encoded) used to verify workspace image signatures.
+	// Required when ImageVerify is true.
+	// +optional
+	ImageCosignKeyRef *corev1.ConfigMapKeySelector `json:"imageCosignKeyRef,omitempty"`
 }
 
 // GetToolchainImage returns the toolchain image, falling back to the default
@@ -430,8 +567,118 @@ func (c *WorkspacesConfig) GetAutoPauseTimeoutMinutes() int32 {
 	return DefaultAutoPauseTimeoutMinutes
 }
 
+// GetImagePullSecrets returns the workspace image pull secrets, or nil if not configured
+func (c *WorkspacesConfig) GetImagePullSecrets() []corev1.LocalObjectReference {
+	if c != nil {
+		return c.ImagePullSecrets
+	}
+	return nil
+}
+
+// IsImageAllowed checks whether a container image is permitted for workspace pods.
+// The configured toolchain image is always allowed. Other images must match an
+// entry in AllowedImages (exact match or prefix glob like "quay.io/org/*").
+// Returns false when AllowedImages is empty and the image is not the toolchain image.
+func (c *WorkspacesConfig) IsImageAllowed(image string) bool {
+	if c == nil {
+		return image == DefaultToolchainImage
+	}
+	if image == c.GetToolchainImage() {
+		return true
+	}
+	if len(c.AllowedImages) == 0 {
+		return false
+	}
+	for _, pattern := range c.AllowedImages {
+		if strings.HasSuffix(pattern, "/*") {
+			prefix := strings.TrimSuffix(pattern, "*")
+			if strings.HasPrefix(image, prefix) {
+				return true
+			}
+		} else if image == pattern {
+			return true
+		}
+	}
+	return false
+}
+
+// MonitoringConfig defines configuration for Prometheus metrics collection
+type MonitoringConfig struct {
+	// Enabled determines if a ServiceMonitor should be deployed for Prometheus scraping
+	// +kubebuilder:default=false
+	Enabled bool `json:"enabled"`
+
+	// Interval defines the Prometheus scrape interval
+	// Default: "30s"
+	// +optional
+	// +kubebuilder:validation:Pattern=`^(0|(([0-9]+)y)?(([0-9]+)w)?(([0-9]+)d)?(([0-9]+)h)?(([0-9]+)m)?(([0-9]+)s)?(([0-9]+)ms)?)$`
+	Interval string `json:"interval,omitempty"`
+}
+
+// GetInterval returns the scrape interval, falling back to "30s"
+func (c *MonitoringConfig) GetInterval() string {
+	if c != nil && c.Interval != "" {
+		return c.Interval
+	}
+	return "30s"
+}
+
+// TracingConfig defines configuration for OpenTelemetry distributed tracing
+type TracingConfig struct {
+	// Enabled determines if the operator should export trace spans
+	// +kubebuilder:default=false
+	Enabled bool `json:"enabled"`
+
+	// Endpoint is the OTLP gRPC collector endpoint (e.g. "otel-collector.namespace.svc:4317").
+	// Falls back to OTEL_EXPORTER_OTLP_ENDPOINT env var when empty.
+	// +optional
+	Endpoint string `json:"endpoint,omitempty"`
+
+	// Insecure disables TLS for the OTLP gRPC connection.
+	// Default: true (plaintext, appropriate for in-cluster collectors).
+	// Set to false when connecting to external/managed tracing backends that require TLS.
+	// +optional
+	// +kubebuilder:default=true
+	Insecure *bool `json:"insecure,omitempty"`
+
+	// SamplingRatio controls the fraction of traces sampled, as a string representation
+	// of a decimal between "0" and "1" (e.g. "0.1" for 10%, "1" for 100%).
+	// Default: "1" (sample everything).
+	// +optional
+	// +kubebuilder:validation:Pattern=`^(0(\.\d+)?|1(\.0+)?)$`
+	SamplingRatio string `json:"samplingRatio,omitempty"`
+}
+
+// IsInsecure returns whether the OTLP connection should use plaintext (default: true)
+func (c *TracingConfig) IsInsecure() bool {
+	if c != nil && c.Insecure != nil {
+		return *c.Insecure
+	}
+	return true
+}
+
+// GetSamplingRatio returns the sampling ratio as a float64, defaulting to 1.0
+func (c *TracingConfig) GetSamplingRatio() float64 {
+	if c != nil && c.SamplingRatio != "" {
+		if v, err := strconv.ParseFloat(c.SamplingRatio, 64); err == nil {
+			return v
+		}
+	}
+	return 1.0
+}
+
+// GetEndpoint returns the configured endpoint or empty string
+func (c *TracingConfig) GetEndpoint() string {
+	if c != nil && c.Endpoint != "" {
+		return c.Endpoint
+	}
+	return ""
+}
+
 // OperatorConfigSpec defines the desired state of OperatorConfig
 type OperatorConfigSpec struct {
+	// +optional
+	WebhookNotifications *WebhookNotificationsConfig `json:"webhookNotifications,omitempty"`
 	// OSBuilds defines the configuration for OS build operations
 	// +optional
 	OSBuilds *OSBuildsConfig `json:"osBuilds,omitempty"`
@@ -455,9 +702,25 @@ type OperatorConfigSpec struct {
 	// Workspaces defines configuration for developer workspaces
 	// +optional
 	Workspaces *WorkspacesConfig `json:"workspaces,omitempty"`
+
+	// Monitoring defines configuration for Prometheus metrics collection
+	// +optional
+	Monitoring *MonitoringConfig `json:"monitoring,omitempty"`
+
+	// Tracing defines configuration for OpenTelemetry distributed tracing
+	// +optional
+	Tracing *TracingConfig `json:"tracing,omitempty"`
+
+	// FeatureGates allows enabling or disabling specific operator features.
+	// Each key is a feature name, and the boolean value enables (true) or disables (false) it.
+	// Alpha features default to disabled, Beta to enabled, GA features are always enabled.
+	// Unknown feature names are ignored.
+	// +optional
+	FeatureGates map[string]bool `json:"featureGates,omitempty"`
 }
 
 // OSBuildsConfig defines configuration for OS build operations
+// +kubebuilder:validation:XValidation:rule="!has(self.taskBundleVerify) || !self.taskBundleVerify || has(self.taskBundleCosignKeyRef)",message="taskBundleCosignKeyRef is required when taskBundleVerify is true"
 type OSBuildsConfig struct {
 	// Enabled determines if Tekton tasks for OS builds should be deployed
 	// +kubebuilder:default=true
@@ -504,6 +767,13 @@ type OSBuildsConfig struct {
 	// +optional
 	ClusterRegistryRoute string `json:"clusterRegistryRoute,omitempty"`
 
+	// InsecureRegistry skips TLS certificate verification for OCI registry operations
+	// such as artifact pushes via oras. Required when the target registry uses a
+	// self-signed certificate (e.g., CRC/OpenShift internal registry, local Kind
+	// registry with generated certs).
+	// +optional
+	InsecureRegistry bool `json:"insecureRegistry,omitempty"`
+
 	// UploadTimeoutMinutes is the maximum time in minutes to wait for file uploads before failing the build
 	// Default: 30
 	// +optional
@@ -535,6 +805,46 @@ type OSBuildsConfig struct {
 	// Certificates defines trusted certificate configuration for build tasks.
 	// +optional
 	Certificates *BuildCertificatesConfig `json:"certificates,omitempty"`
+
+	// TaskBundleRef is the OCI reference to a signed Tekton Bundle containing task definitions.
+	// When set, builds created with SecureBuild=true will resolve tasks from this bundle
+	// instead of the cluster-installed tasks. The bundle should be signed with cosign
+	// and contain the same tasks as the operator deploys.
+	// Example: "quay.io/rh-sdv-cloud/automotive-dev-tekton-tasks:v0.1.0@sha256:abc123..."
+	// +optional
+	TaskBundleRef string `json:"taskBundleRef,omitempty"`
+
+	// TaskBundleVerify enables cosign signature verification for Tekton Bundles.
+	// When true, all bundle refs (from OperatorConfig or user-provided --task-bundle-ref)
+	// must be signed with the key in TaskBundleCosignKeyRef.
+	// +optional
+	TaskBundleVerify bool `json:"taskBundleVerify,omitempty"`
+
+	// TaskBundleCosignKeyRef references a ConfigMap key containing the cosign public key (PEM-encoded)
+	// used to verify Tekton Bundle signatures.
+	// Required when TaskBundleVerify is true.
+	// +optional
+	TaskBundleCosignKeyRef *corev1.ConfigMapKeySelector `json:"taskBundleCosignKeyRef,omitempty"`
+
+	// DefaultBuildTTL is the default time-to-live for builds (all phases, including in-progress).
+	// Builds are automatically deleted after this duration. Uses Go duration format (e.g. "24h", "72h").
+	// Set to "0" to disable expiry by default.
+	// Default: "24h"
+	// +optional
+	DefaultBuildTTL string `json:"defaultBuildTTL,omitempty"`
+
+	// MaxBuildTTL is the maximum TTL that users can request for individual builds.
+	// Build requests specifying a TTL greater than this value are rejected.
+	// Set to "0" for no maximum. Uses Go duration format (e.g. "168h" for 1 week).
+	// +optional
+	MaxBuildTTL string `json:"maxBuildTTL,omitempty"`
+
+	// RegistryTokenLifetimeSeconds is the lifetime in seconds for service account tokens
+	// used for internal registry authentication during builds.
+	// Default: 14400 (4 hours)
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	RegistryTokenLifetimeSeconds int64 `json:"registryTokenLifetimeSeconds,omitempty"`
 }
 
 // CertificateSourceRef references a Secret or ConfigMap that contains trusted CA certificates.
@@ -570,6 +880,30 @@ func (c *OSBuildsConfig) GetFlashTimeoutMinutes() int32 {
 	return DefaultFlashTimeoutMinutes
 }
 
+// GetDefaultBuildTTL returns the default build TTL string, falling back to the hardcoded default
+func (c *OSBuildsConfig) GetDefaultBuildTTL() string {
+	if c != nil && c.DefaultBuildTTL != "" {
+		return c.DefaultBuildTTL
+	}
+	return DefaultBuildTTL
+}
+
+// GetMaxBuildTTL returns the max build TTL string, or empty if no max is set
+func (c *OSBuildsConfig) GetMaxBuildTTL() string {
+	if c != nil {
+		return c.MaxBuildTTL
+	}
+	return ""
+}
+
+// GetRegistryTokenLifetimeSeconds returns the SA token lifetime for internal registry auth
+func (c *OSBuildsConfig) GetRegistryTokenLifetimeSeconds() int64 {
+	if c != nil && c.RegistryTokenLifetimeSeconds > 0 {
+		return c.RegistryTokenLifetimeSeconds
+	}
+	return DefaultRegistryTokenLifetimeSeconds
+}
+
 // GetUsePVCScratchVolumes returns whether to use PVC-backed scratch volumes (default: true)
 func (c *OSBuildsConfig) GetUsePVCScratchVolumes() bool {
 	if c.UsePVCScratchVolumes != nil {
@@ -577,6 +911,18 @@ func (c *OSBuildsConfig) GetUsePVCScratchVolumes() bool {
 	}
 	return true
 }
+
+// Condition types for OperatorConfig
+const (
+	// OperatorConfigConditionReady indicates the operator configuration has been fully reconciled
+	OperatorConfigConditionReady = "Ready"
+
+	// OperatorConfigConditionReconciling indicates the operator is actively reconciling resources
+	OperatorConfigConditionReconciling = "Reconciling"
+
+	// OperatorConfigConditionDegraded indicates the operator encountered errors during reconciliation
+	OperatorConfigConditionDegraded = "Degraded"
+)
 
 // OperatorConfigStatus defines the observed state of OperatorConfig
 type OperatorConfigStatus struct {
@@ -599,6 +945,20 @@ type OperatorConfigStatus struct {
 	// UserNamespacesSupported indicates if the cluster supports user namespaces in pods
 	// (SCC userNamespaceLevel field). When false, workspace pods use privileged mode.
 	UserNamespacesSupported bool `json:"userNamespacesSupported,omitempty"`
+
+	// MonitoringEnabled indicates if the ServiceMonitor is currently deployed
+	MonitoringEnabled bool `json:"monitoringEnabled,omitempty"`
+
+	// Conditions represent the latest available observations of the OperatorConfig's state
+	// +optional
+	// +listType=map
+	// +listMapKey=type
+	// +patchStrategy=merge
+	// +patchMergeKey=type
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
+
+	// TracingEnabled indicates if tracing is configured and active
+	TracingEnabled bool `json:"tracingEnabled,omitempty"`
 }
 
 // +kubebuilder:object:root=true

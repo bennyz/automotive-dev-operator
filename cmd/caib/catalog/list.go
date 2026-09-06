@@ -23,39 +23,53 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
+	"strings"
 	"text/tabwriter"
 
+	caibcommon "github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/common"
 	"github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/config"
 	"github.com/spf13/cobra"
-	"gopkg.in/yaml.v3"
+)
+
+const (
+	listSortCreated = "created"
+	listSortName    = "name"
 )
 
 var (
-	listArchitecture  string
-	listDistro        string
-	listTarget        string
-	listPhase         string
-	listTags          string
-	listLimit         int
-	listAllNamespaces bool
+	listArchitecture string
+	listDistro       string
+	listTarget       string
+	listPhase        string
+	listTags         string
+	listSort         string
+	listLatest       bool
+	listAll          bool
+	listLimit        int
 )
 
 func newListCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "list",
 		Short: "List images in the catalog",
-		Long:  `List images in the catalog with optional filtering by architecture, distribution, target, and phase.`,
-		RunE:  runList,
+		Long: `List images in the catalog with optional filtering by architecture, distribution,
+target, and phase. By default the API returns Available heads (newest per schedule,
+or per distro/arch/target for unscheduled images). Use --all to list every catalog
+image regardless of phase.`,
+		RunE: runList,
 	}
 
 	addCommonFlags(cmd)
 	cmd.Flags().StringVar(&listArchitecture, "architecture", "", "Filter by architecture (amd64, arm64)")
 	cmd.Flags().StringVar(&listDistro, "distro", "", "Filter by distribution (cs9, autosd10-sig)")
 	cmd.Flags().StringVar(&listTarget, "target", "", "Filter by hardware target (qemu, raspberry-pi)")
-	cmd.Flags().StringVar(&listPhase, "phase", "", "Filter by phase (Available, Unavailable, etc)")
+	cmd.Flags().StringVar(&listPhase, "phase", "", "Filter by phase (Available, Unavailable, Failed, all)")
 	cmd.Flags().StringVar(&listTags, "tags", "", "Filter by tags (comma-separated)")
+	cmd.Flags().StringVar(&listSort, "sort", listSortCreated, "Sort order: created (newest first), name")
+	cmd.Flags().BoolVar(&listLatest, "latest", false, "Show only the latest image per schedule or distro/arch/target group (API default)")
+	cmd.Flags().BoolVar(&listAll, "all", false, "List all catalog images (all phases, not only latest heads)")
 	cmd.Flags().IntVar(&listLimit, "limit", 20, "Maximum results to show")
-	cmd.Flags().BoolVar(&listAllNamespaces, "all-namespaces", false, "List images across all namespaces")
 
 	return cmd
 }
@@ -73,15 +87,26 @@ type CatalogImageListResponse struct {
 //
 //nolint:revive // Name intentionally includes package name for clarity in CLI context
 type CatalogImageResponse struct {
-	Name         string   `json:"name"`
-	Namespace    string   `json:"namespace"`
-	RegistryURL  string   `json:"registryUrl"`
-	Phase        string   `json:"phase"`
-	Architecture string   `json:"architecture,omitempty"`
-	Distro       string   `json:"distro,omitempty"`
-	Targets      []Target `json:"targets,omitempty"`
-	SizeBytes    int64    `json:"sizeBytes,omitempty"`
-	CreatedAt    string   `json:"createdAt"`
+	Name             string            `json:"name"`
+	RegistryURL      string            `json:"registryUrl"`
+	Phase            string            `json:"phase"`
+	Architecture     string            `json:"architecture,omitempty"`
+	Distro           string            `json:"distro,omitempty"`
+	Targets          []Target          `json:"targets,omitempty"`
+	Digest           string            `json:"digest,omitempty"`
+	Tags             []string          `json:"tags,omitempty"`
+	SourceType       string            `json:"sourceType,omitempty"`
+	SourceImageBuild string            `json:"sourceImageBuild,omitempty"`
+	ScheduleName     string            `json:"scheduleName,omitempty"`
+	BuildMode        string            `json:"buildMode,omitempty"`
+	ExportFormat     string            `json:"exportFormat,omitempty"`
+	Labels           map[string]string `json:"labels,omitempty"`
+	SizeBytes        int64             `json:"sizeBytes,omitempty"`
+	DownloadURL      string            `json:"downloadUrl,omitempty"`
+	CreatedAt        string            `json:"createdAt"`
+	PublishedAt      string            `json:"publishedAt,omitempty"`
+	StatusReason     string            `json:"statusReason,omitempty"`
+	StatusMessage    string            `json:"statusMessage,omitempty"`
 }
 
 // Target mirrors target info from API
@@ -105,28 +130,9 @@ func runList(cmd *cobra.Command, _ []string) error {
 		token = os.Getenv("CAIB_TOKEN")
 	}
 
-	// Build query parameters
-	params := url.Values{}
-	if namespace != "" && !listAllNamespaces {
-		params.Set("namespace", namespace)
-	}
-	if listArchitecture != "" {
-		params.Set("architecture", listArchitecture)
-	}
-	if listDistro != "" {
-		params.Set("distro", listDistro)
-	}
-	if listTarget != "" {
-		params.Set("target", listTarget)
-	}
-	if listPhase != "" {
-		params.Set("phase", listPhase)
-	}
-	if listTags != "" {
-		params.Set("tags", listTags)
-	}
-	if listLimit > 0 {
-		params.Set("limit", fmt.Sprintf("%d", listLimit))
+	params, err := listQueryParams(cmd)
+	if err != nil {
+		return err
 	}
 
 	// Make request
@@ -170,22 +176,64 @@ func runList(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("failed to parse response: %w", err)
 	}
 
-	// Output in requested format
-	switch outputFormat {
-	case "json":
-		output, _ := json.MarshalIndent(result, "", "  ")
-		fmt.Println(string(output))
-	case "yaml":
-		output, _ := yaml.Marshal(result)
-		fmt.Println(string(output))
-	default:
-		printTable(result.Items)
+	rawFormat := getOutputFormat(cmd)
+	format, fmtErr := caibcommon.ResolveOutputFormat(&rawFormat)
+	if fmtErr != nil {
+		return fmtErr
 	}
 
-	return nil
+	var renderErr error
+	caibcommon.RenderFormatted(format, result, func() error {
+		printTable(result.Items, listTags != "")
+		return nil
+	}, func(err error) { renderErr = err })
+	return renderErr
 }
 
-func printTable(items []CatalogImageResponse) {
+// listQueryParams builds GET /v1/catalog/images query values from parsed flags.
+// The API treats a missing `latest` as true; only send the param when --latest
+// was set explicitly (or --all, which always disables latest-head filtering).
+func listQueryParams(cmd *cobra.Command) (url.Values, error) {
+	params := url.Values{}
+	if listArchitecture != "" {
+		params.Set("architecture", listArchitecture)
+	}
+	if listDistro != "" {
+		params.Set("distro", listDistro)
+	}
+	if listTarget != "" {
+		params.Set("target", listTarget)
+	}
+	if listAll {
+		if listPhase != "" {
+			return nil, fmt.Errorf("--all and --phase are mutually exclusive")
+		}
+		params.Set("phase", "all")
+		params.Set("latest", "false")
+	} else {
+		if listPhase != "" {
+			params.Set("phase", listPhase)
+		}
+		if cmd.Flags().Changed("latest") {
+			params.Set("latest", strconv.FormatBool(listLatest))
+		}
+	}
+	if listTags != "" {
+		params.Set("tags", listTags)
+	}
+	if listSort != "" {
+		if listSort != listSortCreated && listSort != listSortName {
+			return nil, fmt.Errorf("invalid --sort value %q (supported: created, name)", listSort)
+		}
+		params.Set("sort", listSort)
+	}
+	if listLimit > 0 {
+		params.Set("limit", fmt.Sprintf("%d", listLimit))
+	}
+	return params, nil
+}
+
+func printTable(items []CatalogImageResponse, tagsFiltered bool) {
 	if len(items) == 0 {
 		fmt.Println("No catalog images found")
 		return
@@ -198,7 +246,12 @@ func printTable(items []CatalogImageResponse) {
 		}
 	}()
 
-	if _, err := fmt.Fprintln(w, "NAME\tREGISTRY\tARCHITECTURE\tDISTRO\tTARGET\tPHASE\tAGE"); err != nil {
+	header := "NAME\tSCHEDULE\tARCH\tDISTRO\tTARGET\tFORMAT\tPHASE\tAGE\tIMAGE"
+	if !tagsFiltered {
+		header = "NAME\tSCHEDULE\tARCH\tDISTRO\tTARGET\tFORMAT\tTAGS\tPHASE\tAGE\tIMAGE"
+	}
+
+	if _, err := fmt.Fprintln(w, header); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to write header: %v\n", err)
 		return
 	}
@@ -209,22 +262,48 @@ func printTable(items []CatalogImageResponse) {
 			target = img.Targets[0].Name
 		}
 
-		// Truncate registry URL for display
-		registryDisplay := img.RegistryURL
-		if len(registryDisplay) > 50 {
-			registryDisplay = registryDisplay[:47] + "..."
-		}
+		age := caibcommon.FormatAge(catalogAgeTimestamp(img.CreatedAt, img.PublishedAt))
 
-		if _, err := fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-			img.Name,
-			registryDisplay,
-			img.Architecture,
-			img.Distro,
-			target,
-			img.Phase,
-			img.CreatedAt,
-		); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to write row: %v\n", err)
+		if tagsFiltered {
+			if _, err := fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+				img.Name,
+				img.ScheduleName,
+				img.Architecture,
+				img.Distro,
+				target,
+				img.ExportFormat,
+				img.Phase,
+				age,
+				img.RegistryURL,
+			); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to write row: %v\n", err)
+			}
+		} else {
+			tags := strings.Join(img.Tags, ",")
+			if _, err := fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+				img.Name,
+				img.ScheduleName,
+				img.Architecture,
+				img.Distro,
+				target,
+				img.ExportFormat,
+				tags,
+				img.Phase,
+				age,
+				img.RegistryURL,
+			); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to write row: %v\n", err)
+			}
 		}
 	}
+
+	_, _ = fmt.Fprintf(w, "\n")
+	_, _ = fmt.Fprintf(os.Stderr, "%d image(s)\n", len(items))
+}
+
+func catalogAgeTimestamp(createdAt, publishedAt string) string {
+	if publishedAt != "" {
+		return publishedAt
+	}
+	return createdAt
 }

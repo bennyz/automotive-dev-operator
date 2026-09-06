@@ -2,22 +2,19 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 
+	"github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/clilog"
 	buildapiclient "github.com/centos-automotive-suite/automotive-dev-operator/internal/buildapi/client"
 )
 
-// IsAuthError checks if an error is an authentication error (401/403)
+// IsAuthError checks if an error is an authentication error.
 func IsAuthError(err error) bool {
-	if err == nil {
-		return false
-	}
-	errStr := err.Error()
-	return strings.Contains(errStr, "401") ||
-		strings.Contains(errStr, "403") ||
-		strings.Contains(errStr, "unauthorized") ||
-		strings.Contains(errStr, "forbidden")
+	var statusErr buildapiclient.HTTPError
+	return errors.As(err, &statusErr) && statusErr.HTTPStatusCode() == http.StatusUnauthorized
 }
 
 // GetTokenWithReauth gets a token, triggering OIDC re-auth if needed.
@@ -104,7 +101,7 @@ func CreateClientWithReauth(ctx context.Context, serverURL string, authToken *st
 		token, _, err := GetTokenWithReauth(ctx, serverURL, "", insecureSkipTLS)
 		if err != nil {
 			// OIDC fetch failed - log but continue (auth is optional, kubeconfig may work)
-			fmt.Printf("Warning: OIDC authentication failed: %v\n", err)
+			clilog.Warnf("OIDC authentication failed: %v\n", err)
 		} else if token != "" {
 			tokenValue = token
 			if authToken != nil {

@@ -19,8 +19,12 @@ package catalog
 
 import (
 	"context"
+	"fmt"
 	"net/http"
+	"sort"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/go-logr/logr"
@@ -31,20 +35,28 @@ import (
 )
 
 const (
-	defaultNamespace = "default"
+	sortByCreated    = "created"
+	sortByName       = "name"
+	phaseAll         = "all"
+	defaultListPhase = string(automotivev1alpha1.CatalogImagePhaseAvailable)
 )
 
 // Handler handles catalog API requests
 type Handler struct {
-	client client.Client
-	log    logr.Logger
+	client           client.Client
+	log              logr.Logger
+	defaultNamespace string
 }
 
 // NewHandler creates a new catalog API handler
-func NewHandler(client client.Client, log logr.Logger) *Handler {
+func NewHandler(client client.Client, log logr.Logger, defaultNamespace string) *Handler {
+	if defaultNamespace == "" {
+		defaultNamespace = "default"
+	}
 	return &Handler{
-		client: client,
-		log:    log.WithName("catalog-handler"),
+		client:           client,
+		log:              log.WithName("catalog-handler"),
+		defaultNamespace: defaultNamespace,
 	}
 }
 
@@ -58,14 +70,10 @@ func (h *Handler) HandleListCatalogImages(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid query parameters", "details": err.Error()})
 		return
 	}
+	normalizeListParams(&params)
 
 	// Build list options
-	listOpts := []client.ListOption{}
-
-	// Namespace filtering
-	if params.Namespace != "" {
-		listOpts = append(listOpts, client.InNamespace(params.Namespace))
-	}
+	listOpts := []client.ListOption{client.InNamespace(h.defaultNamespace)}
 
 	// Build label selector for filtering
 	labelRequirements := []string{}
@@ -90,19 +98,16 @@ func (h *Handler) HandleListCatalogImages(c *gin.Context) {
 		listOpts = append(listOpts, client.MatchingLabelsSelector{Selector: selector})
 	}
 
-	// Apply limit
-	if params.Limit > 0 && params.Limit <= 100 {
-		listOpts = append(listOpts, client.Limit(int64(params.Limit)))
-	} else {
-		listOpts = append(listOpts, client.Limit(20))
+	// Validate sort param
+	if params.Sort != "" && params.Sort != sortByCreated && params.Sort != sortByName {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid sort value", "details": "supported values: created, name"})
+		return
 	}
 
-	// Apply continue token
-	if params.Continue != "" {
-		listOpts = append(listOpts, client.Continue(params.Continue))
-	}
-
-	// List catalog images
+	// Always list the full namespace set, then filter/sort, then page.
+	// Kubernetes Limit cannot run first: phase/latest/tags filter in-process,
+	// and the default created sort must order the full set before limit/continue
+	// or pages omit newer images (and continue cannot recover global order).
 	catalogImages := &automotivev1alpha1.CatalogImageList{}
 	if err := h.client.List(ctx, catalogImages, listOpts...); err != nil {
 		h.log.Error(err, "failed to list catalog images")
@@ -110,31 +115,17 @@ func (h *Handler) HandleListCatalogImages(c *gin.Context) {
 		return
 	}
 
-	// Filter by phase if specified (post-filter since phase is in status)
-	if params.Phase != "" {
-		filtered := []automotivev1alpha1.CatalogImage{}
-		for _, img := range catalogImages.Items {
-			if string(img.Status.Phase) == params.Phase {
-				filtered = append(filtered, img)
-			}
-		}
-		catalogImages.Items = filtered
-	}
+	catalogImages.Items = postFilterAndSort(catalogImages.Items, params)
 
-	// Filter by tags if specified
-	if params.Tags != "" {
-		requestedTags := strings.Split(params.Tags, ",")
-		filtered := []automotivev1alpha1.CatalogImage{}
-		for _, img := range catalogImages.Items {
-			if hasAllTags(img.Spec.Tags, requestedTags) {
-				filtered = append(filtered, img)
-			}
-		}
-		catalogImages.Items = filtered
+	page, next, total, err := paginateFiltered(catalogImages.Items, effectiveLimit(params.Limit), params.Continue)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid continue token", "details": err.Error()})
+		return
 	}
+	catalogImages.Items = page
 
-	// Convert to response
-	response := ToCatalogImageListResponse(catalogImages, catalogImages.Continue)
+	response := ToCatalogImageListResponse(catalogImages, next)
+	response.Total = total
 	c.JSON(http.StatusOK, response)
 }
 
@@ -142,28 +133,16 @@ func (h *Handler) HandleListCatalogImages(c *gin.Context) {
 func (h *Handler) HandleGetCatalogImage(c *gin.Context) {
 	ctx := context.Background()
 	name := c.Param("name")
-	namespace := c.Query("namespace")
-
-	if namespace == "" {
-		namespace = defaultNamespace
-	}
 
 	catalogImage := &automotivev1alpha1.CatalogImage{}
-	if err := h.client.Get(ctx, client.ObjectKey{Name: name, Namespace: namespace}, catalogImage); err != nil {
+	if err := h.client.Get(ctx, client.ObjectKey{Name: name, Namespace: h.defaultNamespace}, catalogImage); err != nil {
 		if client.IgnoreNotFound(err) == nil {
 			c.JSON(http.StatusNotFound, gin.H{"error": "catalog image not found"})
 			return
 		}
-		h.log.Error(err, "failed to get catalog image", "name", name, "namespace", namespace)
+		h.log.Error(err, "failed to get catalog image", "name", name)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to get catalog image"})
 		return
-	}
-
-	// Increment access count (best effort, don't fail the request on error)
-	catalogImage.Status.AccessCount++
-	if err := h.client.Status().Update(ctx, catalogImage); err != nil {
-		h.log.V(1).Info("failed to update access count", "name", name, "error", err)
-		// Continue with response even if access count update fails
 	}
 
 	response := ToCatalogImageResponse(catalogImage)
@@ -173,10 +152,7 @@ func (h *Handler) HandleGetCatalogImage(c *gin.Context) {
 // HandleCreateCatalogImage creates a new catalog image
 func (h *Handler) HandleCreateCatalogImage(c *gin.Context) {
 	ctx := context.Background()
-	namespace := c.Query("namespace")
-	if namespace == "" {
-		namespace = defaultNamespace
-	}
+	namespace := h.defaultNamespace
 
 	var req CreateCatalogImageRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -244,19 +220,14 @@ func (h *Handler) HandleCreateCatalogImage(c *gin.Context) {
 func (h *Handler) HandleDeleteCatalogImage(c *gin.Context) {
 	ctx := context.Background()
 	name := c.Param("name")
-	namespace := c.Query("namespace")
-
-	if namespace == "" {
-		namespace = defaultNamespace
-	}
 
 	catalogImage := &automotivev1alpha1.CatalogImage{}
-	if err := h.client.Get(ctx, client.ObjectKey{Name: name, Namespace: namespace}, catalogImage); err != nil {
+	if err := h.client.Get(ctx, client.ObjectKey{Name: name, Namespace: h.defaultNamespace}, catalogImage); err != nil {
 		if client.IgnoreNotFound(err) == nil {
 			c.JSON(http.StatusNotFound, gin.H{"error": "catalog image not found"})
 			return
 		}
-		h.log.Error(err, "failed to get catalog image", "name", name, "namespace", namespace)
+		h.log.Error(err, "failed to get catalog image", "name", name)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to get catalog image"})
 		return
 	}
@@ -267,7 +238,7 @@ func (h *Handler) HandleDeleteCatalogImage(c *gin.Context) {
 		return
 	}
 
-	h.log.Info("deleted catalog image", "name", name, "namespace", namespace)
+	h.log.Info("deleted catalog image", "name", name)
 	c.Status(http.StatusNoContent)
 }
 
@@ -275,19 +246,14 @@ func (h *Handler) HandleDeleteCatalogImage(c *gin.Context) {
 func (h *Handler) HandleVerifyCatalogImage(c *gin.Context) {
 	ctx := context.Background()
 	name := c.Param("name")
-	namespace := c.Query("namespace")
-
-	if namespace == "" {
-		namespace = defaultNamespace
-	}
 
 	catalogImage := &automotivev1alpha1.CatalogImage{}
-	if err := h.client.Get(ctx, client.ObjectKey{Name: name, Namespace: namespace}, catalogImage); err != nil {
+	if err := h.client.Get(ctx, client.ObjectKey{Name: name, Namespace: h.defaultNamespace}, catalogImage); err != nil {
 		if client.IgnoreNotFound(err) == nil {
 			c.JSON(http.StatusNotFound, gin.H{"error": "catalog image not found"})
 			return
 		}
-		h.log.Error(err, "failed to get catalog image", "name", name, "namespace", namespace)
+		h.log.Error(err, "failed to get catalog image", "name", name)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to get catalog image"})
 		return
 	}
@@ -300,7 +266,7 @@ func (h *Handler) HandleVerifyCatalogImage(c *gin.Context) {
 		return
 	}
 
-	h.log.Info("triggered verification for catalog image", "name", name, "namespace", namespace)
+	h.log.Info("triggered verification for catalog image", "name", name)
 	c.JSON(http.StatusOK, VerifyImageResponse{
 		Message:   "Verification triggered successfully",
 		Triggered: true,
@@ -320,7 +286,7 @@ func (h *Handler) HandlePublishImageBuild(c *gin.Context) {
 	// Get the ImageBuild
 	imageBuild := &automotivev1alpha1.ImageBuild{}
 	if err := h.client.Get(
-		ctx, client.ObjectKey{Name: req.ImageBuildName, Namespace: req.ImageBuildNamespace}, imageBuild,
+		ctx, client.ObjectKey{Name: req.ImageBuildName, Namespace: h.defaultNamespace}, imageBuild,
 	); err != nil {
 		if client.IgnoreNotFound(err) == nil {
 			c.JSON(http.StatusNotFound, gin.H{"error": "ImageBuild not found"})
@@ -357,7 +323,7 @@ func (h *Handler) HandlePublishImageBuild(c *gin.Context) {
 	// Create CatalogImage
 	catalogImage := &automotivev1alpha1.CatalogImage{}
 	catalogImage.Name = catalogImageName
-	catalogImage.Namespace = req.ImageBuildNamespace
+	catalogImage.Namespace = h.defaultNamespace
 	catalogImage.Spec = automotivev1alpha1.CatalogImageSpec{
 		RegistryURL: registryURL,
 		Tags:        req.Tags,
@@ -387,6 +353,138 @@ func (h *Handler) HandlePublishImageBuild(c *gin.Context) {
 	h.log.Info("published ImageBuild to catalog", "imageBuild", req.ImageBuildName, "catalogImage", catalogImageName)
 	response := ToCatalogImageResponse(catalogImage)
 	c.JSON(http.StatusCreated, response)
+}
+
+func effectiveLimit(limit int) int {
+	if limit > 0 && limit <= 100 {
+		return limit
+	}
+	return 20
+}
+
+func latestEnabled(params ListQueryParams) bool {
+	if params.Latest == nil {
+		return true
+	}
+	return *params.Latest
+}
+
+func normalizeListParams(params *ListQueryParams) {
+	if params.Phase == "" {
+		params.Phase = defaultListPhase
+	}
+	if strings.EqualFold(params.Phase, phaseAll) {
+		params.Phase = ""
+	}
+	if params.Latest == nil {
+		params.Latest = new(true)
+	}
+}
+
+// paginateFiltered returns a limit-sized window of an already-filtered list.
+// continueToken is a decimal offset into that filtered list (not a kube continue).
+func paginateFiltered(items []automotivev1alpha1.CatalogImage, limit int, continueToken string) ([]automotivev1alpha1.CatalogImage, string, int, error) {
+	offset := 0
+	if continueToken != "" {
+		n, err := strconv.Atoi(continueToken)
+		if err != nil || n < 0 {
+			return nil, "", 0, fmt.Errorf("must be a non-negative integer offset")
+		}
+		offset = n
+	}
+	total := len(items)
+	if offset > total {
+		offset = total
+	}
+	end := offset + limit
+	if end > total {
+		end = total
+	}
+	next := ""
+	if end < total {
+		next = strconv.Itoa(end)
+	}
+	return items[offset:end], next, total, nil
+}
+
+func postFilterAndSort(items []automotivev1alpha1.CatalogImage, params ListQueryParams) []automotivev1alpha1.CatalogImage {
+	if params.Phase != "" {
+		filtered := []automotivev1alpha1.CatalogImage{}
+		for _, img := range items {
+			if string(img.Status.Phase) == params.Phase {
+				filtered = append(filtered, img)
+			}
+		}
+		items = filtered
+	}
+
+	if params.Tags != "" {
+		requestedTags := strings.Split(params.Tags, ",")
+		filtered := []automotivev1alpha1.CatalogImage{}
+		for _, img := range items {
+			if hasAllTags(img.Spec.Tags, requestedTags) {
+				filtered = append(filtered, img)
+			}
+		}
+		items = filtered
+	}
+
+	if latestEnabled(params) {
+		sort.Slice(items, func(i, j int) bool {
+			return catalogTime(items[i]).After(catalogTime(items[j]))
+		})
+		seen := map[string]bool{}
+		filtered := []automotivev1alpha1.CatalogImage{}
+		for i := range items {
+			key := latestGroupKey(&items[i])
+			if !seen[key] {
+				seen[key] = true
+				filtered = append(filtered, items[i])
+			}
+		}
+		items = filtered
+	}
+
+	sortBy := params.Sort
+	if sortBy == "" {
+		sortBy = sortByCreated
+	}
+	switch sortBy {
+	case sortByCreated:
+		sort.Slice(items, func(i, j int) bool {
+			return catalogTime(items[i]).After(catalogTime(items[j]))
+		})
+	case sortByName:
+		sort.Slice(items, func(i, j int) bool {
+			return items[i].Name < items[j].Name
+		})
+	}
+
+	return items
+}
+
+// latestGroupKey returns a grouping key for --latest deduplication.
+// Scheduled images group by schedule name; others by distro+arch+target.
+func latestGroupKey(img *automotivev1alpha1.CatalogImage) string {
+	if name, ok := img.Labels[automotivev1alpha1.LabelScheduledImageBuildName]; ok && name != "" {
+		return "schedule:" + name
+	}
+	arch := img.Labels[automotivev1alpha1.LabelArchitecture]
+	distro := img.Labels[automotivev1alpha1.LabelDistro]
+	target := img.Labels[automotivev1alpha1.LabelTarget]
+	if arch == "" && distro == "" && target == "" {
+		return "name:" + img.Name
+	}
+	return distro + "/" + arch + "/" + target
+}
+
+// catalogTime is when the catalog row last became the published head.
+// Overwrite-in-place does not bump creationTimestamp.
+func catalogTime(img automotivev1alpha1.CatalogImage) time.Time {
+	if img.Status.PublishedAt != nil && !img.Status.PublishedAt.Time.IsZero() {
+		return img.Status.PublishedAt.Time
+	}
+	return img.CreationTimestamp.Time
 }
 
 // hasAllTags checks if the image has all the requested tags

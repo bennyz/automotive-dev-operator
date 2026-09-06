@@ -18,6 +18,7 @@ package e2e
 
 import (
 	"fmt"
+	"os"
 	"testing"
 
 	. "github.com/onsi/ginkgo/v2" //nolint:revive // Dot import is standard for Ginkgo
@@ -32,3 +33,17 @@ func TestE2E(t *testing.T) {
 	_, _ = fmt.Fprintf(GinkgoWriter, "Starting automotive-dev-operator suite\n")
 	RunSpecs(t, "e2e suite")
 }
+
+var _ = BeforeSuite(func() {
+	testNamespace = resolveNamespace()
+	registryHost = os.Getenv("REGISTRY_HOST")
+	arch = detectArch()
+
+	_, _ = fmt.Fprintf(GinkgoWriter, "Test namespace: %s\n", testNamespace)
+	_, _ = fmt.Fprintf(GinkgoWriter, "Registry host:  %s\n", registryHost)
+	_, _ = fmt.Fprintf(GinkgoWriter, "Architecture:   %s\n", arch)
+})
+
+var _ = AfterSuite(func() {
+	teardownOperator()
+})

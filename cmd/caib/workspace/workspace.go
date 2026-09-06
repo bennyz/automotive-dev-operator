@@ -20,10 +20,12 @@ import (
 	"text/tabwriter"
 	"time"
 
+	automotivev1alpha1 "github.com/centos-automotive-suite/automotive-dev-operator/api/v1alpha1"
 	"github.com/gorilla/websocket"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 
+	"github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/clilog"
 	caibcommon "github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/common"
 	"github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/config"
 	buildapitypes "github.com/centos-automotive-suite/automotive-dev-operator/internal/buildapi"
@@ -34,6 +36,9 @@ var (
 	serverURL       string
 	authToken       string
 	insecureSkipTLS bool
+
+	// output format pointer — set by NewWorkspaceCmd from the root command's flag
+	outputFormatPtr *string
 
 	// create flags
 	fromBuild        string
@@ -55,10 +60,16 @@ var (
 
 	// deploy flags
 	artifactMappings []string
+
+	// sync flags
+	gitTrackedOnly bool
+	syncDelete     bool
 )
 
 // NewWorkspaceCmd creates the workspace command with subcommands.
-func NewWorkspaceCmd() *cobra.Command {
+// outputFormat is a pointer to the root command's --output-format flag value.
+func NewWorkspaceCmd(outputFormat *string) *cobra.Command {
+	outputFormatPtr = outputFormat
 	cmd := &cobra.Command{
 		Use:   "workspace",
 		Short: "Manage developer workspaces for application building",
@@ -77,6 +88,12 @@ Examples:
   caib workspace sync my-app ./src
   caib workspace exec my-app -- make -j4
   caib workspace deploy my-app --artifact /workspace/src/build/app --dest /usr/local/bin/app`,
+		PersistentPreRunE: func(_ *cobra.Command, _ []string) error {
+			if strings.TrimSpace(serverURL) == "" {
+				serverURL = config.DefaultServerWithDerive()
+			}
+			return nil
+		},
 	}
 
 	cmd.PersistentFlags().StringVar(&serverURL, "server", config.DefaultServer(), "REST API server base URL")
@@ -193,18 +210,30 @@ Examples:
 }
 
 func newSyncCmd() *cobra.Command {
-	return &cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "sync <name> [directory]",
 		Short: "Upload local source directory to a workspace",
 		Long: `Sync uploads a local directory to the workspace's /workspace/src/ path.
 If no directory is specified, the current directory is used.
 
+By default, all files in the directory are included except those excluded by
+.gitignore. Use --git-tracked-only to sync only files that have been committed
+or staged with git add.
+
+Use --delete to remove files from the workspace that no longer exist locally
+(similar to rsync --delete). Without this flag, stale files are left in place.
+
 Examples:
   caib workspace sync my-app ./src
-  caib workspace sync my-app`,
+  caib workspace sync my-app
+  caib workspace sync my-app --git-tracked-only
+  caib workspace sync my-app --delete`,
 		Args: cobra.RangeArgs(1, 2),
 		Run:  runSync,
 	}
+	cmd.Flags().BoolVar(&gitTrackedOnly, "git-tracked-only", false, "sync only git-tracked files (committed or staged)")
+	cmd.Flags().BoolVar(&syncDelete, "delete", false, "remove files from workspace that no longer exist locally")
+	return cmd
 }
 
 func newExecCmd() *cobra.Command {
@@ -279,7 +308,7 @@ func runCreate(_ *cobra.Command, args []string) {
 	var clientConfigB64 string
 	clientInfo, err := caibcommon.ResolveJumpstarterClient(strings.TrimSpace(clientConfigFile))
 	if err == nil {
-		fmt.Printf("Using Jumpstarter client %q (endpoint: %s)\n", clientInfo.Name, clientInfo.Endpoint)
+		clilog.Infof("Using Jumpstarter client %q (endpoint: %s)\n", clientInfo.Name, clientInfo.Endpoint)
 		clientConfigB64 = base64.StdEncoding.EncodeToString(clientInfo.Data)
 	}
 
@@ -315,24 +344,29 @@ func runCreate(_ *cobra.Command, args []string) {
 		handleError(fmt.Errorf("failed to create workspace: %w", err))
 	}
 
-	fmt.Printf("Workspace %q created\n", resp.Name)
-	fmt.Printf("  Architecture: %s\n", resp.Arch)
+	clilog.Infof("Workspace %q created\n", resp.Name)
+	clilog.Infof("  Architecture: %s\n", resp.Arch)
 	if resp.Lease != "" {
-		fmt.Printf("  Lease:        %s\n", resp.Lease)
+		clilog.Infof("  Lease:        %s\n", resp.Lease)
 	}
 
 	if waitForRunningFlag {
 		waitForRunning(resp.Name)
 	} else {
-		fmt.Printf("  Phase:        %s\n", resp.Phase)
+		clilog.Infof("  Phase:        %s\n", resp.Phase)
 	}
 }
 
 func runList(_ *cobra.Command, _ []string) {
 	requireServer()
 
+	format, err := caibcommon.ResolveOutputFormat(outputFormatPtr)
+	if err != nil {
+		handleError(err)
+	}
+
 	var workspaces []buildapitypes.WorkspaceResponse
-	err := caibcommon.ExecuteWithReauth(serverURL, &authToken, insecureSkipTLS, func(client *buildapiclient.Client) error {
+	err = caibcommon.ExecuteWithReauth(serverURL, &authToken, insecureSkipTLS, func(client *buildapiclient.Client) error {
 		ws, cerr := client.ListWorkspaces(context.Background())
 		if cerr != nil {
 			return cerr
@@ -344,13 +378,24 @@ func runList(_ *cobra.Command, _ []string) {
 		handleError(fmt.Errorf("failed to list workspaces: %w", err))
 	}
 
-	if len(workspaces) == 0 {
-		fmt.Println("No workspaces found")
-		return
+	if workspaces == nil {
+		workspaces = []buildapitypes.WorkspaceResponse{}
 	}
 
+	caibcommon.RenderFormatted(format, workspaces, func() error {
+		if len(workspaces) == 0 {
+			fmt.Println("No workspaces found")
+			return nil
+		}
+		return printWorkspaceList(workspaces)
+	}, handleError)
+}
+
+func printWorkspaceList(workspaces []buildapitypes.WorkspaceResponse) error {
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	_, _ = fmt.Fprintln(w, "NAME\tARCH\tPHASE\tLEASE\tAGE")
+	if _, err := fmt.Fprintln(w, "NAME\tARCH\tPHASE\tLEASE\tAGE"); err != nil {
+		return err
+	}
 	for _, ws := range workspaces {
 		lease := ws.Lease
 		if lease == "" {
@@ -360,17 +405,24 @@ func runList(_ *cobra.Command, _ []string) {
 		if age == "" {
 			age = "-"
 		}
-		_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", ws.Name, ws.Arch, ws.Phase, lease, age)
+		if _, err := fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", ws.Name, ws.Arch, ws.Phase, lease, age); err != nil {
+			return err
+		}
 	}
-	_ = w.Flush()
+	return w.Flush()
 }
 
 func runShow(_ *cobra.Command, args []string) {
 	requireServer()
 	name := args[0]
 
+	format, err := caibcommon.ResolveOutputFormat(outputFormatPtr)
+	if err != nil {
+		handleError(err)
+	}
+
 	var ws *buildapitypes.WorkspaceResponse
-	err := caibcommon.ExecuteWithReauth(serverURL, &authToken, insecureSkipTLS, func(client *buildapiclient.Client) error {
+	err = caibcommon.ExecuteWithReauth(serverURL, &authToken, insecureSkipTLS, func(client *buildapiclient.Client) error {
 		r, cerr := client.GetWorkspace(context.Background(), name)
 		if cerr != nil {
 			return cerr
@@ -382,9 +434,21 @@ func runShow(_ *cobra.Command, args []string) {
 		handleError(fmt.Errorf("failed to get workspace: %w", err))
 	}
 
+	caibcommon.RenderFormatted(format, ws, func() error {
+		return printWorkspaceDetails(ws)
+	}, handleError)
+}
+
+func printWorkspaceDetails(ws *buildapitypes.WorkspaceResponse) error {
 	fmt.Printf("Name:         %s\n", ws.Name)
 	fmt.Printf("Architecture: %s\n", ws.Arch)
 	fmt.Printf("Phase:        %s\n", ws.Phase)
+	if ws.Reason != "" {
+		fmt.Printf("Reason:       %s\n", ws.Reason)
+	}
+	if ws.Message != "" {
+		fmt.Printf("Message:      %s\n", ws.Message)
+	}
 	fmt.Printf("Pod:          %s\n", ws.PodName)
 	if ws.Lease != "" {
 		fmt.Printf("Lease:        %s\n", ws.Lease)
@@ -396,6 +460,7 @@ func runShow(_ *cobra.Command, args []string) {
 	if ws.LastActivity != "" {
 		fmt.Printf("Last active:  %s\n", ws.LastActivity)
 	}
+	return nil
 }
 
 func runDelete(_ *cobra.Command, args []string) {
@@ -409,7 +474,7 @@ func runDelete(_ *cobra.Command, args []string) {
 		handleError(fmt.Errorf("failed to delete workspace: %w", err))
 	}
 
-	fmt.Printf("Workspace %q deleted\n", name)
+	clilog.Infof("Workspace %q deleted\n", name)
 }
 
 func runStart(_ *cobra.Command, args []string) {
@@ -430,10 +495,10 @@ func runStart(_ *cobra.Command, args []string) {
 	}
 
 	if waitForRunningFlag {
-		fmt.Printf("Workspace %q starting...\n", resp.Name)
+		clilog.Infof("Workspace %q starting...\n", resp.Name)
 		waitForRunning(resp.Name)
 	} else {
-		fmt.Printf("Workspace %q starting (phase: %s)\n", resp.Name, resp.Phase)
+		clilog.Infof("Workspace %q starting (phase: %s)\n", resp.Name, resp.Phase)
 	}
 }
 
@@ -454,7 +519,7 @@ func runStop(_ *cobra.Command, args []string) {
 		handleError(fmt.Errorf("failed to stop workspace: %w", err))
 	}
 
-	fmt.Printf("Workspace %q stopped (storage preserved)\n", resp.Name)
+	clilog.Infof("Workspace %q stopped (storage preserved)\n", resp.Name)
 }
 
 func runSync(_ *cobra.Command, args []string) {
@@ -475,16 +540,27 @@ func runSync(_ *cobra.Command, args []string) {
 		handleError(fmt.Errorf("source directory does not exist or is not a directory: %s", absDir))
 	}
 
-	files, err := gitTrackedFiles(absDir)
+	files, err := gitListFiles(absDir, gitTrackedOnly)
 	if err != nil {
-		handleError(fmt.Errorf("failed to list git-tracked files: %w", err))
+		handleError(fmt.Errorf("failed to list files: %w", err))
 	}
 	if len(files) == 0 {
-		handleError(fmt.Errorf("no git-tracked files found in %s", absDir))
+		handleError(fmt.Errorf("no files found in %s", absDir))
 	}
 
 	manifest := computeManifest(absDir, files)
-	planReq := buildapitypes.SyncPlanRequest{Files: manifest}
+	if syncDelete {
+		if gitTrackedOnly {
+			fmt.Fprintf(os.Stderr, "Warning: --git-tracked-only with --delete removes remote files that are not git-tracked locally\n")
+		}
+		if err := abortDeleteIfUnreadable(absDir, files, manifest); err != nil {
+			handleError(err)
+		}
+	}
+	planReq := buildapitypes.SyncPlanRequest{
+		Files:          manifest,
+		IncludeDeleted: syncDelete,
+	}
 
 	var plan *buildapitypes.SyncPlanResponse
 	err = caibcommon.ExecuteWithReauth(serverURL, &authToken, insecureSkipTLS, func(client *buildapiclient.Client) error {
@@ -496,21 +572,48 @@ func runSync(_ *cobra.Command, args []string) {
 		return nil
 	})
 	if err != nil {
-		// Fall back to full sync — warn so users know why delta didn't work
+		if syncDelete {
+			handleError(fmt.Errorf("sync plan required for --delete: %w", err))
+		}
+		// Fall back to full overlay sync — warn so users know why delta didn't work
 		fmt.Fprintf(os.Stderr, "Warning: sync plan unavailable (%v), uploading all files\n", err)
-		fmt.Printf("Syncing %d tracked files to workspace %q...\n", len(files), name)
+		clilog.Infof("Syncing %d files to workspace %q...\n", len(files), name)
 		uploadFiles(name, absDir, files)
 		return
 	}
 
-	if len(plan.Changed) == 0 {
-		fmt.Printf("Workspace %q is up to date (%d files)\n", name, plan.Unchanged)
+	if syncDelete && !plan.IncludeDeleted {
+		handleError(fmt.Errorf("server does not support --delete; upgrade the build API"))
+	}
+	if syncDelete {
+		plan.Deleted = filterDeletedMissingLocal(absDir, plan.Deleted)
+	}
+
+	if len(plan.Changed) == 0 && len(plan.Deleted) == 0 {
+		clilog.Infof("Workspace %q is up to date (%d files)\n", name, plan.Unchanged)
 		return
 	}
 
-	fmt.Printf("Syncing %d changed files to workspace %q (%d unchanged)...\n",
-		len(plan.Changed), name, plan.Unchanged)
-	uploadFiles(name, absDir, plan.Changed)
+	if len(plan.Changed) > 0 {
+		clilog.Infof("Syncing %d changed files to workspace %q (%d unchanged)...\n",
+			len(plan.Changed), name, plan.Unchanged)
+		uploadFiles(name, absDir, plan.Changed)
+	}
+
+	if syncDelete && len(plan.Deleted) > 0 {
+		for _, f := range plan.Deleted {
+			fmt.Fprintf(os.Stderr, "  delete: %s\n", f)
+		}
+		clilog.Infof("Removing %d stale file(s) from workspace %q...\n", len(plan.Deleted), name)
+		deleteReq := buildapitypes.SyncDeleteRequest{Files: plan.Deleted}
+		err = caibcommon.ExecuteWithReauth(serverURL, &authToken, insecureSkipTLS, func(client *buildapiclient.Client) error {
+			return client.SyncDelete(context.Background(), name, deleteReq)
+		})
+		if err != nil {
+			handleError(fmt.Errorf("failed to delete stale files: %w", err))
+		}
+		clilog.Infoln("Stale files removed")
+	}
 }
 
 func uploadFiles(name, absDir string, files []string) {
@@ -532,7 +635,7 @@ func uploadFiles(name, absDir string, files []string) {
 	if err != nil {
 		handleError(fmt.Errorf("failed to sync workspace: %w", err))
 	}
-	fmt.Println("Files synced")
+	clilog.Infoln("Files synced")
 }
 
 func computeManifest(baseDir string, files []string) map[string]string {
@@ -541,12 +644,14 @@ func computeManifest(baseDir string, files []string) map[string]string {
 		absPath := filepath.Join(baseDir, relPath)
 		f, err := os.Open(absPath)
 		if err != nil {
-			continue // file may have been deleted since ls-files
+			fmt.Fprintf(os.Stderr, "Warning: skipping %s: %v\n", relPath, err)
+			continue
 		}
 		h := sha256.New()
 		_, err = io.Copy(h, f)
 		_ = f.Close()
 		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: skipping %s: %v\n", relPath, err)
 			continue
 		}
 		manifest[relPath] = hex.EncodeToString(h.Sum(nil))
@@ -554,18 +659,59 @@ func computeManifest(baseDir string, files []string) map[string]string {
 	return manifest
 }
 
-// gitTrackedFiles returns the list of git-tracked files relative to dir.
-func gitTrackedFiles(dir string) ([]string, error) {
-	cmd := exec.Command("git", "ls-files", "--cached", "--exclude-standard")
+// abortDeleteIfUnreadable refuses --delete when a git-listed path was omitted
+// from the manifest for any reason other than confirmed absence. Omitting an
+// unreadable-but-present file would make the server treat it as remote-only.
+func abortDeleteIfUnreadable(baseDir string, files []string, manifest map[string]string) error {
+	for _, rel := range files {
+		if _, ok := manifest[rel]; ok {
+			continue
+		}
+		_, err := os.Lstat(filepath.Join(baseDir, rel))
+		if err == nil {
+			return fmt.Errorf("refusing --delete: %s exists locally but could not be hashed (aborting to avoid deleting the remote copy)", rel)
+		}
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("refusing --delete: %s: %w", rel, err)
+		}
+	}
+	return nil
+}
+
+// filterDeletedMissingLocal drops remote paths that still exist locally
+// (including gitignored files) so --delete matches "no longer exist locally".
+func filterDeletedMissingLocal(baseDir string, deleted []string) []string {
+	if len(deleted) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(deleted))
+	for _, rel := range deleted {
+		_, err := os.Lstat(filepath.Join(baseDir, rel))
+		if os.IsNotExist(err) {
+			out = append(out, rel)
+		}
+	}
+	return out
+}
+
+// gitListFiles returns files relative to dir. When trackedOnly is true, only
+// git-indexed files are returned. Otherwise both tracked and untracked files
+// are returned, excluding those matched by .gitignore.
+func gitListFiles(dir string, trackedOnly bool) ([]string, error) {
+	args := []string{"ls-files", "-z", "--cached", "--exclude-standard"}
+	if !trackedOnly {
+		args = append(args, "--others")
+	}
+	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
 	out, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("git ls-files failed (is this a git repo?): %w", err)
 	}
 	var files []string
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		if line != "" {
-			files = append(files, line)
+	for _, f := range bytes.Split(bytes.TrimRight(out, "\x00"), []byte{0}) {
+		if len(f) > 0 {
+			files = append(files, string(f))
 		}
 	}
 	return files, nil
@@ -580,7 +726,8 @@ func tarTrackedFiles(baseDir string, files []string, w io.Writer) error {
 		absPath := filepath.Join(baseDir, relPath)
 		fi, err := os.Lstat(absPath)
 		if err != nil {
-			continue // file may have been deleted since ls-files
+			fmt.Fprintf(os.Stderr, "Warning: skipping %s: %v\n", relPath, err)
+			continue
 		}
 
 		var linkTarget string
@@ -745,9 +892,9 @@ func runDeploy(_ *cobra.Command, args []string) {
 	}
 
 	if len(artifacts) == 1 {
-		fmt.Printf("Deploying %s -> %s\n", artifacts[0].Src, artifacts[0].Dest)
+		clilog.Infof("Deploying %s -> %s\n", artifacts[0].Src, artifacts[0].Dest)
 	} else {
-		fmt.Printf("Deploying %d artifacts to board...\n", len(artifacts))
+		clilog.Infof("Deploying %d artifacts to board...\n", len(artifacts))
 	}
 
 	var body io.ReadCloser
@@ -776,7 +923,8 @@ func waitForRunning(name string) {
 	defer ticker.Stop()
 
 	isTTY := term.IsTerminal(int(os.Stdout.Fd()))
-	lastPhase := ""
+	lastStatus := ""
+	lastReason := ""
 
 	for {
 		select {
@@ -785,7 +933,11 @@ func waitForRunning(name string) {
 			return
 		case <-timeout:
 			fmt.Println()
-			handleError(fmt.Errorf("timed out waiting for workspace %q to be running", name))
+			err := fmt.Errorf("timed out waiting for workspace %q to be running", name)
+			if lastStatus != "" {
+				err = fmt.Errorf("%w (last status: %s)", err, lastStatus)
+			}
+			handleError(workspaceStatusError(err, lastReason))
 		case <-ticker.C:
 			var ws *buildapitypes.WorkspaceResponse
 			err := caibcommon.ExecuteWithReauth(serverURL, &authToken, insecureSkipTLS, func(client *buildapiclient.Client) error {
@@ -800,39 +952,81 @@ func waitForRunning(name string) {
 				continue // transient error, retry
 			}
 
-			if ws.Phase != lastPhase {
-				lastPhase = ws.Phase
-				if isTTY {
-					fmt.Printf("\r  Phase:        %-20s", ws.Phase)
-				} else {
-					fmt.Printf("  Phase: %s\n", ws.Phase)
+			showProgress := !clilog.IsQuiet()
+			status := ws.Phase
+			lastReason = ws.Reason
+			if ws.Reason != "" {
+				status += " (" + ws.Reason + ")"
+			}
+			if ws.Message != "" {
+				status += ": " + ws.Message
+			}
+			if status != lastStatus {
+				lastStatus = status
+				if showProgress {
+					if isTTY {
+						fmt.Printf("\r  Phase:        %s\033[K", status)
+					} else {
+						fmt.Printf("  Phase: %s\n", status)
+					}
 				}
 			}
 
 			switch ws.Phase {
 			case "Running":
-				if isTTY {
+				if isTTY && showProgress {
 					fmt.Println()
 				}
 				return
-			case "Failed":
-				if isTTY {
+			case "Stopped":
+				if isTTY && showProgress {
 					fmt.Println()
 				}
-				handleError(fmt.Errorf("workspace %q failed", name))
+				handleError(caibcommon.NewActionableError(
+					fmt.Errorf("workspace %q is stopped (auto-paused due to inactivity)", name),
+					"caib workspace start "+name,
+				))
+			case "Failed":
+				if isTTY && showProgress {
+					fmt.Println()
+				}
+				handleError(workspaceFailureError(name, ws))
 			}
 		}
 	}
 }
 
+func workspaceFailureError(name string, ws *buildapitypes.WorkspaceResponse) error {
+	err := fmt.Errorf("workspace %q failed", name)
+	if ws.Reason != "" {
+		err = fmt.Errorf("workspace %q failed (%s)", name, ws.Reason)
+	}
+	if ws.Message != "" {
+		err = fmt.Errorf("%w: %s", err, ws.Message)
+	}
+
+	return workspaceStatusError(err, ws.Reason)
+}
+
+func workspaceStatusError(err error, reason string) error {
+	switch reason {
+	case string(automotivev1alpha1.WorkspaceReasonImagePulling):
+		return caibcommon.NewActionableError(err, "verify the workspace image name and registry access")
+	case string(automotivev1alpha1.WorkspaceReasonScheduling):
+		return caibcommon.NewActionableError(err, "contact your service administrator to check cluster capacity for the requested architecture")
+	default:
+		return fmt.Errorf("%w; contact your service administrator with this status", err)
+	}
+}
+
 func requireServer() {
 	if serverURL == "" {
-		handleError(fmt.Errorf("--server is required (or set CAIB_SERVER, or run 'caib login <server-url>')"))
+		handleError(caibcommon.ServerURLRequiredError("caib workspace --server <server-url>"))
 	}
 }
 
 func handleError(err error) {
-	fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+	fmt.Fprintln(os.Stderr, caibcommon.FormatError(err))
 	os.Exit(1)
 }
 
@@ -840,7 +1034,7 @@ func streamToStdout(r io.Reader) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	for scanner.Scan() {
-		fmt.Println(scanner.Text())
+		clilog.Infoln(scanner.Text())
 	}
 	if err := scanner.Err(); err != nil {
 		fmt.Fprintf(os.Stderr, "stream error: %v\n", err)
@@ -861,7 +1055,7 @@ func newProgressReader(r io.Reader, total int64) *progressReader {
 	return &progressReader{
 		r:     r,
 		total: total,
-		isTTY: term.IsTerminal(int(os.Stdout.Fd())),
+		isTTY: term.IsTerminal(int(os.Stderr.Fd())),
 		last:  -1,
 	}
 }
@@ -880,20 +1074,23 @@ func (p *progressReader) Read(b []byte) (int, error) {
 }
 
 func (p *progressReader) render(pct int) {
+	if clilog.IsQuiet() {
+		return
+	}
 	barWidth := 30
 	filled := barWidth * pct / 100
 	bar := strings.Repeat("█", filled) + strings.Repeat("░", barWidth-filled)
 	sizeInfo := fmt.Sprintf("%s / %s", humanSize(p.read), humanSize(p.total))
 	if p.isTTY {
-		_, _ = fmt.Fprintf(os.Stdout, "\r  Upload   │%s│ %3d%% %s", bar, pct, sizeInfo)
+		_, _ = fmt.Fprintf(os.Stderr, "\r  Upload   │%s│ %3d%% %s", bar, pct, sizeInfo)
 	} else if pct%25 == 0 || pct == 100 {
-		_, _ = fmt.Fprintf(os.Stdout, "  Upload: %d%% %s\n", pct, sizeInfo)
+		_, _ = fmt.Fprintf(os.Stderr, "  Upload: %d%% %s\n", pct, sizeInfo)
 	}
 }
 
 func (p *progressReader) finish() {
-	if p.total > 0 && p.isTTY {
-		_, _ = fmt.Fprintln(os.Stdout)
+	if p.total > 0 && p.isTTY && !clilog.IsQuiet() {
+		_, _ = fmt.Fprintln(os.Stderr)
 	}
 }
 

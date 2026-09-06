@@ -110,8 +110,9 @@ if [ "$COMMAND" != "build" ] && [ "$SKIP_CONFIRM" = false ]; then
     fi
 fi
 
-# Configuration
-VERSION=${VERSION:-0.0.1}
+# Configuration — read default from VERSION file
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VERSION=${VERSION:-$(cat "$SCRIPT_DIR/../VERSION" 2>/dev/null || echo "0.0.0")}
 NAMESPACE=${NAMESPACE:-automotive-dev-operator-system}
 CATALOG_NAME=${CATALOG_NAME:-automotive-dev-operator-catalog}
 
@@ -124,7 +125,7 @@ if [ -z "$INTERNAL_REGISTRY" ]; then
     oc patch configs.imageregistry.operator.openshift.io/cluster --patch '{"spec":{"defaultRoute":true}}' --type=merge
 
     echo "Waiting for registry route to be created..."
-    for i in {1..30}; do
+    for _ in {1..30}; do
         INTERNAL_REGISTRY=$(oc get route default-route -n openshift-image-registry -o jsonpath='{.spec.host}' 2>/dev/null || echo "")
         if [ -n "$INTERNAL_REGISTRY" ]; then
             break
@@ -186,13 +187,8 @@ uninstall_operator() {
     echo "Deleting subscription (if exists)..."
     oc delete subscriptions.operators.coreos.com automotive-dev-operator -n ${NAMESPACE} --ignore-not-found=true
 
-    echo "Deleting CSVs (if exist)..."
-    oc delete csv -n ${NAMESPACE} -l operators.coreos.com/automotive-dev-operator.${NAMESPACE}= --ignore-not-found=true 2>/dev/null || true
-    # Also try by name pattern
-    CSVS=$(oc get csv -n ${NAMESPACE} -o name 2>/dev/null | grep automotive-dev-operator || true)
-    if [ -n "$CSVS" ]; then
-        echo "$CSVS" | xargs -r oc delete -n ${NAMESPACE} --ignore-not-found=true
-    fi
+    echo "Deleting all CSVs in namespace..."
+    oc delete csv --all -n ${NAMESPACE} --ignore-not-found=true 2>/dev/null || true
 
     echo "Deleting InstallPlans (if exist)..."
     oc delete installplan -n ${NAMESPACE} --all --ignore-not-found=true 2>/dev/null || true
@@ -211,6 +207,11 @@ uninstall_operator() {
     oc delete clusterrolebinding ado-build-controller --ignore-not-found=true 2>/dev/null || true
     oc delete role ado-build-controller-leader-election -n ${NAMESPACE} --ignore-not-found=true 2>/dev/null || true
     oc delete rolebinding ado-build-controller-leader-election -n ${NAMESPACE} --ignore-not-found=true 2>/dev/null || true
+
+    echo "Cleaning up legacy kustomize RBAC (pre-OLM)..."
+    oc delete clusterrole ado-manager-role --ignore-not-found=true 2>/dev/null || true
+    oc delete clusterrolebinding ado-manager-rolebinding --ignore-not-found=true 2>/dev/null || true
+    oc delete clusterrolebinding ado-manager-cluster-rolebinding --ignore-not-found=true 2>/dev/null || true
 
     echo "Waiting for operator pods to terminate..."
     oc wait --for=delete pod -l control-plane=operator -n ${NAMESPACE} --timeout=60s 2>/dev/null || true
@@ -262,12 +263,12 @@ fi
 
 echo ""
 echo "Ensuring push permissions..."
-oc policy add-role-to-user system:image-pusher $(oc whoami) -n ${NAMESPACE} 2>/dev/null || true
-oc policy add-role-to-user system:image-pusher $(oc whoami) -n ${CATALOG_NAMESPACE} 2>/dev/null || true
+oc policy add-role-to-user system:image-pusher "$(oc whoami)" -n ${NAMESPACE} 2>/dev/null || true
+oc policy add-role-to-user system:image-pusher "$(oc whoami)" -n ${CATALOG_NAMESPACE} 2>/dev/null || true
 
 echo ""
 echo "Logging in to OpenShift registry..."
-${CONTAINER_TOOL} login -u $(oc whoami) -p $(oc whoami -t) ${REGISTRY} --tls-verify=false
+${CONTAINER_TOOL} login -u "$(oc whoami)" -p "$(oc whoami -t)" ${REGISTRY} --tls-verify=false
 
 echo ""
 echo "Ensuring namespace ${NAMESPACE} exists..."
@@ -279,32 +280,32 @@ CLUSTER_ARCHS=$(oc get nodes -o jsonpath='{.items[*].status.nodeInfo.architectur
 echo "Found architectures: ${CLUSTER_ARCHS}"
 
 # Build multi-arch manifest if cluster has multiple architectures
-ARCHS_ARRAY=(${CLUSTER_ARCHS})
+read -ra ARCHS_ARRAY <<< "${CLUSTER_ARCHS}"
 if [ ${#ARCHS_ARRAY[@]} -gt 1 ]; then
     echo ""
     echo "Multi-arch cluster detected. Building for all architectures..."
 
     # Build and push each architecture
-    for arch in ${CLUSTER_ARCHS}; do
+    for arch in "${ARCHS_ARRAY[@]}"; do
         echo ""
         echo "Building for linux/${arch}..."
-        ${CONTAINER_TOOL} buildx build -f Dockerfile --platform linux/${arch} --load -t ${OPERATOR_IMG}-${arch} .
+        ${CONTAINER_TOOL} buildx build -f Dockerfile --platform "linux/${arch}" --load -t "${OPERATOR_IMG}-${arch}" .
         echo "Pushing ${OPERATOR_IMG}-${arch}..."
-        ${CONTAINER_TOOL} push ${OPERATOR_IMG}-${arch} --tls-verify=false
+        ${CONTAINER_TOOL} push "${OPERATOR_IMG}-${arch}" --tls-verify=false
     done
 
     echo ""
     echo "Creating multi-arch manifest..."
     # Remove any existing manifest or image with this name
-    ${CONTAINER_TOOL} manifest rm ${OPERATOR_IMG} 2>/dev/null || true
-    ${CONTAINER_TOOL} rmi ${OPERATOR_IMG} 2>/dev/null || true
+    ${CONTAINER_TOOL} manifest rm "${OPERATOR_IMG}" 2>/dev/null || true
+    ${CONTAINER_TOOL} rmi "${OPERATOR_IMG}" 2>/dev/null || true
 
-    MANIFEST_ARGS=""
-    for arch in ${CLUSTER_ARCHS}; do
-        MANIFEST_ARGS="${MANIFEST_ARGS} ${OPERATOR_IMG}-${arch}"
+    MANIFEST_ARGS=()
+    for arch in "${ARCHS_ARRAY[@]}"; do
+        MANIFEST_ARGS+=("${OPERATOR_IMG}-${arch}")
     done
-    ${CONTAINER_TOOL} manifest create ${OPERATOR_IMG} ${MANIFEST_ARGS}
-    ${CONTAINER_TOOL} manifest push ${OPERATOR_IMG} --tls-verify=false
+    ${CONTAINER_TOOL} manifest create "${OPERATOR_IMG}" "${MANIFEST_ARGS[@]}"
+    ${CONTAINER_TOOL} manifest push "${OPERATOR_IMG}" --tls-verify=false
 else
     BUILD_PLATFORM="linux/${ARCHS_ARRAY[0]}"
     echo "Single architecture cluster. Building for: ${BUILD_PLATFORM}"
@@ -367,34 +368,39 @@ entries:
 EOF
 ./bin/opm render bundle/ --output yaml >> catalog/automotive-dev-operator.yaml
 
-# Add openshift-pipelines dependency (opm render doesn't include dependencies.yaml)
-# Use awk for portable multi-line insertion after the olm.package version line
-awk '
-/^- type: olm\.package$/ { in_pkg=1 }
-in_pkg && /version:/ {
-    print
-    print "- type: olm.package.required"
-    print "  value:"
-    print "    packageName: openshift-pipelines-operator-rh"
-    print "    versionRange: \">=1.12.0\""
-    in_pkg=0
-    next
-}
-{ print }
-' catalog/automotive-dev-operator.yaml > catalog/automotive-dev-operator.yaml.tmp
-mv catalog/automotive-dev-operator.yaml.tmp catalog/automotive-dev-operator.yaml
-
 # Update bundle image reference to internal registry (handles both empty and existing image refs)
 sed -i.bak "s|^image:.*|image: ${BUNDLE_IMG_INTERNAL}|g" catalog/automotive-dev-operator.yaml
 rm -f catalog/automotive-dev-operator.yaml.bak
 
 echo ""
 echo "Building catalog image..."
-${CONTAINER_TOOL} build -f catalog.Dockerfile -t ${CATALOG_IMG} .
+if [ ${#ARCHS_ARRAY[@]} -gt 1 ]; then
+    for arch in "${ARCHS_ARRAY[@]}"; do
+        echo "Building catalog for linux/${arch}..."
+        ${CONTAINER_TOOL} buildx build -f catalog.Dockerfile --platform "linux/${arch}" --load -t "${CATALOG_IMG}-${arch}" .
+    done
+    echo "Creating multi-arch catalog manifest..."
+    ${CONTAINER_TOOL} manifest rm "${CATALOG_IMG}" 2>/dev/null || true
+    ${CONTAINER_TOOL} rmi "${CATALOG_IMG}" 2>/dev/null || true
+    CATALOG_MANIFEST_ARGS=()
+    for arch in "${ARCHS_ARRAY[@]}"; do
+        CATALOG_MANIFEST_ARGS+=("${CATALOG_IMG}-${arch}")
+    done
+    ${CONTAINER_TOOL} manifest create "${CATALOG_IMG}" "${CATALOG_MANIFEST_ARGS[@]}"
+else
+    ${CONTAINER_TOOL} buildx build -f catalog.Dockerfile --platform linux/${ARCHS_ARRAY[0]} --load -t ${CATALOG_IMG} .
+fi
 
 echo ""
 echo "Pushing catalog image to OpenShift registry..."
-${CONTAINER_TOOL} push ${CATALOG_IMG} --tls-verify=false
+if [ ${#ARCHS_ARRAY[@]} -gt 1 ]; then
+    for arch in "${ARCHS_ARRAY[@]}"; do
+        ${CONTAINER_TOOL} push "${CATALOG_IMG}-${arch}" --tls-verify=false
+    done
+    ${CONTAINER_TOOL} manifest push "${CATALOG_IMG}" --tls-verify=false
+else
+    ${CONTAINER_TOOL} push ${CATALOG_IMG} --tls-verify=false
+fi
 
 echo ""
 echo "Updating CatalogSource manifest..."
@@ -428,7 +434,7 @@ if [ "$COMMAND" = "redeploy" ]; then
 
     echo ""
     echo "Waiting for catalog pod to be ready..."
-    for i in {1..60}; do
+    for _ in {1..60}; do
         CATALOG_POD=$(oc get pods -n ${CATALOG_NAMESPACE} -l olm.catalogSource=${CATALOG_NAME} -o name 2>/dev/null || echo "")
         if [ -n "$CATALOG_POD" ]; then
             oc wait --for=condition=Ready ${CATALOG_POD} -n ${CATALOG_NAMESPACE} --timeout=120s && break
@@ -446,7 +452,7 @@ if [ "$COMMAND" = "redeploy" ]; then
 
     echo ""
     echo "Waiting for CSV to be installed..."
-    for i in {1..60}; do
+    for _ in {1..60}; do
         CSV=$(oc get csv -n ${NAMESPACE} -o name 2>/dev/null | grep automotive-dev-operator || echo "")
         if [ -n "$CSV" ]; then
             PHASE=$(oc get ${CSV} -n ${NAMESPACE} -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
@@ -467,7 +473,7 @@ if [ "$COMMAND" = "redeploy" ]; then
 
     echo ""
     echo "Waiting for operator deployment to be available..."
-    for i in {1..30}; do
+    for _ in {1..30}; do
         if oc get deployment ado-operator -n ${NAMESPACE} &>/dev/null; then
             oc wait --for=condition=Available deployment/ado-operator -n ${NAMESPACE} --timeout=300s && break
         fi

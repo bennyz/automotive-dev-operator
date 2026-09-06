@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/centos-automotive-suite/automotive-dev-operator/internal/common/labels"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 	corev1 "k8s.io/api/core/v1"
@@ -77,12 +78,12 @@ func (a *APIServer) ensureClientTokenSecret(c *gin.Context, username string, oid
 			Name:      secretName,
 			Namespace: resolveNamespace(),
 			Labels: map[string]string{
-				"app.kubernetes.io/name":                        "automotive-dev-operator",
-				"app.kubernetes.io/component":                   "build-api",
-				"automotive.sdv.cloud.redhat.com/resource-type": "client-token",
+				labels.Name:         labels.ValueOperator,
+				labels.Component:    labels.ValueBuildAPI,
+				labels.ResourceType: "client-token",
 			},
 			Annotations: map[string]string{
-				"automotive.sdv.cloud.redhat.com/username": username,
+				labels.Username: username,
 			},
 		},
 		Type: corev1.SecretTypeOpaque,

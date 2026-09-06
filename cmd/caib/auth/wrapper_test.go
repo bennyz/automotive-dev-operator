@@ -3,6 +3,8 @@ package auth
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -12,6 +14,33 @@ import (
 	. "github.com/onsi/ginkgo/v2" //nolint:revive
 	. "github.com/onsi/gomega"    //nolint:revive
 )
+
+type testHTTPStatusError struct {
+	code int
+}
+
+func (e *testHTTPStatusError) Error() string {
+	return http.StatusText(e.code)
+}
+
+func (e *testHTTPStatusError) HTTPStatusCode() int {
+	return e.code
+}
+
+var _ = Describe("IsAuthError", func() {
+	DescribeTable("classifies only authentication failures for reauthentication",
+		func(err error, expected bool) {
+			Expect(IsAuthError(err)).To(Equal(expected))
+		},
+		Entry("nil error", nil, false),
+		Entry("401 response", &testHTTPStatusError{code: http.StatusUnauthorized}, true),
+		Entry("wrapped 401 response", fmt.Errorf("request failed: %w", &testHTTPStatusError{code: http.StatusUnauthorized}), true),
+		Entry("unstructured unauthorized response", errors.New("request failed: unauthorized"), false),
+		Entry("403 workspace image policy response", &testHTTPStatusError{code: http.StatusForbidden}, false),
+		Entry("forbidden response", errors.New("request failed: forbidden"), false),
+		Entry("unrelated response", errors.New("request failed: 500 Internal Server Error"), false),
+	)
+})
 
 var _ = Describe("CreateClientWithReauth", func() {
 	It("should handle nil authToken pointer safely", func() {
@@ -89,15 +118,15 @@ var _ = Describe("RefreshCachedToken", func() {
 	It("should return error when no cache exists", func() {
 		apiServer = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			_ = json.NewEncoder(w).Encode(map[string]any{
 				"clientId": "test-client",
-				"jwt": []map[string]interface{}{
+				"jwt": []map[string]any{
 					{
-						"issuer": map[string]interface{}{
+						"issuer": map[string]any{
 							"url": "https://issuer.example.com",
 						},
-						"claimMappings": map[string]interface{}{
-							"username": map[string]interface{}{"claim": "preferred_username"},
+						"claimMappings": map[string]any{
+							"username": map[string]any{"claim": "preferred_username"},
 						},
 					},
 				},
@@ -126,15 +155,15 @@ var _ = Describe("RefreshCachedToken", func() {
 
 		apiServer = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			_ = json.NewEncoder(w).Encode(map[string]any{
 				"clientId": "test-client",
-				"jwt": []map[string]interface{}{
+				"jwt": []map[string]any{
 					{
-						"issuer": map[string]interface{}{
+						"issuer": map[string]any{
 							"url": "https://issuer.example.com",
 						},
-						"claimMappings": map[string]interface{}{
-							"username": map[string]interface{}{"claim": "preferred_username"},
+						"claimMappings": map[string]any{
+							"username": map[string]any{"claim": "preferred_username"},
 						},
 					},
 				},
@@ -171,7 +200,7 @@ var _ = Describe("RefreshCachedToken", func() {
 				})
 				return
 			}
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			_ = json.NewEncoder(w).Encode(map[string]any{
 				"access_token":  newAccessToken,
 				"refresh_token": "new-refresh",
 				"expires_in":    3600,
@@ -193,15 +222,15 @@ var _ = Describe("RefreshCachedToken", func() {
 		// API server returns OIDC config pointing to the token server
 		apiServer = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			_ = json.NewEncoder(w).Encode(map[string]any{
 				"clientId": "test-client",
-				"jwt": []map[string]interface{}{
+				"jwt": []map[string]any{
 					{
-						"issuer": map[string]interface{}{
+						"issuer": map[string]any{
 							"url": tokenServer.URL,
 						},
-						"claimMappings": map[string]interface{}{
-							"username": map[string]interface{}{"claim": "preferred_username"},
+						"claimMappings": map[string]any{
+							"username": map[string]any{"claim": "preferred_username"},
 						},
 					},
 				},

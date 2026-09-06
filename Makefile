@@ -1,9 +1,8 @@
 # VERSION defines the project version for the bundle.
-# Update this value when you upgrade the version of your project.
-# To re-generate a bundle for another specific version without changing the standard setup, you can:
-# - use the VERSION as arg of the bundle target (e.g make bundle VERSION=0.0.2)
-# - use environment variables to overwrite this value (e.g export VERSION=0.0.2)
-VERSION ?= 0.1.0
+# The default is read from the VERSION file at the project root.
+# To override for a single command: make bundle VERSION=0.0.2
+# To override via environment: export VERSION=0.0.2
+VERSION ?= $(shell cat $(dir $(lastword $(MAKEFILE_LIST)))VERSION 2>/dev/null || echo 0.0.0)
 
 # CHANNELS define the bundle channels used in the bundle.
 # Add a new line here if you would like to change its default config. (E.g CHANNELS = "candidate,fast,stable")
@@ -109,18 +108,23 @@ generate: controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and
 fmt: ## Run go fmt against code.
 	go fmt ./...
 
+.PHONY: generate-openapi
+generate-openapi: ## Copy the canonical Build API specification to the documentation.
+	cp internal/buildapi/openapi.yaml docs/openapi.yaml
+
+.PHONY: verify-openapi
+verify-openapi: ## Check that the published OpenAPI matches the embedded specification.
+	@cmp internal/buildapi/openapi.yaml docs/openapi.yaml || { echo "OpenAPI drift: run make generate-openapi"; exit 1; }
+
 .PHONY: vet
 vet: ## Run go vet against code.
-	go vet ./...
+	go vet -tags containers_image_openpgp ./...
 
 .PHONY: test
-test: manifests generate fmt vet envtest ## Run tests.
-	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
+test: verify-openapi manifests generate fmt vet envtest ## Run tests.
+	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test -tags containers_image_openpgp $$(go list ./... | grep -v /e2e) -coverprofile cover.out
 
-# Utilize Kind or modify the e2e tests to load the image locally, enabling compatibility with other vendors.
-.PHONY: test-e2e  # Run the e2e tests against a Kind k8s instance that is spun up.
-test-e2e:
-	go test ./test/e2e/ -v -ginkgo.v -timeout 85m
+include Makefile.e2e
 
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter
@@ -130,12 +134,15 @@ lint: golangci-lint ## Run golangci-lint linter
 lint-fix: golangci-lint ## Run golangci-lint linter and perform fixes
 	$(GOLANGCI_LINT) run --fix
 
+.PHONY: lint-shell
+lint-shell: ## Run shellcheck on shell scripts
+	find . -name '*.sh' -not -path './.git/*' -not -path './vendor/*' -print0 | xargs -0 shellcheck --severity=warning
+
 ##@ Build
 
 .PHONY: build
 build: manifests generate fmt vet ## Build manager binary.
 	go build -o bin/manager cmd/main.go
-	go build -o bin/init-secrets cmd/init-secrets/main.go
 
 .PHONY: run
 run: manifests generate fmt vet ## Run a controller from your host.
@@ -146,7 +153,7 @@ run: manifests generate fmt vet ## Run a controller from your host.
 # More info: https://docs.docker.com/develop/develop-images/build_enhancements/
 .PHONY: docker-build
 docker-build: ## Build docker image with the manager.
-	$(CONTAINER_TOOL) buildx build -f Dockerfile --platform $(BUILD_PLATFORM) --load -t ${IMG} .
+	$(CONTAINER_TOOL) buildx build -f Dockerfile --build-arg VERSION=$(VERSION) --platform $(BUILD_PLATFORM) --load -t ${IMG} .
 
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.
@@ -165,7 +172,7 @@ docker-buildx: ## Build and push docker image for the manager for cross-platform
 	sed -e '1 s/\(^FROM\)/FROM --platform=\$$\{BUILDPLATFORM\}/; t' -e ' 1,// s//FROM --platform=\$$\{BUILDPLATFORM\}/' Dockerfile > Dockerfile.cross
 	- $(CONTAINER_TOOL) buildx create --name automotive-dev-operator-builder
 	$(CONTAINER_TOOL) buildx use automotive-dev-operator-builder
-	- $(CONTAINER_TOOL) buildx build --push --platform=$(PLATFORMS) --tag ${IMG} -f Dockerfile.cross .
+	- $(CONTAINER_TOOL) buildx build --push --build-arg VERSION=$(VERSION) --platform=$(PLATFORMS) --tag ${IMG} -f Dockerfile.cross .
 	- $(CONTAINER_TOOL) buildx rm automotive-dev-operator-builder
 	rm Dockerfile.cross
 
@@ -189,16 +196,24 @@ install: manifests kustomize ## Install CRDs into the K8s cluster specified in ~
 uninstall: manifests kustomize ## Uninstall CRDs from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
 	$(KUSTOMIZE) build config/crd | $(KUBECTL) delete --ignore-not-found=$(ignore-not-found) -f -
 
+NAMESPACE ?= automotive-dev-operator-system
+
 .PHONY: deploy
 deploy: manifests kustomize ## Deploy controller to the K8s cluster specified in ~/.kube/config.
-	cd config/manager && $(KUSTOMIZE) edit set image controller=${IMG}
-	cd config/manager && sed -i.bak 's|value: controller:latest|value: ${IMG}|g' manager.yaml && rm -f manager.yaml.bak
-	$(KUSTOMIZE) build config/default | $(KUBECTL) apply -f -
-	cd config/manager && sed -i.bak 's|value: ${IMG}|value: controller:latest|g' manager.yaml && rm -f manager.yaml.bak
+	@cd $(CURDIR)/config/default && $(KUSTOMIZE) edit set namespace $(NAMESPACE); \
+	cd $(CURDIR)/config/manager && cp manager.yaml manager.yaml.orig; \
+	trap 'cd $(CURDIR)/config/default && $(KUSTOMIZE) edit set namespace automotive-dev-operator-system; cd $(CURDIR)/config/manager && mv -f manager.yaml.orig manager.yaml 2>/dev/null || true' EXIT; \
+	cd $(CURDIR)/config/manager && $(KUSTOMIZE) edit set image controller=${IMG}; \
+	cd $(CURDIR)/config/manager && sed -i.bak 's|value: quay.io/rh-sdv-cloud/automotive-dev-operator:latest|value: ${IMG}|g' manager.yaml && rm -f manager.yaml.bak; \
+	cd $(CURDIR) && $(KUSTOMIZE) build config/default | $(KUBECTL) apply -f -; \
+	cd $(CURDIR)/config/manager && sed -i.bak 's|value: ${IMG}|value: quay.io/rh-sdv-cloud/automotive-dev-operator:latest|g' manager.yaml && rm -f manager.yaml.bak; \
+	rm -f $(CURDIR)/config/manager/manager.yaml.orig
 
 .PHONY: undeploy
 undeploy: kustomize ## Undeploy controller from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
-	$(KUSTOMIZE) build config/default | $(KUBECTL) delete --ignore-not-found=$(ignore-not-found) -f -
+	@cd $(CURDIR)/config/default && $(KUSTOMIZE) edit set namespace $(NAMESPACE); \
+	trap 'cd $(CURDIR)/config/default && $(KUSTOMIZE) edit set namespace automotive-dev-operator-system' EXIT; \
+	cd $(CURDIR) && $(KUSTOMIZE) build config/default | $(KUBECTL) delete --ignore-not-found=$(ignore-not-found) -f -
 
 ##@ Dependencies
 
@@ -218,7 +233,7 @@ GOLANGCI_LINT = $(LOCALBIN)/golangci-lint
 KUSTOMIZE_VERSION ?= v5.4.3
 CONTROLLER_TOOLS_VERSION ?= v0.19.0
 ENVTEST_VERSION ?= release-0.19
-GOLANGCI_LINT_VERSION ?= v2.5.0
+GOLANGCI_LINT_VERSION ?= v2.13.1
 
 .PHONY: kustomize
 kustomize: $(KUSTOMIZE) ## Download kustomize locally if necessary.
@@ -338,6 +353,10 @@ catalog-deploy: ## Build and deploy the catalog to OpenShift OperatorHub
 	./deploy-catalog.sh
 
 .PHONY: catalog-update
+# Fallback: when bundle image isn't pushed yet, render from local bundle/ dir.
+# opm emits image: "" for local dirs (no registry ref), so sed injects BUNDLE_IMG.
+# The leading YAML '---' separator from opm output is stripped to avoid duplicating
+# the one already emitted by the echo block.
 catalog-update: opm ## Generate catalog configuration for current version
 	@echo "Generating catalog configuration for version $(VERSION)..."
 	@mkdir -p catalog
@@ -353,7 +372,14 @@ catalog-update: opm ## Generate catalog configuration for current version
 		echo "entries:"; \
 		echo "  - name: automotive-dev-operator.v$(VERSION)"; \
 		echo "---"; \
-		$(OPM) render $(BUNDLE_IMG); \
+		rendered=$$( \
+			if $(OPM) render $(BUNDLE_IMG) -o yaml 2>/dev/null; then true; \
+			else \
+				echo "Note: Bundle image not available remotely, rendering from local bundle/ directory" >&2; \
+				$(OPM) render bundle/ -o yaml | \
+					sed 's|^image: ""|image: $(BUNDLE_IMG)|'; \
+			fi \
+		) && echo "$$rendered" | sed '1{/^---$$/d}'; \
 	} > catalog/automotive-dev-operator.yaml
 	@# Add openshift-pipelines dependency (opm render doesn't include it)
 	@awk '\
@@ -377,6 +403,24 @@ build-caib: ## Build the caib tool
 .PHONY: build-api-server
 build-api-server: ## Build the api server
 	go build -o bin/build-api cmd/build-api/main.go
+
+# Tekton Bundle configuration
+TEKTON_TASKS_DIR ?= _output/tasks
+TEKTON_BUNDLE_IMG ?= $(IMAGE_TAG_BASE)-tekton-tasks:$(VERSION)
+
+.PHONY: export-tasks
+export-tasks: ## Export Tekton task definitions as YAML
+	go run ./cmd/export-tasks --output-dir $(TEKTON_TASKS_DIR)
+
+.PHONY: bundle-tasks
+bundle-tasks: export-tasks ## Build and push a Tekton Bundle OCI image from exported tasks
+	tkn bundle push $(TEKTON_BUNDLE_IMG) $(addprefix -f ,$(wildcard $(TEKTON_TASKS_DIR)/*.yaml))
+
+COSIGN_PUB_KEY ?= hack/cosign.pub
+
+.PHONY: verify-bundle
+verify-bundle: ## Verify cosign signature on the Tekton Bundle image
+	cosign verify --key $(COSIGN_PUB_KEY) $(TEKTON_BUNDLE_IMG)
 
 ##@ Release
 
@@ -408,6 +452,32 @@ community-operators-bundle: bundle ## Prepare bundle for community-operators-pro
 	fi
 	@echo "Bundle prepared at: community-operators-prod/operators/automotive-dev-operator/$(VERSION)"
 
+.PHONY: bump-go
+bump-go: ## Update Go version everywhere (usage: make bump-go GO_PATCH_VERSION=1.26.3)
+	@if [ -z "$(GO_PATCH_VERSION)" ]; then \
+		echo "Usage: make bump-go GO_PATCH_VERSION=1.26.3"; exit 1; \
+	fi
+	@if ! echo "$(GO_PATCH_VERSION)" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$$'; then \
+		echo "Error: GO_PATCH_VERSION must be in X.Y.Z format (got '$(GO_PATCH_VERSION)')"; exit 1; \
+	fi
+	$(eval GO_MINOR_VERSION := $(shell echo $(GO_PATCH_VERSION) | cut -d. -f1,2))
+	@echo "Bumping Go: minor=$(GO_MINOR_VERSION) patch=$(GO_PATCH_VERSION)"
+	@perl -pi -e "s/(GO_VERSION: ['\"]?)[0-9]+\.[0-9]+(['\"]?)/\$${1}$(GO_MINOR_VERSION)\$${2}/" \
+		.github/workflows/build.yml \
+		.github/workflows/e2e-lanes.yml \
+		.github/workflows/e2e.yml \
+		.github/workflows/lint.yml \
+		.github/workflows/test-images.yml
+	@perl -pi -e 's/go-toolset:[0-9]+\.[0-9]+\.[0-9]+/go-toolset:$(GO_PATCH_VERSION)/' \
+		.tekton/bundle-pull-request.yaml \
+		.tekton/bundle-push.yaml \
+		.tekton/catalog-pull-request.yaml \
+		.tekton/catalog-push.yaml \
+		Dockerfile
+	@perl -pi -e 's/^go [0-9]+\.[0-9]+\.[0-9]+/go $(GO_PATCH_VERSION)/' go.mod
+	@echo "Running go mod tidy and make generate manifests..."
+	go mod tidy
+	$(MAKE) generate manifests
+
 .PHONY: release-images
 release-images: docker-buildx bundle-build bundle-push catalog-build catalog-push ## Build and push all release images (operator, bundle, catalog)
-

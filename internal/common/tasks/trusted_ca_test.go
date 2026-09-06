@@ -13,8 +13,8 @@ func TestTrustedCABundleVolumeSource_DefaultsToConfigMap(t *testing.T) {
 	if src.ConfigMap == nil {
 		t.Fatalf("expected ConfigMap source by default")
 	}
-	if src.ConfigMap.Name != defaultTrustedCABundleConfigMap {
-		t.Fatalf("expected default configmap %q, got %q", defaultTrustedCABundleConfigMap, src.ConfigMap.Name)
+	if src.ConfigMap.Name != DefaultTrustedCABundleConfigMap {
+		t.Fatalf("expected default configmap %q, got %q", DefaultTrustedCABundleConfigMap, src.ConfigMap.Name)
 	}
 }
 

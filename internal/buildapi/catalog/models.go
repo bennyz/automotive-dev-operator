@@ -20,6 +20,7 @@ import (
 	"time"
 
 	automotivev1alpha1 "github.com/centos-automotive-suite/automotive-dev-operator/api/v1alpha1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // CatalogImageResponse represents a catalog image in API responses
@@ -27,7 +28,6 @@ import (
 //nolint:revive // Name intentionally includes package name for clarity in external API
 type CatalogImageResponse struct {
 	Name             string                `json:"name"`
-	Namespace        string                `json:"namespace"`
 	RegistryURL      string                `json:"registryUrl"`
 	Digest           string                `json:"digest,omitempty"`
 	Tags             []string              `json:"tags,omitempty"`
@@ -43,12 +43,18 @@ type CatalogImageResponse struct {
 	PublishedAt      *time.Time            `json:"publishedAt,omitempty"`
 	CreatedAt        time.Time             `json:"createdAt"`
 	SourceImageBuild string                `json:"sourceImageBuild,omitempty"`
+	SourceType       string                `json:"sourceType,omitempty"`
+	ScheduleName     string                `json:"scheduleName,omitempty"`
+	BuildMode        string                `json:"buildMode,omitempty"`
+	ExportFormat     string                `json:"exportFormat,omitempty"`
 	Labels           map[string]string     `json:"labels,omitempty"`
 	ArtifactRefs     []ArtifactRefInfo     `json:"artifactRefs,omitempty"`
 	DownloadURL      string                `json:"downloadUrl,omitempty"`
 	IsMultiArch      bool                  `json:"isMultiArch,omitempty"`
 	PlatformVariants []PlatformVariantInfo `json:"platformVariants,omitempty"`
 	AccessCount      int64                 `json:"accessCount,omitempty"`
+	StatusReason     string                `json:"statusReason,omitempty"`
+	StatusMessage    string                `json:"statusMessage,omitempty"`
 }
 
 // ArtifactRefInfo represents artifact reference information in responses
@@ -101,10 +107,9 @@ type CreateCatalogImageRequest struct {
 
 // PublishImageBuildRequest represents a request to publish an ImageBuild to the catalog
 type PublishImageBuildRequest struct {
-	ImageBuildName      string   `json:"imageBuildName" binding:"required"`
-	ImageBuildNamespace string   `json:"imageBuildNamespace" binding:"required"`
-	CatalogImageName    string   `json:"catalogImageName,omitempty"`
-	Tags                []string `json:"tags,omitempty"`
+	ImageBuildName   string   `json:"imageBuildName" binding:"required"`
+	CatalogImageName string   `json:"catalogImageName,omitempty"`
+	Tags             []string `json:"tags,omitempty"`
 }
 
 // VerifyImageResponse represents the response from verifying an image
@@ -115,12 +120,13 @@ type VerifyImageResponse struct {
 
 // ListQueryParams represents query parameters for listing catalog images
 type ListQueryParams struct {
-	Namespace    string `form:"namespace"`
 	Architecture string `form:"architecture"`
 	Distro       string `form:"distro"`
 	Target       string `form:"target"`
 	Phase        string `form:"phase"`
 	Tags         string `form:"tags"`
+	Sort         string `form:"sort"`
+	Latest       *bool  `form:"latest"`
 	Limit        int    `form:"limit,default=20"`
 	Continue     string `form:"continue"`
 }
@@ -129,9 +135,8 @@ type ListQueryParams struct {
 func ToCatalogImageResponse(catalogImage *automotivev1alpha1.CatalogImage) CatalogImageResponse {
 	response := CatalogImageResponse{
 		Name:        catalogImage.Name,
-		Namespace:   catalogImage.Namespace,
 		RegistryURL: catalogImage.Spec.RegistryURL,
-		Digest:      catalogImage.Spec.Digest,
+		Digest:      catalogDigest(catalogImage),
 		Tags:        catalogImage.Spec.Tags,
 		Phase:       string(catalogImage.Status.Phase),
 		Labels:      catalogImage.Labels,
@@ -144,6 +149,8 @@ func ToCatalogImageResponse(catalogImage *automotivev1alpha1.CatalogImage) Catal
 		response.Distro = catalogImage.Spec.Metadata.Distro
 		response.DistroVersion = catalogImage.Spec.Metadata.DistroVersion
 		response.Bootc = catalogImage.Spec.Metadata.Bootc
+		response.BuildMode = catalogImage.Spec.Metadata.BuildMode
+		response.ExportFormat = catalogImage.Spec.Metadata.ExportFormat
 
 		for _, target := range catalogImage.Spec.Metadata.Targets {
 			response.Targets = append(response.Targets, HardwareTargetInfo{
@@ -152,6 +159,14 @@ func ToCatalogImageResponse(catalogImage *automotivev1alpha1.CatalogImage) Catal
 				Notes:    target.Notes,
 			})
 		}
+	}
+
+	// Extract source type from label
+	if sourceType, ok := catalogImage.Labels[automotivev1alpha1.LabelSourceType]; ok {
+		response.SourceType = sourceType
+	}
+	if scheduleName, ok := catalogImage.Labels[automotivev1alpha1.LabelScheduledImageBuildName]; ok {
+		response.ScheduleName = scheduleName
 	}
 
 	// Extract registry metadata
@@ -184,6 +199,17 @@ func ToCatalogImageResponse(catalogImage *automotivev1alpha1.CatalogImage) Catal
 
 	response.SourceImageBuild = catalogImage.Status.SourceImageBuild
 	response.AccessCount = catalogImage.Status.AccessCount
+
+	if catalogImage.Status.Phase == automotivev1alpha1.CatalogImagePhaseUnavailable ||
+		catalogImage.Status.Phase == automotivev1alpha1.CatalogImagePhaseFailed {
+		for _, c := range catalogImage.Status.Conditions {
+			if c.Type == automotivev1alpha1.CatalogImageConditionAvailable && c.Status == metav1.ConditionFalse {
+				response.StatusReason = c.Reason
+				response.StatusMessage = c.Message
+				break
+			}
+		}
+	}
 
 	// Extract artifact references
 	for _, ref := range catalogImage.Status.ArtifactRefs {
@@ -221,6 +247,16 @@ func resolveDownloadURL(catalogImage *automotivev1alpha1.CatalogImage) string {
 
 	// Default to registry URL
 	return catalogImage.Spec.RegistryURL
+}
+
+func catalogDigest(catalogImage *automotivev1alpha1.CatalogImage) string {
+	if catalogImage.Spec.Digest != "" {
+		return catalogImage.Spec.Digest
+	}
+	if catalogImage.Status.RegistryMetadata != nil {
+		return catalogImage.Status.RegistryMetadata.ResolvedDigest
+	}
+	return ""
 }
 
 // ToCatalogImageListResponse converts a list of CatalogImage CRs to an API response

@@ -1,4 +1,4 @@
-//go:build !notmono && !codec.notmono 
+//go:build !notmono && !codec.notmono
 
 // Copyright (c) 2012-2020 Ugorji Nwoke. All rights reserved.
 // Use of this source code is governed by a MIT license found in the LICENSE file.
@@ -948,6 +948,10 @@ func (e *encoderJsonBytes) MustEncode(v interface{}) {
 	return
 }
 
+func (e *encoderJsonBytes) NumBytesWritten() int {
+	return e.e.NumBytesWritten()
+}
+
 func (e *encoderJsonBytes) mustEncode(v interface{}) {
 	halt.onerror(e.err)
 	if e.hh == nil {
@@ -1165,11 +1169,11 @@ func (e *encoderJsonBytes) rawBytes(vv Raw) {
 }
 
 func (e *encoderJsonBytes) fn(t reflect.Type) *encFnJsonBytes {
-	return e.dh.encFnViaBH(t, e.rtidFn, e.h, e.fp, false)
+	return e.dh.encFnViaBH(t, e.rtidFn, e.h, e.fp, true)
 }
 
 func (e *encoderJsonBytes) fnNoExt(t reflect.Type) *encFnJsonBytes {
-	return e.dh.encFnViaBH(t, e.rtidFnNoExt, e.h, e.fp, true)
+	return e.dh.encFnViaBH(t, e.rtidFnNoExt, e.h, e.fp, false)
 }
 
 func (e *encoderJsonBytes) mapStart(length int) {
@@ -1643,7 +1647,7 @@ func (d *decoderJsonBytes) kInterfaceNaked(f *decFnInfo) (rvn reflect.Value) {
 			} else {
 				rvn = reflect.New(bfn.rt)
 				if bfn.ext == SelfExt {
-					sideDecode(d.hh, &d.h.sideDecPool, func(sd decoderI) { oneOffDecode(sd, rv2i(rvn), bytes, bfn.rt, true) })
+					sideDecode(d.hh, &d.h.sideDecPool, func(sd decoderI) { oneOffDecode(sd, rv2i(rvn), bytes, bfn.rt, false) })
 				} else {
 					bfn.ext.ReadExt(rv2i(rvn), bytes)
 				}
@@ -2222,7 +2226,8 @@ func (d *decoderJsonBytes) kChan(f *decFnInfo, rv reflect.Value) {
 	}
 
 	rtelem := ti.elem
-	useTransient := decUseTransient && ti.elemkind != byte(reflect.Ptr) && ti.tielem.flagCanTransient
+	useTransient := decUseTransient && ti.tielem.flagCanTransient &&
+		ti.elemkind != byte(reflect.Slice) && ti.elemkind != byte(reflect.Ptr)
 
 	for k := reflect.Kind(ti.elemkind); k == reflect.Ptr; k = rtelem.Kind() {
 		rtelem = rtelem.Elem()
@@ -2313,7 +2318,7 @@ func (d *decoderJsonBytes) kMap(f *decFnInfo, rv reflect.Value) {
 	vtypePtr := vtypeKind == reflect.Ptr
 	ktypePtr := ktypeKind == reflect.Ptr
 
-	vTransient := decUseTransient && !vtypePtr && ti.tielem.flagCanTransient
+	vTransient := decUseTransient && !vtypePtr && ti.tielem.flagCanTransient && vtypeKind != reflect.Slice
 
 	kTransient := vTransient && !ktypePtr && ti.tikey.flagCanTransient
 
@@ -2874,11 +2879,11 @@ func (d *decoderJsonBytes) interfaceExtConvertAndDecode(v interface{}, ext Inter
 }
 
 func (d *decoderJsonBytes) fn(t reflect.Type) *decFnJsonBytes {
-	return d.dh.decFnViaBH(t, d.rtidFn, d.h, d.fp, false)
+	return d.dh.decFnViaBH(t, d.rtidFn, d.h, d.fp, true)
 }
 
 func (d *decoderJsonBytes) fnNoExt(t reflect.Type) *decFnJsonBytes {
-	return d.dh.decFnViaBH(t, d.rtidFnNoExt, d.h, d.fp, true)
+	return d.dh.decFnViaBH(t, d.rtidFnNoExt, d.h, d.fp, false)
 }
 
 func (helperDecDriverJsonBytes) newDecoderBytes(in []byte, h Handle) *decoderJsonBytes {
@@ -3615,6 +3620,11 @@ func (d *jsonDecDriverBytes) nextValueBytes() []byte {
 	switch d.tok {
 	default:
 		_, d.tok = d.r.jsonReadNum()
+
+		if d.tok != 0 {
+			vv := d.r.stopRecording()
+			return vv[:len(vv)-1]
+		}
 	case 'n':
 		d.checkLit3([3]byte{'u', 'l', 'l'}, d.r.readn3())
 	case 'f':
@@ -4124,6 +4134,7 @@ func (d *jsonEncDriverBytes) init(hh Handle, shared *encoderBase, enc encoderI) 
 	return
 }
 
+func (e *jsonEncDriverBytes) NumBytesWritten() int    { return e.w.numWrite() }
 func (e *jsonEncDriverBytes) writeBytesAsis(b []byte) { e.w.writeb(b) }
 
 func (e *jsonEncDriverBytes) writerEnd() { e.w.end() }
@@ -4159,7 +4170,7 @@ func (d *jsonDecDriverBytes) resetInBytes(in []byte) {
 }
 
 func (d *jsonDecDriverBytes) resetInIO(r io.Reader) {
-	d.r.resetIO(r, d.h.ReaderBufferSize, d.h.MaxInitLen, &d.d.blist)
+	d.r.resetIO(r, d.h.ReaderBufferSize, d.h.maxBytes2Read(), &d.d.blist)
 }
 
 func (d *jsonDecDriverBytes) descBd() (s string) {
@@ -5106,6 +5117,10 @@ func (e *encoderJsonIO) MustEncode(v interface{}) {
 	return
 }
 
+func (e *encoderJsonIO) NumBytesWritten() int {
+	return e.e.NumBytesWritten()
+}
+
 func (e *encoderJsonIO) mustEncode(v interface{}) {
 	halt.onerror(e.err)
 	if e.hh == nil {
@@ -5323,11 +5338,11 @@ func (e *encoderJsonIO) rawBytes(vv Raw) {
 }
 
 func (e *encoderJsonIO) fn(t reflect.Type) *encFnJsonIO {
-	return e.dh.encFnViaBH(t, e.rtidFn, e.h, e.fp, false)
+	return e.dh.encFnViaBH(t, e.rtidFn, e.h, e.fp, true)
 }
 
 func (e *encoderJsonIO) fnNoExt(t reflect.Type) *encFnJsonIO {
-	return e.dh.encFnViaBH(t, e.rtidFnNoExt, e.h, e.fp, true)
+	return e.dh.encFnViaBH(t, e.rtidFnNoExt, e.h, e.fp, false)
 }
 
 func (e *encoderJsonIO) mapStart(length int) {
@@ -5801,7 +5816,7 @@ func (d *decoderJsonIO) kInterfaceNaked(f *decFnInfo) (rvn reflect.Value) {
 			} else {
 				rvn = reflect.New(bfn.rt)
 				if bfn.ext == SelfExt {
-					sideDecode(d.hh, &d.h.sideDecPool, func(sd decoderI) { oneOffDecode(sd, rv2i(rvn), bytes, bfn.rt, true) })
+					sideDecode(d.hh, &d.h.sideDecPool, func(sd decoderI) { oneOffDecode(sd, rv2i(rvn), bytes, bfn.rt, false) })
 				} else {
 					bfn.ext.ReadExt(rv2i(rvn), bytes)
 				}
@@ -6380,7 +6395,8 @@ func (d *decoderJsonIO) kChan(f *decFnInfo, rv reflect.Value) {
 	}
 
 	rtelem := ti.elem
-	useTransient := decUseTransient && ti.elemkind != byte(reflect.Ptr) && ti.tielem.flagCanTransient
+	useTransient := decUseTransient && ti.tielem.flagCanTransient &&
+		ti.elemkind != byte(reflect.Slice) && ti.elemkind != byte(reflect.Ptr)
 
 	for k := reflect.Kind(ti.elemkind); k == reflect.Ptr; k = rtelem.Kind() {
 		rtelem = rtelem.Elem()
@@ -6471,7 +6487,7 @@ func (d *decoderJsonIO) kMap(f *decFnInfo, rv reflect.Value) {
 	vtypePtr := vtypeKind == reflect.Ptr
 	ktypePtr := ktypeKind == reflect.Ptr
 
-	vTransient := decUseTransient && !vtypePtr && ti.tielem.flagCanTransient
+	vTransient := decUseTransient && !vtypePtr && ti.tielem.flagCanTransient && vtypeKind != reflect.Slice
 
 	kTransient := vTransient && !ktypePtr && ti.tikey.flagCanTransient
 
@@ -7032,11 +7048,11 @@ func (d *decoderJsonIO) interfaceExtConvertAndDecode(v interface{}, ext Interfac
 }
 
 func (d *decoderJsonIO) fn(t reflect.Type) *decFnJsonIO {
-	return d.dh.decFnViaBH(t, d.rtidFn, d.h, d.fp, false)
+	return d.dh.decFnViaBH(t, d.rtidFn, d.h, d.fp, true)
 }
 
 func (d *decoderJsonIO) fnNoExt(t reflect.Type) *decFnJsonIO {
-	return d.dh.decFnViaBH(t, d.rtidFnNoExt, d.h, d.fp, true)
+	return d.dh.decFnViaBH(t, d.rtidFnNoExt, d.h, d.fp, false)
 }
 
 func (helperDecDriverJsonIO) newDecoderBytes(in []byte, h Handle) *decoderJsonIO {
@@ -7773,6 +7789,11 @@ func (d *jsonDecDriverIO) nextValueBytes() []byte {
 	switch d.tok {
 	default:
 		_, d.tok = d.r.jsonReadNum()
+
+		if d.tok != 0 {
+			vv := d.r.stopRecording()
+			return vv[:len(vv)-1]
+		}
 	case 'n':
 		d.checkLit3([3]byte{'u', 'l', 'l'}, d.r.readn3())
 	case 'f':
@@ -8282,6 +8303,7 @@ func (d *jsonEncDriverIO) init(hh Handle, shared *encoderBase, enc encoderI) (fp
 	return
 }
 
+func (e *jsonEncDriverIO) NumBytesWritten() int    { return e.w.numWrite() }
 func (e *jsonEncDriverIO) writeBytesAsis(b []byte) { e.w.writeb(b) }
 
 func (e *jsonEncDriverIO) writerEnd() { e.w.end() }
@@ -8317,7 +8339,7 @@ func (d *jsonDecDriverIO) resetInBytes(in []byte) {
 }
 
 func (d *jsonDecDriverIO) resetInIO(r io.Reader) {
-	d.r.resetIO(r, d.h.ReaderBufferSize, d.h.MaxInitLen, &d.d.blist)
+	d.r.resetIO(r, d.h.ReaderBufferSize, d.h.maxBytes2Read(), &d.d.blist)
 }
 
 func (d *jsonDecDriverIO) descBd() (s string) {

@@ -1,0 +1,20 @@
+# Enable Perses dashboards in OpenShift Console
+#
+# Prerequisite: Cluster Observability Operator (COO) must be installed.
+#
+# This creates a UIPlugin that tells COO to:
+#   1. Deploy a Perses instance
+#   2. Register a console plugin adding "Dashboards (Perses)" under Observe
+#
+# Usage:
+#   oc apply -f uiplugin.yaml
+---
+apiVersion: observability.openshift.io/v1alpha1
+kind: UIPlugin
+metadata:
+  name: monitoring
+spec:
+  type: Monitoring
+  monitoring:
+    perses:
+      enabled: true

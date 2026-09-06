@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"os"
 
+	"github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/clilog"
 	"github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/config"
 	"github.com/spf13/cobra"
 )
@@ -52,10 +53,9 @@ func newPublishCmd() *cobra.Command {
 }
 
 type publishRequest struct {
-	ImageBuildName      string   `json:"imageBuildName"`
-	ImageBuildNamespace string   `json:"imageBuildNamespace"`
-	CatalogImageName    string   `json:"catalogImageName,omitempty"`
-	Tags                []string `json:"tags,omitempty"`
+	ImageBuildName   string   `json:"imageBuildName"`
+	CatalogImageName string   `json:"catalogImageName,omitempty"`
+	Tags             []string `json:"tags,omitempty"`
 }
 
 func runPublish(cmd *cobra.Command, args []string) error {
@@ -74,18 +74,12 @@ func runPublish(cmd *cobra.Command, args []string) error {
 		token = os.Getenv("CAIB_TOKEN")
 	}
 
-	ns := namespace
-	if ns == "" {
-		ns = defaultNamespace
-	}
-
-	fmt.Printf("Publishing ImageBuild %q to catalog...\n", imageBuildName)
+	clilog.Infof("Publishing ImageBuild %q to catalog...\n", imageBuildName)
 
 	reqBody := publishRequest{
-		ImageBuildName:      imageBuildName,
-		ImageBuildNamespace: ns,
-		CatalogImageName:    publishCatalogName,
-		Tags:                publishTags,
+		ImageBuildName:   imageBuildName,
+		CatalogImageName: publishCatalogName,
+		Tags:             publishTags,
 	}
 
 	bodyBytes, err := json.Marshal(reqBody)
@@ -118,7 +112,7 @@ func runPublish(cmd *cobra.Command, args []string) error {
 	body, _ := io.ReadAll(resp.Body)
 
 	if resp.StatusCode == http.StatusNotFound {
-		return fmt.Errorf("ImageBuild %q not found in namespace %q", imageBuildName, ns)
+		return fmt.Errorf("ImageBuild %q not found", imageBuildName)
 	}
 
 	if resp.StatusCode != http.StatusCreated {
@@ -130,16 +124,16 @@ func runPublish(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to parse response: %w", err)
 	}
 
-	fmt.Println("✓ Published successfully")
-	fmt.Println()
-	fmt.Printf("Catalog Image: %s\n", result.Name)
-	fmt.Printf("Registry URL:  %s\n", result.RegistryURL)
-	fmt.Printf("Architecture:  %s\n", result.Architecture)
-	fmt.Printf("Distro:        %s\n", result.Distro)
+	clilog.Infoln("✓ Published successfully")
+	clilog.Infoln()
+	clilog.Infof("Catalog Image: %s\n", result.Name)
+	clilog.Infof("Registry URL:  %s\n", result.RegistryURL)
+	clilog.Infof("Architecture:  %s\n", result.Architecture)
+	clilog.Infof("Distro:        %s\n", result.Distro)
 	if len(result.Targets) > 0 {
-		fmt.Printf("Target:        %s\n", result.Targets[0].Name)
+		clilog.Infof("Target:        %s\n", result.Targets[0].Name)
 	}
-	fmt.Printf("Status:        %s\n", result.Phase)
+	clilog.Infof("Status:        %s\n", result.Phase)
 
 	return nil
 }

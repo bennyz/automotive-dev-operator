@@ -70,12 +70,14 @@ spec:
                       jwt:
                         description: JWT authentication configuration for OIDC providers.
                         items:
-                          description: JWTAuthenticator provides the configuration
-                            for a single JWT authenticator.
+                          description: |-
+                            JWTAuthenticatorConfig configures a single external JWT/OIDC authenticator.
+                            It mirrors apiserverv1beta1.JWTAuthenticator but replaces the issuer with
+                            JWTIssuerConfig to support Kubernetes-native CA references.
                           properties:
                             claimMappings:
-                              description: claimMappings points claims of a token
-                                to be treated as user attributes.
+                              description: ClaimMappings maps OIDC claims to Kubernetes
+                                user attributes.
                               properties:
                                 extra:
                                   description: |-
@@ -242,8 +244,8 @@ spec:
                               - username
                               type: object
                             claimValidationRules:
-                              description: claimValidationRules are rules that are
-                                applied to validate token claims to authenticate users.
+                              description: ClaimValidationRules are additional rules
+                                applied to incoming JWT claims.
                               items:
                                 description: ClaimValidationRule provides the configuration
                                   for a single claim validation rule.
@@ -287,87 +289,92 @@ spec:
                                 type: object
                               type: array
                             issuer:
-                              description: issuer contains the basic OIDC provider
-                                connection options.
+                              description: Issuer configures the OIDC provider.
                               properties:
                                 audienceMatchPolicy:
-                                  description: |-
-                                    audienceMatchPolicy defines how the "audiences" field is used to match the "aud" claim in the presented JWT.
-                                    Allowed values are:
-                                    1. "MatchAny" when multiple audiences are specified and
-                                    2. empty (or unset) or "MatchAny" when a single audience is specified.
-
-                                    - MatchAny: the "aud" claim in the presented JWT must match at least one of the entries in the "audiences" field.
-                                    For example, if "audiences" is ["foo", "bar"], the "aud" claim in the presented JWT must contain either "foo" or "bar" (and may contain both).
-
-                                    - "": The match policy can be empty (or unset) when a single audience is specified in the "audiences" field. The "aud" claim in the presented JWT must contain the single audience (and may contain others).
-
-                                    For more nuanced audience validation, use claimValidationRules.
-                                      example: claimValidationRule[].expression: 'sets.equivalent(claims.aud, ["bar", "foo", "baz"])' to require an exact match.
+                                  description: AudienceMatchPolicy controls how audiences
+                                    are matched.
                                   type: string
                                 audiences:
-                                  description: |-
-                                    audiences is the set of acceptable audiences the JWT must be issued to.
-                                    At least one of the entries must match the "aud" claim in presented JWTs.
-                                    Same value as the --oidc-client-id flag (though this field supports an array).
-                                    Required to be non-empty.
+                                  description: Audiences is the set of acceptable
+                                    JWT audiences.
                                   items:
                                     type: string
+                                  minItems: 1
                                   type: array
                                 certificateAuthority:
                                   description: |-
-                                    certificateAuthority contains PEM-encoded certificate authority certificates
-                                    used to validate the connection when fetching discovery information.
-                                    If unset, the system verifier is used.
-                                    Same value as the content of the file referenced by the --oidc-ca-file flag.
+                                    CertificateAuthority is an inline PEM-encoded CA certificate used to verify
+                                    the OIDC provider's TLS certificate.
                                   type: string
-                                discoveryURL:
+                                certificateAuthorityConfigMap:
                                   description: |-
-                                    discoveryURL, if specified, overrides the URL used to fetch discovery
-                                    information instead of using "{url}/.well-known/openid-configuration".
-                                    The exact value specified is used, so "/.well-known/openid-configuration"
-                                    must be included in discoveryURL if needed.
-
-                                    The "issuer" field in the fetched discovery information must match the "issuer.url" field
-                                    in the AuthenticationConfiguration and will be used to validate the "iss" claim in the presented JWT.
-                                    This is for scenarios where the well-known and jwks endpoints are hosted at a different
-                                    location than the issuer (such as locally in the cluster).
-
-                                    Example:
-                                    A discovery url that is exposed using kubernetes service 'oidc' in namespace 'oidc-namespace'
-                                    and discovery information is available at '/.well-known/openid-configuration'.
-                                    discoveryURL: "https://oidc.oidc-namespace/.well-known/openid-configuration"
-                                    certificateAuthority is used to verify the TLS connection and the hostname on the leaf certificate
-                                    must be set to 'oidc.oidc-namespace'.
-
-                                    curl https://oidc.oidc-namespace/.well-known/openid-configuration (.discoveryURL field)
-                                    {
-                                        issuer: "https://oidc.example.com" (.url field)
-                                    }
-
-                                    discoveryURL must be different from url.
-                                    Required to be unique across all JWT authenticators.
-                                    Note that egress selection configuration is not used for this network connection.
+                                    CertificateAuthorityConfigMap references a Kubernetes ConfigMap containing the
+                                    PEM-encoded CA certificate. The build API watches the ConfigMap for changes so
+                                    CA rotations are picked up immediately without restarting the server.
+                                  properties:
+                                    key:
+                                      description: Key within the ConfigMap whose
+                                        value is the PEM-encoded CA certificate.
+                                      type: string
+                                    name:
+                                      description: Name of the ConfigMap.
+                                      type: string
+                                    namespace:
+                                      description: Namespace of the ConfigMap. If
+                                        omitted, the operator's namespace is used.
+                                      type: string
+                                  required:
+                                  - key
+                                  - name
+                                  type: object
+                                certificateAuthoritySecret:
+                                  description: |-
+                                    CertificateAuthoritySecret references a Kubernetes Secret containing the
+                                    PEM-encoded CA certificate. The build API watches the Secret for changes so
+                                    CA rotations are picked up immediately without restarting the server.
+                                  properties:
+                                    key:
+                                      description: Key within the Secret whose value
+                                        is the PEM-encoded CA certificate.
+                                      type: string
+                                    name:
+                                      description: Name of the Secret.
+                                      type: string
+                                    namespace:
+                                      description: Namespace of the Secret. If omitted,
+                                        the operator's namespace is used.
+                                      type: string
+                                  required:
+                                  - key
+                                  - name
+                                  type: object
+                                discoveryURL:
+                                  description: DiscoveryURL overrides the OIDC discovery
+                                    endpoint when it differs from URL.
+                                  type: string
+                                egressSelectorType:
+                                  description: |-
+                                    EgressSelectorType specifies which egress selector should be used for
+                                    OIDC-related network traffic (discovery, JWKS, distributed claims, etc).
+                                    Valid values are "controlplane" and "cluster".
                                   type: string
                                 url:
-                                  description: |-
-                                    url points to the issuer URL in a format https://url or https://url/path.
-                                    This must match the "iss" claim in the presented JWT, and the issuer returned from discovery.
-                                    Same value as the --oidc-issuer-url flag.
-                                    Discovery information is fetched from "{url}/.well-known/openid-configuration" unless overridden by discoveryURL.
-                                    Required to be unique across all JWT authenticators.
-                                    Note that egress selection configuration is not used for this network connection.
+                                  description: URL is the base URL of the OIDC provider.
                                   type: string
                               required:
                               - audiences
                               - url
                               type: object
+                              x-kubernetes-validations:
+                              - message: at most one of certificateAuthority, certificateAuthoritySecret,
+                                  or certificateAuthorityConfigMap may be set
+                                rule: '[has(self.certificateAuthority), has(self.certificateAuthoritySecret),
+                                  has(self.certificateAuthorityConfigMap)].filter(x,
+                                  x).size() <= 1'
                             userValidationRules:
-                              description: |-
-                                userValidationRules are rules that are applied to final user before completing authentication.
-                                These allow invariants to be applied to incoming identities such as preventing the
-                                use of the system: prefix that is commonly used by Kubernetes components.
-                                The validation rules are logically ANDed together and must all return true for the validation to pass.
+                              description: UserValidationRules are additional rules
+                                applied to the authenticated user.
                               items:
                                 description: UserValidationRule provides the configuration
                                   for a single user info validation rule.
@@ -436,7 +443,7 @@ spec:
                               Claims lists the names of resources, defined in spec.resourceClaims,
                               that are used by this container.
 
-                              This is an alpha field and requires enabling the
+                              This field depends on the
                               DynamicResourceAllocation feature gate.
 
                               This field is immutable. It can only be set for containers.
@@ -496,67 +503,7 @@ spec:
                               Claims lists the names of resources, defined in spec.resourceClaims,
                               that are used by this container.
 
-                              This is an alpha field and requires enabling the
-                              DynamicResourceAllocation feature gate.
-
-                              This field is immutable. It can only be set for containers.
-                            items:
-                              description: ResourceClaim references one entry in PodSpec.ResourceClaims.
-                              properties:
-                                name:
-                                  description: |-
-                                    Name must match the name of one entry in pod.spec.resourceClaims of
-                                    the Pod where this field is used. It makes that resource available
-                                    inside a container.
-                                  type: string
-                                request:
-                                  description: |-
-                                    Request is the name chosen for a request in the referenced claim.
-                                    If empty, everything from the claim is made available, otherwise
-                                    only the result of this request.
-                                  type: string
-                              required:
-                              - name
-                              type: object
-                            type: array
-                            x-kubernetes-list-map-keys:
-                            - name
-                            x-kubernetes-list-type: map
-                          limits:
-                            additionalProperties:
-                              anyOf:
-                              - type: integer
-                              - type: string
-                              pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
-                              x-kubernetes-int-or-string: true
-                            description: |-
-                              Limits describes the maximum amount of compute resources allowed.
-                              More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
-                            type: object
-                          requests:
-                            additionalProperties:
-                              anyOf:
-                              - type: integer
-                              - type: string
-                              pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
-                              x-kubernetes-int-or-string: true
-                            description: |-
-                              Requests describes the minimum amount of compute resources required.
-                              If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
-                              otherwise to an implementation-defined value. Requests cannot exceed Limits.
-                              More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
-                            type: object
-                        type: object
-                      oauthProxy:
-                        description: OAuthProxy defines resource requirements for
-                          the OAuth proxy sidecar
-                        properties:
-                          claims:
-                            description: |-
-                              Claims lists the names of resources, defined in spec.resourceClaims,
-                              that are used by this container.
-
-                              This is an alpha field and requires enabling the
+                              This field depends on the
                               DynamicResourceAllocation feature gate.
 
                               This field is immutable. It can only be set for containers.
@@ -613,6 +560,13 @@ spec:
                 description: ContainerBuilds defines configuration for container build
                   operations
                 properties:
+                  defaultBuildTTL:
+                    description: |-
+                      DefaultBuildTTL is the default time-to-live for container builds.
+                      After this duration past completion, a build transitions to Expired
+                      and its BuildRun is cleaned up. Uses Go duration format (e.g. "24h").
+                      Set to "0" to disable expiry by default.
+                    type: string
                   uploadTimeoutMinutes:
                     default: 10
                     description: |-
@@ -622,6 +576,15 @@ spec:
                     minimum: 1
                     type: integer
                 type: object
+              featureGates:
+                additionalProperties:
+                  type: boolean
+                description: |-
+                  FeatureGates allows enabling or disabling specific operator features.
+                  Each key is a feature name, and the boolean value enables (true) or disables (false) it.
+                  Alpha features default to disabled, Beta to enabled, GA features are always enabled.
+                  Unknown feature names are ignored.
+                type: object
               images:
                 description: Images defines container image references used by the
                   operator
@@ -630,13 +593,14 @@ spec:
                     description: AutomotiveImageBuilder is the container image for
                       automotive-image-builder
                     type: string
-                  oauthProxy:
-                    description: OAuthProxy is the OAuth proxy sidecar image for OpenShift
-                      deployments
-                    type: string
                   operator:
                     description: Operator is the operator container image (overridden
                       by OPERATOR_IMAGE env var when set)
+                    type: string
+                  oras:
+                    description: |-
+                      Oras is the ORAS CLI image mounted as an OCI volume in build pods.
+                      Only used when the OCIVolumes feature gate is enabled.
                     type: string
                   yqHelper:
                     description: YQHelper is the yq helper image used in Tekton task
@@ -652,6 +616,11 @@ spec:
                       DefaultLeaseDuration is the cluster-wide default lease duration in HH:MM:SS format
                       Can be overridden per-ImageBuild via FlashSpec.LeaseDuration
                       Default: "03:00:00"
+                    type: string
+                  defaultLeaseTags:
+                    description: |-
+                      DefaultLeaseTags are key=value tags applied to all Jumpstarter leases created by the operator
+                      Format: comma-separated key=value pairs (e.g. "platform=caib,env=prod")
                     type: string
                   image:
                     default: quay.io/jumpstarter-dev/jumpstarter:latest
@@ -683,6 +652,24 @@ spec:
                     description: TargetMappings maps build targets to Jumpstarter
                       exporter configurations
                     type: object
+                type: object
+              monitoring:
+                description: Monitoring defines configuration for Prometheus metrics
+                  collection
+                properties:
+                  enabled:
+                    default: false
+                    description: Enabled determines if a ServiceMonitor should be
+                      deployed for Prometheus scraping
+                    type: boolean
+                  interval:
+                    description: |-
+                      Interval defines the Prometheus scrape interval
+                      Default: "30s"
+                    pattern: ^(0|(([0-9]+)y)?(([0-9]+)w)?(([0-9]+)d)?(([0-9]+)h)?(([0-9]+)m)?(([0-9]+)s)?(([0-9]+)ms)?)$
+                    type: string
+                required:
+                - enabled
                 type: object
               osBuilds:
                 description: OSBuilds defines the configuration for OS build operations
@@ -722,6 +709,13 @@ spec:
                       Required for bootc builds to allow nested containers to pull builder images
                       Example: "default-route-openshift-image-registry.apps.mycluster.example.com"
                     type: string
+                  defaultBuildTTL:
+                    description: |-
+                      DefaultBuildTTL is the default time-to-live for builds (all phases, including in-progress).
+                      Builds are automatically deleted after this duration. Uses Go duration format (e.g. "24h", "72h").
+                      Set to "0" to disable expiry by default.
+                      Default: "24h"
+                    type: string
                   enabled:
                     default: true
                     description: Enabled determines if Tekton tasks for OS builds
@@ -733,6 +727,19 @@ spec:
                       Default: 240 (4 hours)
                     format: int32
                     type: integer
+                  insecureRegistry:
+                    description: |-
+                      InsecureRegistry skips TLS certificate verification for OCI registry operations
+                      such as artifact pushes via oras. Required when the target registry uses a
+                      self-signed certificate (e.g., CRC/OpenShift internal registry, local Kind
+                      registry with generated certs).
+                    type: boolean
+                  maxBuildTTL:
+                    description: |-
+                      MaxBuildTTL is the maximum TTL that users can request for individual builds.
+                      Build requests specifying a TTL greater than this value are rejected.
+                      Set to "0" for no maximum. Uses Go duration format (e.g. "168h" for 1 week).
+                    type: string
                   memoryVolumeSize:
                     description: |-
                       MemoryVolumeSize specifies the size limit for memory-backed volumes
@@ -752,6 +759,14 @@ spec:
                       PVCSize specifies the size for persistent volume claims created for build workspaces
                       Default: "8Gi"
                     type: string
+                  registryTokenLifetimeSeconds:
+                    description: |-
+                      RegistryTokenLifetimeSeconds is the lifetime in seconds for service account tokens
+                      used for internal registry authentication during builds.
+                      Default: 14400 (4 hours)
+                    format: int64
+                    minimum: 1
+                    type: integer
                   runtimeClassName:
                     description: |-
                       RuntimeClassName specifies the runtime class to use for the build pod
@@ -762,6 +777,48 @@ spec:
                       StorageClass specifies the storage class for build PVCs
                       If empty, the cluster default storage class is used
                     type: string
+                  taskBundleCosignKeyRef:
+                    description: |-
+                      TaskBundleCosignKeyRef references a ConfigMap key containing the cosign public key (PEM-encoded)
+                      used to verify Tekton Bundle signatures.
+                      Required when TaskBundleVerify is true.
+                    properties:
+                      key:
+                        description: |-
+                          The key to select from the ConfigMap's Data field.
+                          Keys in the BinaryData field are not currently propagated to container env vars.
+                        type: string
+                      name:
+                        default: ""
+                        description: |-
+                          Name of the referent.
+                          This field is effectively required, but due to backwards compatibility is
+                          allowed to be empty. Instances of this type with an empty value here are
+                          almost certainly wrong.
+                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                        type: string
+                      optional:
+                        description: Specify whether the ConfigMap or its key must
+                          be defined
+                        type: boolean
+                    required:
+                    - key
+                    type: object
+                    x-kubernetes-map-type: atomic
+                  taskBundleRef:
+                    description: |-
+                      TaskBundleRef is the OCI reference to a signed Tekton Bundle containing task definitions.
+                      When set, builds created with SecureBuild=true will resolve tasks from this bundle
+                      instead of the cluster-installed tasks. The bundle should be signed with cosign
+                      and contain the same tasks as the operator deploys.
+                      Example: "quay.io/rh-sdv-cloud/automotive-dev-tekton-tasks:v0.1.0@sha256:abc123..."
+                    type: string
+                  taskBundleVerify:
+                    description: |-
+                      TaskBundleVerify enables cosign signature verification for Tekton Bundles.
+                      When true, all bundle refs (from OperatorConfig or user-provided --task-bundle-ref)
+                      must be signed with the key in TaskBundleCosignKeyRef.
+                    type: boolean
                   tolerations:
                     description: |-
                       Tolerations specifies tolerations to be added to build pods
@@ -786,9 +843,10 @@ spec:
                         operator:
                           description: |-
                             Operator represents a key's relationship to the value.
-                            Valid operators are Exists and Equal. Defaults to Equal.
+                            Valid operators are Exists, Equal, Lt, and Gt. Defaults to Equal.
                             Exists is equivalent to wildcard for value, so that a pod can
                             tolerate all taints of a particular category.
+                            Lt and Gt perform numeric comparisons (requires feature gate TaintTolerationComparisonOperators).
                           type: string
                         tolerationSeconds:
                           description: |-
@@ -828,9 +886,104 @@ spec:
                 required:
                 - enabled
                 type: object
+                x-kubernetes-validations:
+                - message: taskBundleCosignKeyRef is required when taskBundleVerify
+                    is true
+                  rule: '!has(self.taskBundleVerify) || !self.taskBundleVerify ||
+                    has(self.taskBundleCosignKeyRef)'
+              tracing:
+                description: Tracing defines configuration for OpenTelemetry distributed
+                  tracing
+                properties:
+                  enabled:
+                    default: false
+                    description: Enabled determines if the operator should export
+                      trace spans
+                    type: boolean
+                  endpoint:
+                    description: |-
+                      Endpoint is the OTLP gRPC collector endpoint (e.g. "otel-collector.namespace.svc:4317").
+                      Falls back to OTEL_EXPORTER_OTLP_ENDPOINT env var when empty.
+                    type: string
+                  insecure:
+                    default: true
+                    description: |-
+                      Insecure disables TLS for the OTLP gRPC connection.
+                      Default: true (plaintext, appropriate for in-cluster collectors).
+                      Set to false when connecting to external/managed tracing backends that require TLS.
+                    type: boolean
+                  samplingRatio:
+                    description: |-
+                      SamplingRatio controls the fraction of traces sampled, as a string representation
+                      of a decimal between "0" and "1" (e.g. "0.1" for 10%, "1" for 100%).
+                      Default: "1" (sample everything).
+                    pattern: ^(0(\.\d+)?|1(\.0+)?)$
+                    type: string
+                required:
+                - enabled
+                type: object
+              webhookNotifications:
+                description: WebhookNotificationsConfig configures outbound terminal
+                  event delivery.
+                properties:
+                  allowHTTP:
+                    description: AllowHTTP is only intended for development receivers.
+                    type: boolean
+                  deliveryWindowSeconds:
+                    default: 86400
+                    format: int32
+                    maximum: 604800
+                    minimum: 60
+                    type: integer
+                  maxAttempts:
+                    default: 8
+                    format: int32
+                    maximum: 1000
+                    minimum: 1
+                    type: integer
+                  outboundPolicy:
+                    description: OutboundPolicyConfig allows administrators to grant
+                      access to intentional internal destinations.
+                    properties:
+                      allowedCIDRs:
+                        items:
+                          maxLength: 64
+                          type: string
+                        maxItems: 128
+                        type: array
+                      allowedHostnames:
+                        description: AllowedHostnames are exact hostnames, not URL
+                          prefixes or wildcard patterns.
+                        items:
+                          maxLength: 253
+                          type: string
+                        maxItems: 128
+                        type: array
+                      trustedCAConfigMap:
+                        description: TrustedCAConfigMap names a same-namespace ConfigMap
+                          containing ca-bundle.crt.
+                        maxLength: 253
+                        type: string
+                    type: object
+                  timeoutSeconds:
+                    default: 10
+                    format: int32
+                    maximum: 120
+                    minimum: 1
+                    type: integer
+                type: object
               workspaces:
                 description: Workspaces defines configuration for developer workspaces
                 properties:
+                  allowedImages:
+                    description: |-
+                      AllowedImages restricts which container images users may run in workspaces.
+                      Supports exact matches and prefix globs (e.g., "quay.io/my-org/*").
+                      When empty, only the configured toolchain image is allowed.
+                      The toolchain image is always implicitly permitted.
+                    items:
+                      type: string
+                    type: array
                   autoPauseTimeoutMinutes:
                     description: |-
                       AutoPauseTimeoutMinutes is the cluster-wide default idle timeout in minutes before
@@ -848,6 +1001,59 @@ spec:
                     description: DefaultArchitecture is the default target architecture
                       for workspaces
                     type: string
+                  imageCosignKeyRef:
+                    description: |-
+                      ImageCosignKeyRef references a ConfigMap key containing the cosign public key
+                      (PEM-encoded) used to verify workspace image signatures.
+                      Required when ImageVerify is true.
+                    properties:
+                      key:
+                        description: |-
+                          The key to select from the ConfigMap's Data field.
+                          Keys in the BinaryData field are not currently propagated to container env vars.
+                        type: string
+                      name:
+                        default: ""
+                        description: |-
+                          Name of the referent.
+                          This field is effectively required, but due to backwards compatibility is
+                          allowed to be empty. Instances of this type with an empty value here are
+                          almost certainly wrong.
+                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                        type: string
+                      optional:
+                        description: Specify whether the ConfigMap or its key must
+                          be defined
+                        type: boolean
+                    required:
+                    - key
+                    type: object
+                    x-kubernetes-map-type: atomic
+                  imagePullSecrets:
+                    description: ImagePullSecrets is a list of secret references for
+                      pulling private workspace images
+                    items:
+                      description: |-
+                        LocalObjectReference contains enough information to let you locate the
+                        referenced object inside the same namespace.
+                      properties:
+                        name:
+                          default: ""
+                          description: |-
+                            Name of the referent.
+                            This field is effectively required, but due to backwards compatibility is
+                            allowed to be empty. Instances of this type with an empty value here are
+                            almost certainly wrong.
+                            More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                          type: string
+                      type: object
+                      x-kubernetes-map-type: atomic
+                    type: array
+                  imageVerify:
+                    description: |-
+                      ImageVerify enables cosign signature verification for workspace images.
+                      When true, images must be signed with the key in ImageCosignKeyRef.
+                    type: boolean
                   maxResources:
                     description: MaxResources defines the maximum CPU and memory that
                       users can request for workspace containers
@@ -857,7 +1063,7 @@ spec:
                           Claims lists the names of resources, defined in spec.resourceClaims,
                           that are used by this container.
 
-                          This is an alpha field and requires enabling the
+                          This field depends on the
                           DynamicResourceAllocation feature gate.
 
                           This field is immutable. It can only be set for containers.
@@ -927,7 +1133,7 @@ spec:
                           Claims lists the names of resources, defined in spec.resourceClaims,
                           that are used by this container.
 
-                          This is an alpha field and requires enabling the
+                          This field depends on the
                           DynamicResourceAllocation feature gate.
 
                           This field is immutable. It can only be set for containers.
@@ -1009,9 +1215,10 @@ spec:
                         operator:
                           description: |-
                             Operator represents a key's relationship to the value.
-                            Valid operators are Exists and Equal. Defaults to Equal.
+                            Valid operators are Exists, Equal, Lt, and Gt. Defaults to Equal.
                             Exists is equivalent to wildcard for value, so that a pod can
                             tolerate all taints of a particular category.
+                            Lt and Gt perform numeric comparisons (requires feature gate TaintTolerationComparisonOperators).
                           type: string
                         tolerationSeconds:
                           description: |-
@@ -1033,10 +1240,74 @@ spec:
                       toolchains
                     type: string
                 type: object
+                x-kubernetes-validations:
+                - message: imageCosignKeyRef is required when imageVerify is true
+                  rule: '!has(self.imageVerify) || !self.imageVerify || has(self.imageCosignKeyRef)'
             type: object
           status:
             description: OperatorConfigStatus defines the observed state of OperatorConfig
             properties:
+              conditions:
+                description: Conditions represent the latest available observations
+                  of the OperatorConfig's state
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
               jumpstarterAvailable:
                 description: JumpstarterAvailable indicates if Jumpstarter is available
                   (explicitly configured or local CRDs detected)
@@ -1044,6 +1315,10 @@ spec:
               message:
                 description: Message provides detail about the current phase
                 type: string
+              monitoringEnabled:
+                description: MonitoringEnabled indicates if the ServiceMonitor is
+                  currently deployed
+                type: boolean
               observedGeneration:
                 description: ObservedGeneration is the most recent generation observed
                   by the controller.
@@ -1057,6 +1332,10 @@ spec:
                 description: Phase represents the current phase (Ready, Reconciling,
                   Failed)
                 type: string
+              tracingEnabled:
+                description: TracingEnabled indicates if tracing is configured and
+                  active
+                type: boolean
               userNamespacesSupported:
                 description: |-
                   UserNamespacesSupported indicates if the cluster supports user namespaces in pods

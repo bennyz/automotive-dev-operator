@@ -1,4 +1,4 @@
-//go:build !notmono && !codec.notmono 
+//go:build !notmono && !codec.notmono
 
 // Copyright (c) 2012-2020 Ugorji Nwoke. All rights reserved.
 // Use of this source code is governed by a MIT license found in the LICENSE file.
@@ -922,6 +922,10 @@ func (e *encoderCborBytes) MustEncode(v interface{}) {
 	return
 }
 
+func (e *encoderCborBytes) NumBytesWritten() int {
+	return e.e.NumBytesWritten()
+}
+
 func (e *encoderCborBytes) mustEncode(v interface{}) {
 	halt.onerror(e.err)
 	if e.hh == nil {
@@ -1139,11 +1143,11 @@ func (e *encoderCborBytes) rawBytes(vv Raw) {
 }
 
 func (e *encoderCborBytes) fn(t reflect.Type) *encFnCborBytes {
-	return e.dh.encFnViaBH(t, e.rtidFn, e.h, e.fp, false)
+	return e.dh.encFnViaBH(t, e.rtidFn, e.h, e.fp, true)
 }
 
 func (e *encoderCborBytes) fnNoExt(t reflect.Type) *encFnCborBytes {
-	return e.dh.encFnViaBH(t, e.rtidFnNoExt, e.h, e.fp, true)
+	return e.dh.encFnViaBH(t, e.rtidFnNoExt, e.h, e.fp, false)
 }
 
 func (e *encoderCborBytes) mapStart(length int) {
@@ -1617,7 +1621,7 @@ func (d *decoderCborBytes) kInterfaceNaked(f *decFnInfo) (rvn reflect.Value) {
 			} else {
 				rvn = reflect.New(bfn.rt)
 				if bfn.ext == SelfExt {
-					sideDecode(d.hh, &d.h.sideDecPool, func(sd decoderI) { oneOffDecode(sd, rv2i(rvn), bytes, bfn.rt, true) })
+					sideDecode(d.hh, &d.h.sideDecPool, func(sd decoderI) { oneOffDecode(sd, rv2i(rvn), bytes, bfn.rt, false) })
 				} else {
 					bfn.ext.ReadExt(rv2i(rvn), bytes)
 				}
@@ -2196,7 +2200,8 @@ func (d *decoderCborBytes) kChan(f *decFnInfo, rv reflect.Value) {
 	}
 
 	rtelem := ti.elem
-	useTransient := decUseTransient && ti.elemkind != byte(reflect.Ptr) && ti.tielem.flagCanTransient
+	useTransient := decUseTransient && ti.tielem.flagCanTransient &&
+		ti.elemkind != byte(reflect.Slice) && ti.elemkind != byte(reflect.Ptr)
 
 	for k := reflect.Kind(ti.elemkind); k == reflect.Ptr; k = rtelem.Kind() {
 		rtelem = rtelem.Elem()
@@ -2287,7 +2292,7 @@ func (d *decoderCborBytes) kMap(f *decFnInfo, rv reflect.Value) {
 	vtypePtr := vtypeKind == reflect.Ptr
 	ktypePtr := ktypeKind == reflect.Ptr
 
-	vTransient := decUseTransient && !vtypePtr && ti.tielem.flagCanTransient
+	vTransient := decUseTransient && !vtypePtr && ti.tielem.flagCanTransient && vtypeKind != reflect.Slice
 
 	kTransient := vTransient && !ktypePtr && ti.tikey.flagCanTransient
 
@@ -2848,11 +2853,11 @@ func (d *decoderCborBytes) interfaceExtConvertAndDecode(v interface{}, ext Inter
 }
 
 func (d *decoderCborBytes) fn(t reflect.Type) *decFnCborBytes {
-	return d.dh.decFnViaBH(t, d.rtidFn, d.h, d.fp, false)
+	return d.dh.decFnViaBH(t, d.rtidFn, d.h, d.fp, true)
 }
 
 func (d *decoderCborBytes) fnNoExt(t reflect.Type) *decFnCborBytes {
-	return d.dh.decFnViaBH(t, d.rtidFnNoExt, d.h, d.fp, true)
+	return d.dh.decFnViaBH(t, d.rtidFnNoExt, d.h, d.fp, false)
 }
 
 func (helperDecDriverCborBytes) newDecoderBytes(in []byte, h Handle) *decoderCborBytes {
@@ -3701,7 +3706,7 @@ func (d *cborDecDriverBytes) decTagBigIntAsFloat(neg bool) (f float64) {
 }
 
 func (d *cborDecDriverBytes) decTagBigFloatAsFloat(decimal bool) (f float64) {
-	if nn := d.r.readn1(); nn != 82 {
+	if nn := d.r.readn1(); nn != 0x82 {
 		halt.errorf("(%d) decoding decimal/big.Float: expected 2 numbers", nn)
 	}
 	exp := d.DecodeInt64()
@@ -3947,6 +3952,7 @@ func (d *cborEncDriverBytes) init(hh Handle, shared *encoderBase, enc encoderI) 
 	return
 }
 
+func (e *cborEncDriverBytes) NumBytesWritten() int    { return e.w.numWrite() }
 func (e *cborEncDriverBytes) writeBytesAsis(b []byte) { e.w.writeb(b) }
 
 func (e *cborEncDriverBytes) writerEnd() { e.w.end() }
@@ -3982,7 +3988,7 @@ func (d *cborDecDriverBytes) resetInBytes(in []byte) {
 }
 
 func (d *cborDecDriverBytes) resetInIO(r io.Reader) {
-	d.r.resetIO(r, d.h.ReaderBufferSize, d.h.MaxInitLen, &d.d.blist)
+	d.r.resetIO(r, d.h.ReaderBufferSize, d.h.maxBytes2Read(), &d.d.blist)
 }
 
 func (d *cborDecDriverBytes) descBd() string {
@@ -4904,6 +4910,10 @@ func (e *encoderCborIO) MustEncode(v interface{}) {
 	return
 }
 
+func (e *encoderCborIO) NumBytesWritten() int {
+	return e.e.NumBytesWritten()
+}
+
 func (e *encoderCborIO) mustEncode(v interface{}) {
 	halt.onerror(e.err)
 	if e.hh == nil {
@@ -5121,11 +5131,11 @@ func (e *encoderCborIO) rawBytes(vv Raw) {
 }
 
 func (e *encoderCborIO) fn(t reflect.Type) *encFnCborIO {
-	return e.dh.encFnViaBH(t, e.rtidFn, e.h, e.fp, false)
+	return e.dh.encFnViaBH(t, e.rtidFn, e.h, e.fp, true)
 }
 
 func (e *encoderCborIO) fnNoExt(t reflect.Type) *encFnCborIO {
-	return e.dh.encFnViaBH(t, e.rtidFnNoExt, e.h, e.fp, true)
+	return e.dh.encFnViaBH(t, e.rtidFnNoExt, e.h, e.fp, false)
 }
 
 func (e *encoderCborIO) mapStart(length int) {
@@ -5599,7 +5609,7 @@ func (d *decoderCborIO) kInterfaceNaked(f *decFnInfo) (rvn reflect.Value) {
 			} else {
 				rvn = reflect.New(bfn.rt)
 				if bfn.ext == SelfExt {
-					sideDecode(d.hh, &d.h.sideDecPool, func(sd decoderI) { oneOffDecode(sd, rv2i(rvn), bytes, bfn.rt, true) })
+					sideDecode(d.hh, &d.h.sideDecPool, func(sd decoderI) { oneOffDecode(sd, rv2i(rvn), bytes, bfn.rt, false) })
 				} else {
 					bfn.ext.ReadExt(rv2i(rvn), bytes)
 				}
@@ -6178,7 +6188,8 @@ func (d *decoderCborIO) kChan(f *decFnInfo, rv reflect.Value) {
 	}
 
 	rtelem := ti.elem
-	useTransient := decUseTransient && ti.elemkind != byte(reflect.Ptr) && ti.tielem.flagCanTransient
+	useTransient := decUseTransient && ti.tielem.flagCanTransient &&
+		ti.elemkind != byte(reflect.Slice) && ti.elemkind != byte(reflect.Ptr)
 
 	for k := reflect.Kind(ti.elemkind); k == reflect.Ptr; k = rtelem.Kind() {
 		rtelem = rtelem.Elem()
@@ -6269,7 +6280,7 @@ func (d *decoderCborIO) kMap(f *decFnInfo, rv reflect.Value) {
 	vtypePtr := vtypeKind == reflect.Ptr
 	ktypePtr := ktypeKind == reflect.Ptr
 
-	vTransient := decUseTransient && !vtypePtr && ti.tielem.flagCanTransient
+	vTransient := decUseTransient && !vtypePtr && ti.tielem.flagCanTransient && vtypeKind != reflect.Slice
 
 	kTransient := vTransient && !ktypePtr && ti.tikey.flagCanTransient
 
@@ -6830,11 +6841,11 @@ func (d *decoderCborIO) interfaceExtConvertAndDecode(v interface{}, ext Interfac
 }
 
 func (d *decoderCborIO) fn(t reflect.Type) *decFnCborIO {
-	return d.dh.decFnViaBH(t, d.rtidFn, d.h, d.fp, false)
+	return d.dh.decFnViaBH(t, d.rtidFn, d.h, d.fp, true)
 }
 
 func (d *decoderCborIO) fnNoExt(t reflect.Type) *decFnCborIO {
-	return d.dh.decFnViaBH(t, d.rtidFnNoExt, d.h, d.fp, true)
+	return d.dh.decFnViaBH(t, d.rtidFnNoExt, d.h, d.fp, false)
 }
 
 func (helperDecDriverCborIO) newDecoderBytes(in []byte, h Handle) *decoderCborIO {
@@ -7683,7 +7694,7 @@ func (d *cborDecDriverIO) decTagBigIntAsFloat(neg bool) (f float64) {
 }
 
 func (d *cborDecDriverIO) decTagBigFloatAsFloat(decimal bool) (f float64) {
-	if nn := d.r.readn1(); nn != 82 {
+	if nn := d.r.readn1(); nn != 0x82 {
 		halt.errorf("(%d) decoding decimal/big.Float: expected 2 numbers", nn)
 	}
 	exp := d.DecodeInt64()
@@ -7929,6 +7940,7 @@ func (d *cborEncDriverIO) init(hh Handle, shared *encoderBase, enc encoderI) (fp
 	return
 }
 
+func (e *cborEncDriverIO) NumBytesWritten() int    { return e.w.numWrite() }
 func (e *cborEncDriverIO) writeBytesAsis(b []byte) { e.w.writeb(b) }
 
 func (e *cborEncDriverIO) writerEnd() { e.w.end() }
@@ -7964,7 +7976,7 @@ func (d *cborDecDriverIO) resetInBytes(in []byte) {
 }
 
 func (d *cborDecDriverIO) resetInIO(r io.Reader) {
-	d.r.resetIO(r, d.h.ReaderBufferSize, d.h.MaxInitLen, &d.d.blist)
+	d.r.resetIO(r, d.h.ReaderBufferSize, d.h.maxBytes2Read(), &d.d.blist)
 }
 
 func (d *cborDecDriverIO) descBd() string {

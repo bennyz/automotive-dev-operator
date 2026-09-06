@@ -4,10 +4,26 @@ metadata:
   labels:
     app.kubernetes.io/name: automotive-dev-operator
     app.kubernetes.io/managed-by: kustomize
-  name: manager-rolebinding
+  name: manager-cluster-rolebinding
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
+  name: manager-role
+subjects:
+- kind: ServiceAccount
+  name: operator
+  namespace: system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  labels:
+    app.kubernetes.io/name: automotive-dev-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: manager-rolebinding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
   name: manager-role
 subjects:
 - kind: ServiceAccount

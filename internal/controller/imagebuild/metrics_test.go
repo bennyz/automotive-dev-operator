@@ -11,6 +11,38 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+func gaugeValue(g prometheus.Gauge) float64 {
+	m := &io_prometheus_client.Metric{}
+	if err := g.Write(m); err != nil {
+		return 0
+	}
+	return m.GetGauge().GetValue()
+}
+
+func TestAdjustActiveBuildsGauge(t *testing.T) {
+	ActiveBuilds.Set(0)
+
+	adjustActiveBuildsGauge("", "Building")
+	if v := gaugeValue(ActiveBuilds); v != 1 {
+		t.Errorf("after entering Building: got %v, want 1", v)
+	}
+
+	adjustActiveBuildsGauge("Building", "Building")
+	if v := gaugeValue(ActiveBuilds); v != 1 {
+		t.Errorf("same phase should not change gauge: got %v, want 1", v)
+	}
+
+	adjustActiveBuildsGauge("Building", "Completed")
+	if v := gaugeValue(ActiveBuilds); v != 0 {
+		t.Errorf("after leaving Building: got %v, want 0", v)
+	}
+
+	adjustActiveBuildsGauge("Completed", "Failed")
+	if v := gaugeValue(ActiveBuilds); v != 0 {
+		t.Errorf("non-Building transition should not change gauge: got %v, want 0", v)
+	}
+}
+
 // counterValue returns the current value of a counter with the given labels.
 func counterValue(cv *prometheus.CounterVec, labels ...string) float64 {
 	m := &io_prometheus_client.Metric{}
@@ -251,5 +283,161 @@ func TestRecordBuildMetrics_NoTimingResult(t *testing.T) {
 	afterCount := histogramCount(BuildPhaseDuration, labels...)
 	if afterCount != beforeCount {
 		t.Error("should not record phase metrics when build-timing result is absent")
+	}
+}
+
+func TestBuildMetricStatus(t *testing.T) {
+	tests := []struct {
+		name          string
+		phase         string
+		previousPhase string
+		want          string
+	}{
+		{"completed", "Completed", "", buildStatusSuccess},
+		{"failed", "Failed", "", buildStatusFailure},
+		{"cancelled", "Cancelled", "", buildStatusFailure},
+		{"expired with previous completed", "Expired", "Completed", buildStatusSuccess},
+		{"expired with previous failed", "Expired", "Failed", buildStatusFailure},
+		{"expired without previous phase (legacy)", "Expired", "", buildStatusSuccess},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			b := &automotivev1alpha1.ImageBuild{
+				Status: automotivev1alpha1.ImageBuildStatus{
+					Phase:         tt.phase,
+					PreviousPhase: tt.previousPhase,
+				},
+			}
+			if got := buildMetricStatus(b); got != tt.want {
+				t.Errorf("buildMetricStatus(%q, prev=%q) = %q, want %q", tt.phase, tt.previousPhase, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSeedMetricsFromCRs(t *testing.T) {
+	// Use unique label values to avoid interference from other tests
+	buildLabels := []string{"bootc", "fedora", "seed-target", "raw", "arm64", "success"}
+	failLabels := []string{"image", "fedora", "seed-target", "qcow2", "amd64", "failure"}
+	flashLabels := []string{"seed-target", "success"}
+
+	beforeBuild := counterValue(BuildTotal, buildLabels...)
+	beforeFail := counterValue(BuildTotal, failLabels...)
+	beforeFlash := counterValue(FlashTotal, flashLabels...)
+
+	start := metav1.NewTime(time.Now().Add(-5 * time.Minute))
+	end := metav1.Now()
+
+	builds := []automotivev1alpha1.ImageBuild{
+		{
+			Spec: automotivev1alpha1.ImageBuildSpec{
+				Architecture: "arm64",
+				AIB:          &automotivev1alpha1.AIBSpec{Distro: "fedora", Target: "seed-target", Mode: "bootc"},
+				Export:       &automotivev1alpha1.ExportSpec{Format: "raw"},
+			},
+			Status: automotivev1alpha1.ImageBuildStatus{
+				Phase:            "Completed",
+				StartTime:        &start,
+				CompletionTime:   &end,
+				FlashTaskRunName: "flash-run-1",
+			},
+		},
+		{
+			Spec: automotivev1alpha1.ImageBuildSpec{
+				Architecture: "arm64",
+				AIB:          &automotivev1alpha1.AIBSpec{Distro: "fedora", Target: "seed-target", Mode: "bootc"},
+				Export:       &automotivev1alpha1.ExportSpec{Format: "raw"},
+			},
+			Status: automotivev1alpha1.ImageBuildStatus{
+				Phase:          "Completed",
+				StartTime:      &start,
+				CompletionTime: &end,
+			},
+		},
+		// Expired build with PreviousPhase=Completed → counts as success
+		{
+			Spec: automotivev1alpha1.ImageBuildSpec{
+				Architecture: "arm64",
+				AIB:          &automotivev1alpha1.AIBSpec{Distro: "fedora", Target: "seed-target", Mode: "bootc"},
+				Export:       &automotivev1alpha1.ExportSpec{Format: "raw"},
+			},
+			Status: automotivev1alpha1.ImageBuildStatus{
+				Phase:          "Expired",
+				PreviousPhase:  "Completed",
+				StartTime:      &start,
+				CompletionTime: &end,
+			},
+		},
+		{
+			Spec: automotivev1alpha1.ImageBuildSpec{
+				Architecture: "amd64",
+				AIB:          &automotivev1alpha1.AIBSpec{Distro: "fedora", Target: "seed-target", Mode: "image"},
+				Export:       &automotivev1alpha1.ExportSpec{Format: "qcow2"},
+			},
+			Status: automotivev1alpha1.ImageBuildStatus{
+				Phase: "Failed",
+			},
+		},
+		// Expired build with PreviousPhase=Failed → counts as failure
+		{
+			Spec: automotivev1alpha1.ImageBuildSpec{
+				Architecture: "amd64",
+				AIB:          &automotivev1alpha1.AIBSpec{Distro: "fedora", Target: "seed-target", Mode: "image"},
+				Export:       &automotivev1alpha1.ExportSpec{Format: "qcow2"},
+			},
+			Status: automotivev1alpha1.ImageBuildStatus{
+				Phase:         "Expired",
+				PreviousPhase: "Failed",
+			},
+		},
+		// In-progress build — should only count as active, not seed counters
+		{
+			Spec: automotivev1alpha1.ImageBuildSpec{
+				Architecture: "amd64",
+				AIB:          &automotivev1alpha1.AIBSpec{Distro: "fedora", Target: "seed-target", Mode: "image"},
+			},
+			Status: automotivev1alpha1.ImageBuildStatus{
+				Phase: "Building",
+			},
+		},
+	}
+
+	seedMetrics(builds)
+
+	afterBuild := counterValue(BuildTotal, buildLabels...)
+	if afterBuild-beforeBuild != 3 {
+		t.Errorf("BuildTotal(success) delta = %v, want 3 (2 completed + 1 expired-from-completed)", afterBuild-beforeBuild)
+	}
+
+	afterFail := counterValue(BuildTotal, failLabels...)
+	if afterFail-beforeFail != 2 {
+		t.Errorf("BuildTotal(failure) delta = %v, want 2 (1 failed + 1 expired-from-failed)", afterFail-beforeFail)
+	}
+
+	afterFlash := counterValue(FlashTotal, flashLabels...)
+	if afterFlash-beforeFlash != 1 {
+		t.Errorf("FlashTotal delta = %v, want 1", afterFlash-beforeFlash)
+	}
+}
+
+func TestSeedMetricsFromCRs_ActiveBuilds(t *testing.T) {
+	ActiveBuilds.Set(0)
+
+	builds := []automotivev1alpha1.ImageBuild{
+		{
+			Status: automotivev1alpha1.ImageBuildStatus{Phase: "Building"},
+		},
+		{
+			Status: automotivev1alpha1.ImageBuildStatus{Phase: "Building"},
+		},
+		{
+			Status: automotivev1alpha1.ImageBuildStatus{Phase: "Completed"},
+		},
+	}
+
+	seedMetrics(builds)
+
+	if v := gaugeValue(ActiveBuilds); v != 2 {
+		t.Errorf("ActiveBuilds = %v, want 2", v)
 	}
 }

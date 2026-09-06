@@ -23,46 +23,14 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	automotivev1alpha1 "github.com/centos-automotive-suite/automotive-dev-operator/api/v1alpha1"
+	"github.com/centos-automotive-suite/automotive-dev-operator/internal/common/labels"
 )
-
-// --- Container Build Handlers ---
-
-func (a *APIServer) handleStreamContainerBuildLogs(c *gin.Context) {
-	name := c.Param("name")
-	a.log.Info("container build logs requested", "build", name, "reqID", c.GetString("reqID"))
-	a.streamContainerBuildLogs(c, name)
-}
-
-func (a *APIServer) handleCreateContainerBuild(c *gin.Context) {
-	a.log.Info("create container build", "reqID", c.GetString("reqID"))
-	a.createContainerBuild(c)
-}
-
-func (a *APIServer) handleListContainerBuilds(c *gin.Context) {
-	a.log.Info("list container builds", "reqID", c.GetString("reqID"))
-	listContainerBuilds(c)
-}
-
-func (a *APIServer) handleGetContainerBuild(c *gin.Context) {
-	name := c.Param("name")
-	a.log.Info("get container build", "build", name, "reqID", c.GetString("reqID"))
-	a.getContainerBuild(c, name)
-}
-
-func (a *APIServer) handleContainerBuildUpload(c *gin.Context) {
-	name := c.Param("name")
-	a.log.Info("container build upload", "build", name, "reqID", c.GetString("reqID"))
-	a.uploadContainerBuildContext(c, name)
-}
-
-// --- Container Build Implementation ---
 
 func (a *APIServer) streamContainerBuildLogs(c *gin.Context, name string) {
 	namespace := resolveNamespace()
 
-	k8sClient, err := getClientFromRequest(c)
+	k8sClient, err := getK8sClientOrFail(c)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
@@ -72,12 +40,7 @@ func (a *APIServer) streamContainerBuildLogs(c *gin.Context, name string) {
 	defer cancel()
 
 	cb := &automotivev1alpha1.ContainerBuild{}
-	if err := k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, cb); err != nil {
-		if k8serrors.IsNotFound(err) {
-			c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
-			return
-		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+	if err := getResourceOrFail(ctx, c, k8sClient, name, namespace, cb, "container build"); err != nil {
 		return
 	}
 
@@ -87,14 +50,8 @@ func (a *APIServer) streamContainerBuildLogs(c *gin.Context, name string) {
 		return
 	}
 
-	restCfg, err := getRESTConfigFromRequest(c)
+	cs, err := getClientsetOrFail(c)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	cs, err := kubernetes.NewForConfig(restCfg)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
@@ -166,7 +123,7 @@ func (a *APIServer) streamContainerBuildLogs(c *gin.Context, name string) {
 		// Check if build is complete AND all pod logs have been streamed
 		if allPodsComplete {
 			if err := k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, cb); err == nil {
-				if cb.Status.Phase == phaseCompleted || cb.Status.Phase == phaseFailed {
+				if isTerminalPhase(cb.Status.Phase) {
 					break
 				}
 			}
@@ -221,9 +178,8 @@ func (a *APIServer) createContainerBuild(c *gin.Context) {
 		req.Name = fmt.Sprintf("cb-%s", uuid.New().String()[:8])
 	}
 
-	k8sClient, err := getClientFromRequestFn(c)
+	k8sClient, err := getK8sClientOrFail(c)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("k8s client error: %v", err)})
 		return
 	}
 
@@ -262,7 +218,8 @@ func (a *APIServer) createContainerBuild(c *gin.Context) {
 			return
 		}
 
-		secretName, err := createInternalRegistrySecretFn(ctx, restCfg, namespace, req.Name)
+		tokenLifetime := resolveTokenLifetime(ctx, k8sClient, namespace)
+		secretName, err := createInternalRegistrySecretFn(ctx, restCfg, namespace, req.Name, tokenLifetime)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to create internal registry secret: %v", err)})
 			return
@@ -309,12 +266,12 @@ func (a *APIServer) createContainerBuild(c *gin.Context) {
 			Name:      req.Name,
 			Namespace: namespace,
 			Labels: map[string]string{
-				"app.kubernetes.io/managed-by": "build-api",
-				"app.kubernetes.io/part-of":    "automotive-dev",
-				"app.kubernetes.io/created-by": "automotive-dev-build-api",
+				labels.ManagedBy: labels.ValueBuildAPI,
+				labels.PartOf:    labels.ValueAutomotiveDev,
+				labels.CreatedBy: labels.ValueBuildAPICreator,
 			},
 			Annotations: map[string]string{
-				"automotive.sdv.cloud.redhat.com/requested-by": requestedBy,
+				labels.RequestedBy: requestedBy,
 			},
 		},
 		Spec: automotivev1alpha1.ContainerBuildSpec{
@@ -367,9 +324,8 @@ func listContainerBuilds(c *gin.Context) {
 	namespace := resolveNamespace()
 	limit, offset := parsePagination(c)
 
-	k8sClient, err := getClientFromRequest(c)
+	k8sClient, err := getK8sClientOrFail(c)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("k8s client error: %v", err)})
 		return
 	}
 
@@ -396,7 +352,7 @@ func listContainerBuilds(c *gin.Context) {
 			CreatedAt:   cb.CreationTimestamp.Format(time.RFC3339),
 			OutputImage: cb.Spec.Output,
 		}
-		if v, ok := cb.Annotations["automotive.sdv.cloud.redhat.com/requested-by"]; ok {
+		if v, ok := cb.Annotations[labels.RequestedBy]; ok {
 			item.RequestedBy = v
 		}
 		if cb.Status.CompletionTime != nil {
@@ -411,20 +367,14 @@ func listContainerBuilds(c *gin.Context) {
 func (a *APIServer) getContainerBuild(c *gin.Context, name string) {
 	namespace := resolveNamespace()
 
-	k8sClient, err := getClientFromRequest(c)
+	k8sClient, err := getK8sClientOrFail(c)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("k8s client error: %v", err)})
 		return
 	}
 
 	ctx := c.Request.Context()
 	cb := &automotivev1alpha1.ContainerBuild{}
-	if err := k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, cb); err != nil {
-		if k8serrors.IsNotFound(err) {
-			c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
-			return
-		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("error fetching container build: %v", err)})
+	if err := getResourceOrFail(ctx, c, k8sClient, name, namespace, cb, "container build"); err != nil {
 		return
 	}
 
@@ -443,7 +393,7 @@ func (a *APIServer) getContainerBuild(c *gin.Context, name string) {
 		OutputImage: outputImage,
 		ImageDigest: cb.Status.ImageDigest,
 	}
-	if v, ok := cb.Annotations["automotive.sdv.cloud.redhat.com/requested-by"]; ok {
+	if v, ok := cb.Annotations[labels.RequestedBy]; ok {
 		resp.RequestedBy = v
 	}
 	if cb.Status.StartTime != nil {
@@ -456,11 +406,12 @@ func (a *APIServer) getContainerBuild(c *gin.Context, name string) {
 	// Mint a fresh registry token for completed/failed internal registry builds
 	// that belong to the requesting user
 	requester := a.resolveRequester(c)
-	buildOwner := cb.Annotations["automotive.sdv.cloud.redhat.com/requested-by"]
+	buildOwner := cb.Annotations[labels.RequestedBy]
 	if requester == buildOwner &&
 		cb.Spec.UseServiceAccountAuth &&
-		(cb.Status.Phase == phaseCompleted || cb.Status.Phase == phaseFailed) {
-		token, _, tokenErr := a.mintRegistryToken(ctx, c, namespace)
+		isTerminalPhase(cb.Status.Phase) {
+		tokenLifetime := resolveTokenLifetime(ctx, k8sClient, namespace)
+		token, _, tokenErr := a.mintRegistryToken(ctx, c, namespace, tokenLifetime)
 		if tokenErr != nil {
 			a.log.Error(tokenErr, "failed to mint registry token for container build", "build", name)
 		} else {
@@ -472,10 +423,10 @@ func (a *APIServer) getContainerBuild(c *gin.Context, name string) {
 }
 
 func parseWaiterLockFileArg(tokens []string) (string, bool) {
-	for i := 0; i < len(tokens); i++ {
+	for i := range tokens {
 		token := tokens[i]
-		if strings.HasPrefix(token, "--lock-file=") {
-			lockFile := strings.TrimSpace(strings.TrimPrefix(token, "--lock-file="))
+		if after, ok := strings.CutPrefix(token, "--lock-file="); ok {
+			lockFile := strings.TrimSpace(after)
 			if lockFile != "" {
 				return lockFile, true
 			}
@@ -537,20 +488,14 @@ func findWaiterContainer(pod *corev1.Pod) string {
 func (a *APIServer) uploadContainerBuildContext(c *gin.Context, name string) {
 	namespace := resolveNamespace()
 
-	k8sClient, err := getClientFromRequestFn(c)
+	k8sClient, err := getK8sClientOrFail(c)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("k8s client error: %v", err)})
 		return
 	}
 
 	ctx := c.Request.Context()
 	cb := &automotivev1alpha1.ContainerBuild{}
-	if err := k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, cb); err != nil {
-		if k8serrors.IsNotFound(err) {
-			c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
-			return
-		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("error fetching container build: %v", err)})
+	if err := getResourceOrFail(ctx, c, k8sClient, name, namespace, cb, "container build"); err != nil {
 		return
 	}
 
@@ -652,11 +597,19 @@ func (a *APIServer) uploadContainerBuildContext(c *gin.Context, name string) {
 	}
 
 	// Phase 2: Signal completion to the waiter.
-	// Use the same lock file only when it is explicitly configured on the source-local step.
-	doneCmd := []string{"waiter", "done"}
-	if lockFile, ok := getWaiterLockFileFromPodSpec(buildPod, waiterContainer); ok {
-		doneCmd = append(doneCmd, "--lock-file="+lockFile)
+	// The waiter's "start" command may not have created the lock file yet when the
+	// tar extraction completes quickly (race between Tekton entrypoint and our exec).
+	// Wait for the lock file inside the container to avoid SPDY reconnection overhead.
+	lockFile := "/shp-tmp/waiter.lock"
+	if lf, ok := getWaiterLockFileFromPodSpec(buildPod, waiterContainer); ok {
+		lockFile = lf
 	}
+
+	waitAndDoneScript := fmt.Sprintf(
+		`for i in $(seq 1 60); do [ -f %[1]s ] && exec waiter done --lock-file=%[1]s; sleep 1; done; echo "timeout waiting for lock file %[1]s" >&2; exit 1`,
+		lockFile,
+	)
+	doneCmd := []string{"sh", "-c", waitAndDoneScript}
 
 	doneExecReq := clientset.CoreV1().RESTClient().Post().
 		Resource("pods").
@@ -680,12 +633,10 @@ func (a *APIServer) uploadContainerBuildContext(c *gin.Context, name string) {
 
 	var doneStdout strings.Builder
 	var doneStderr strings.Builder
-	doneStreamOpts := remotecommand.StreamOptions{
+	if err := doneExecutor.StreamWithContext(ctx, remotecommand.StreamOptions{
 		Stdout: &doneStdout,
 		Stderr: &doneStderr,
-	}
-
-	if err := doneExecutor.StreamWithContext(ctx, doneStreamOpts); err != nil {
+	}); err != nil {
 		detail := strings.TrimSpace(doneStderr.String())
 		if detail == "" {
 			detail = strings.TrimSpace(doneStdout.String())

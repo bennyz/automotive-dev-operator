@@ -11,7 +11,14 @@ import (
 	"time"
 
 	automotivev1alpha1 "github.com/centos-automotive-suite/automotive-dev-operator/api/v1alpha1"
+	"github.com/centos-automotive-suite/automotive-dev-operator/internal/common/bundleverify"
+	"github.com/centos-automotive-suite/automotive-dev-operator/internal/controller/controllerutils"
 	"github.com/go-logr/logr"
+	"github.com/google/go-containerregistry/pkg/v1/remote"
+	ociremote "github.com/sigstore/cosign/v3/pkg/oci/remote"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -27,11 +34,16 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
+var wsTracer = otel.Tracer("workspace-controller")
+
 const (
 	containerName               = "toolchain"
 	pvcSuffix                   = "-workspace"
 	leaseAnn                    = "automotive.sdv.cloud.redhat.com/lease-id"
 	workspaceServiceAccountName = "ado-workspace"
+	phaseCreating               = "Creating"
+	phaseFailed                 = "Failed"
+	phaseStopped                = "Stopped"
 )
 
 // Reconciler reconciles a Workspace object.
@@ -46,15 +58,23 @@ type Reconciler struct {
 	clientsetOnce sync.Once
 }
 
-// +kubebuilder:rbac:groups=automotive.sdv.cloud.redhat.com,resources=workspaces,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=automotive.sdv.cloud.redhat.com,resources=workspaces/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=automotive.sdv.cloud.redhat.com,resources=workspaces/finalizers,verbs=update
-// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;delete
-// +kubebuilder:rbac:groups="",resources=pods/exec,verbs=create
-// +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;delete
+// +kubebuilder:rbac:groups=automotive.sdv.cloud.redhat.com,namespace=system,resources=workspaces,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=automotive.sdv.cloud.redhat.com,namespace=system,resources=workspaces/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=automotive.sdv.cloud.redhat.com,namespace=system,resources=workspaces/finalizers,verbs=update
+// +kubebuilder:rbac:groups="",namespace=system,resources=pods,verbs=get;list;watch;create;delete
+// +kubebuilder:rbac:groups="",namespace=system,resources=pods/exec,verbs=create
+// +kubebuilder:rbac:groups="",namespace=system,resources=persistentvolumeclaims,verbs=get;list;watch;create;delete
 
 // Reconcile handles Workspace CR changes.
-func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, err error) {
+	ctx, span := wsTracer.Start(ctx, "Workspace.Reconcile",
+		trace.WithAttributes(
+			attribute.String("workspace.name", req.Name),
+			attribute.String("workspace.namespace", req.Namespace),
+		),
+	)
+	defer controllerutils.EndSpanWithError(span, &err)
+
 	log := r.Log.WithValues("workspace", req.NamespacedName)
 
 	ws := &automotivev1alpha1.Workspace{}
@@ -64,15 +84,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 	// Ensure PVC exists
 	if err := r.ensurePVC(ctx, ws); err != nil {
-		if statusErr := r.setStatus(ctx, ws, "Failed", fmt.Sprintf("PVC error: %v", err)); statusErr != nil {
+		if statusErr := r.setStatus(ctx, ws, "Failed", automotivev1alpha1.WorkspaceReasonStorageError, fmt.Sprintf("PVC error: %v", err)); statusErr != nil {
 			log.Error(statusErr, "failed to update status after PVC error")
 		}
 		return ctrl.Result{}, err
-	}
-
-	// Ensure Pod exists (needs PVC name from status)
-	if ws.Status.PVCName == "" {
-		return ctrl.Result{Requeue: true}, nil
 	}
 
 	// Handle stopped state: delete pod but keep PVC
@@ -80,38 +95,25 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		if err := r.deleteWorkspacePod(ctx, ws, log); err != nil {
 			return ctrl.Result{}, err
 		}
-		// Preserve existing message (e.g., auto-pause reason) if already Stopped
-		msg := ws.Status.Message
-		return ctrl.Result{}, r.setStatus(ctx, ws, "Stopped", msg)
+		var reason automotivev1alpha1.WorkspaceStatusReason
+		msg := ""
+		if ws.Status.Phase == phaseStopped {
+			reason, msg = ws.Status.Reason, ws.Status.Message
+		}
+		return ctrl.Result{}, r.setStatus(ctx, ws, phaseStopped, reason, msg)
 	}
 
 	pod, err := r.ensurePod(ctx, ws, log)
 	if err != nil {
-		if statusErr := r.setStatus(ctx, ws, "Failed", fmt.Sprintf("Pod error: %v", err)); statusErr != nil {
+		if statusErr := r.setStatus(ctx, ws, "Failed", automotivev1alpha1.WorkspaceReasonPodCreationError, fmt.Sprintf("Pod error: %v", err)); statusErr != nil {
 			log.Error(statusErr, "failed to update status after pod error")
 		}
 		return ctrl.Result{}, err
 	}
 
-	// Update status from pod phase
-	phase := "Pending"
-	msg := ""
-	if pod != nil {
-		switch pod.Status.Phase {
-		case corev1.PodRunning:
-			phase = "Running"
-		case corev1.PodFailed:
-			phase = "Failed"
-			msg = "Pod failed"
-		case corev1.PodSucceeded:
-			phase = "Failed"
-			msg = "Pod exited unexpectedly"
-		default:
-			phase = "Creating"
-		}
-	}
+	phase, reason, msg := workspacePodStatus(pod)
 
-	if err := r.setStatus(ctx, ws, phase, msg); err != nil {
+	if err := r.setStatus(ctx, ws, phase, reason, msg); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -123,12 +125,127 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	return ctrl.Result{}, nil
 }
 
-func (r *Reconciler) ensurePVC(ctx context.Context, ws *automotivev1alpha1.Workspace) error {
+func workspacePodStatus(pod *corev1.Pod) (string, automotivev1alpha1.WorkspaceStatusReason, string) {
+	if pod == nil {
+		return "Pending", "", ""
+	}
+
+	if (pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodSucceeded) &&
+		(pod.Status.Reason != "" || pod.Status.Message != "") {
+		fallback := "Pod failed"
+		if pod.Status.Phase == corev1.PodSucceeded {
+			fallback = "Pod exited unexpectedly"
+		}
+		reason := automotivev1alpha1.WorkspaceReasonPodFailed
+		if pod.Status.Phase == corev1.PodSucceeded {
+			reason = automotivev1alpha1.WorkspaceReasonPodExited
+		}
+		return phaseFailed, reason, statusMessage("pod", pod.Status.Reason, pod.Status.Message, fallback)
+	}
+
+	var creatingReason automotivev1alpha1.WorkspaceStatusReason
+	creatingMessage := ""
+	for _, status := range pod.Status.InitContainerStatuses {
+		failed, reason, message := workspaceContainerStatus(status, true)
+		if failed {
+			return phaseFailed, reason, message
+		}
+		if creatingMessage == "" {
+			creatingReason = reason
+			creatingMessage = message
+		}
+	}
+	for _, status := range pod.Status.ContainerStatuses {
+		failed, reason, message := workspaceContainerStatus(status, false)
+		if failed {
+			return phaseFailed, reason, message
+		}
+		if creatingMessage == "" {
+			creatingReason = reason
+			creatingMessage = message
+		}
+	}
+
+	switch pod.Status.Phase {
+	case corev1.PodFailed:
+		return phaseFailed, automotivev1alpha1.WorkspaceReasonPodFailed, "pod: Pod failed"
+	case corev1.PodSucceeded:
+		return phaseFailed, automotivev1alpha1.WorkspaceReasonPodExited, "pod: Pod exited unexpectedly"
+	}
+
+	if pod.Status.Phase == corev1.PodRunning {
+		if creatingMessage == "" {
+			return "Running", "", ""
+		}
+	}
+
+	if creatingMessage != "" {
+		return phaseCreating, creatingReason, creatingMessage
+	}
+	for _, condition := range pod.Status.Conditions {
+		if condition.Type == corev1.PodScheduled && condition.Status == corev1.ConditionFalse {
+			return phaseCreating, automotivev1alpha1.WorkspaceReasonScheduling, statusMessage("pod", condition.Reason, condition.Message, "Waiting to be scheduled")
+		}
+	}
+
+	return phaseCreating, "", ""
+}
+
+func workspaceContainerStatus(status corev1.ContainerStatus, initContainer bool) (bool, automotivev1alpha1.WorkspaceStatusReason, string) {
+	if waiting := status.State.Waiting; waiting != nil {
+		message := statusMessage("container "+status.Name, waiting.Reason, waiting.Message, "Waiting")
+		reason, failed := workspaceWaitingReason(waiting.Reason)
+		return failed, reason, message
+	}
+	if terminated := status.State.Terminated; terminated != nil {
+		if initContainer && terminated.ExitCode == 0 {
+			return false, "", ""
+		}
+		fallback := fmt.Sprintf("Exited with code %d", terminated.ExitCode)
+		return true, automotivev1alpha1.WorkspaceReasonContainerExited, statusMessage("container "+status.Name, terminated.Reason, terminated.Message, fallback)
+	}
+	return false, "", ""
+}
+
+func statusMessage(subject, reason, message, fallback string) string {
+	detail := reason
+	if detail == "" {
+		detail = fallback
+	}
+	result := subject + ": " + detail
+	if message != "" {
+		result += ": " + message
+	}
+	return result
+}
+
+// Kubelet reasons are free-form strings; map them to the stable Workspace API contract here.
+func workspaceWaitingReason(reason string) (automotivev1alpha1.WorkspaceStatusReason, bool) {
+	switch reason {
+	case "CreateContainerConfigError":
+		return automotivev1alpha1.WorkspaceReasonContainerConfigError, true
+	case "CreateContainerError", "RunContainerError":
+		return automotivev1alpha1.WorkspaceReasonContainerRuntimeError, true
+	case "ErrImageNeverPull", "InvalidImageName":
+		return automotivev1alpha1.WorkspaceReasonImageConfigError, true
+	case "ErrImagePull", "ImagePullBackOff":
+		return automotivev1alpha1.WorkspaceReasonImagePulling, false
+	case "CrashLoopBackOff":
+		return automotivev1alpha1.WorkspaceReasonContainerRestarting, false
+	default:
+		return automotivev1alpha1.WorkspaceReasonContainerStarting, false
+	}
+}
+
+func (r *Reconciler) ensurePVC(ctx context.Context, ws *automotivev1alpha1.Workspace) (err error) {
+	ctx, span := wsTracer.Start(ctx, "Workspace.EnsurePVC")
+	defer controllerutils.EndSpanWithError(span, &err)
+
 	pvcName := ws.Name + pvcSuffix
 
 	// Check if the PVC already exists
 	existing := &corev1.PersistentVolumeClaim{}
-	err := r.Get(ctx, client.ObjectKey{Namespace: ws.Namespace, Name: pvcName}, existing)
+	err = r.Get(ctx, client.ObjectKey{Namespace: ws.Namespace, Name: pvcName}, existing)
 	if err == nil {
 		// PVC exists; ensure status is up to date
 		if ws.Status.PVCName != pvcName {
@@ -181,10 +298,13 @@ func (r *Reconciler) ensurePVC(ctx context.Context, ws *automotivev1alpha1.Works
 	return r.Status().Patch(ctx, ws, patch)
 }
 
-func (r *Reconciler) ensurePod(ctx context.Context, ws *automotivev1alpha1.Workspace, log logr.Logger) (*corev1.Pod, error) {
+func (r *Reconciler) ensurePod(ctx context.Context, ws *automotivev1alpha1.Workspace, log logr.Logger) (_ *corev1.Pod, err error) {
+	ctx, span := wsTracer.Start(ctx, "Workspace.EnsurePod")
+	defer controllerutils.EndSpanWithError(span, &err)
+
 	podName := "workspace-" + ws.Name
 	existing := &corev1.Pod{}
-	err := r.Get(ctx, client.ObjectKey{Namespace: ws.Namespace, Name: podName}, existing)
+	err = r.Get(ctx, client.ObjectKey{Namespace: ws.Namespace, Name: podName}, existing)
 	if err == nil {
 		return existing, nil // already exists
 	}
@@ -199,6 +319,30 @@ func (r *Reconciler) ensurePod(ctx context.Context, ws *automotivev1alpha1.Works
 		operatorConfig = oc
 	}
 
+	var wsConfig *automotivev1alpha1.WorkspacesConfig
+	if operatorConfig != nil {
+		wsConfig = operatorConfig.Spec.Workspaces
+	}
+	image := resolveWorkspaceImage(ws, wsConfig)
+	if wsConfig != nil && !wsConfig.IsImageAllowed(image) {
+		return nil, fmt.Errorf("image %q is not in the allowed images list", image)
+	}
+	if wsConfig != nil && wsConfig.ImageVerify {
+		pubKeyPEM, err := bundleverify.FetchCosignPublicKey(ctx, r.Client, wsConfig.ImageCosignKeyRef, ws.Namespace)
+		if err != nil {
+			return nil, fmt.Errorf("imageVerify is enabled but cosign key is unavailable: %w", err)
+		}
+		imagePullSecrets := resolveImagePullSecrets(ws, wsConfig)
+		keychain, err := bundleverify.KeychainFromPullSecrets(ctx, r.Client, ws.Namespace, imagePullSecrets)
+		if err != nil {
+			return nil, fmt.Errorf("building registry keychain: %w", err)
+		}
+		registryOpts := ociremote.WithRemoteOptions(remote.WithAuthFromKeychain(keychain))
+		if err := bundleverify.VerifyBundle(ctx, image, pubKeyPEM, registryOpts); err != nil {
+			return nil, fmt.Errorf("workspace image signature verification failed: %w", err)
+		}
+	}
+
 	pod := r.buildPod(ws, operatorConfig)
 	if err := controllerutil.SetControllerReference(ws, pod, r.Scheme); err != nil {
 		return nil, err
@@ -208,6 +352,28 @@ func (r *Reconciler) ensurePod(ctx context.Context, ws *automotivev1alpha1.Works
 		return nil, err
 	}
 	return pod, nil
+}
+
+func resolveWorkspaceImage(ws *automotivev1alpha1.Workspace, wsConfig *automotivev1alpha1.WorkspacesConfig) string {
+	if ws.Spec.Image != "" {
+		return ws.Spec.Image
+	}
+	if wsConfig != nil {
+		if img := wsConfig.GetToolchainImage(); img != "" {
+			return img
+		}
+	}
+	return automotivev1alpha1.DefaultToolchainImage
+}
+
+func resolveImagePullSecrets(ws *automotivev1alpha1.Workspace, wsConfig *automotivev1alpha1.WorkspacesConfig) []corev1.LocalObjectReference {
+	if len(ws.Spec.ImagePullSecrets) > 0 {
+		return ws.Spec.ImagePullSecrets
+	}
+	if wsConfig != nil {
+		return wsConfig.GetImagePullSecrets()
+	}
+	return nil
 }
 
 func (r *Reconciler) buildPod(ws *automotivev1alpha1.Workspace, operatorConfig *automotivev1alpha1.OperatorConfig) *corev1.Pod {
@@ -224,10 +390,8 @@ func (r *Reconciler) buildPod(ws *automotivev1alpha1.Workspace, operatorConfig *
 	}
 
 	configuredImage := wsConfig.GetToolchainImage()
-	image := ws.Spec.Image
-	if image == "" {
-		image = configuredImage
-	}
+	image := resolveWorkspaceImage(ws, wsConfig)
+	imagePullSecrets := resolveImagePullSecrets(ws, wsConfig)
 
 	// Determine if the cluster supports user namespaces.
 	// With user namespaces: drop ALL caps + add specific ones, procMount=Unmasked
@@ -237,7 +401,7 @@ func (r *Reconciler) buildPod(ws *automotivev1alpha1.Workspace, operatorConfig *
 	var secCtx *corev1.SecurityContext
 	if userNamespaces {
 		secCtx = &corev1.SecurityContext{
-			AllowPrivilegeEscalation: ptr.To(true),
+			AllowPrivilegeEscalation: new(true),
 			ProcMount:                ptr.To(corev1.UnmaskedProcMount),
 			Capabilities: &corev1.Capabilities{
 				Drop: []corev1.Capability{"ALL"},
@@ -246,12 +410,12 @@ func (r *Reconciler) buildPod(ws *automotivev1alpha1.Workspace, operatorConfig *
 		}
 	} else if image == configuredImage {
 		secCtx = &corev1.SecurityContext{
-			Privileged:               ptr.To(true),
-			AllowPrivilegeEscalation: ptr.To(true),
+			Privileged:               new(true),
+			AllowPrivilegeEscalation: new(true),
 		}
 	} else {
 		secCtx = &corev1.SecurityContext{
-			AllowPrivilegeEscalation: ptr.To(true),
+			AllowPrivilegeEscalation: new(true),
 			Capabilities: &corev1.Capabilities{
 				Drop: []corev1.Capability{"ALL"},
 				Add:  []corev1.Capability{"SETUID", "SETGID", "DAC_OVERRIDE", "CHOWN", "FOWNER"},
@@ -363,7 +527,7 @@ chown -R 1000:1000 /workspace/src /workspace/cache /workspace/.cache /workspace/
 				Command:      []string{"/bin/sh", "-c", initScript},
 				VolumeMounts: initMounts,
 				SecurityContext: &corev1.SecurityContext{
-					AllowPrivilegeEscalation: ptr.To(false),
+					AllowPrivilegeEscalation: new(false),
 					Capabilities: &corev1.Capabilities{
 						Drop: []corev1.Capability{"ALL"},
 						Add:  []corev1.Capability{"CHOWN", "DAC_OVERRIDE", "FOWNER"},
@@ -393,7 +557,7 @@ chown -R 1000:1000 /workspace/src /workspace/cache /workspace/.cache /workspace/
 								{
 									Key:      "kubernetes.io/arch",
 									Operator: corev1.NodeSelectorOpIn,
-									Values:   []string{arch},
+									Values:   []string{controllerutils.NormalizeArchToK8s(arch)},
 								},
 							},
 						},
@@ -401,25 +565,40 @@ chown -R 1000:1000 /workspace/src /workspace/cache /workspace/.cache /workspace/
 				},
 			},
 		},
+		ImagePullSecrets:              imagePullSecrets,
 		NodeSelector:                  ws.Spec.NodeSelector,
 		Tolerations:                   wsConfig.GetTolerations(),
 		TerminationGracePeriodSeconds: ptr.To[int64](5),
 		RestartPolicy:                 corev1.RestartPolicyNever,
 	}
 	if userNamespaces {
-		podSpec.HostUsers = ptr.To(false)
+		podSpec.HostUsers = new(false)
 	}
 
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        podName,
 			Namespace:   ws.Namespace,
+			Labels:      workspacePodLabels(ws, arch),
 			Annotations: annotations,
 		},
 		Spec: podSpec,
 	}
 
 	return pod
+}
+
+func workspacePodLabels(ws *automotivev1alpha1.Workspace, arch string) map[string]string {
+	labels := map[string]string{
+		"app.kubernetes.io/managed-by":        "automotive-dev-operator",
+		"app.kubernetes.io/component":         "workspace",
+		automotivev1alpha1.LabelWorkspaceName: controllerutils.SanitizeLabelValue(ws.Name),
+		automotivev1alpha1.LabelArchitecture:  controllerutils.SanitizeLabelValue(arch),
+	}
+	if owner := controllerutils.SanitizeLabelValue(ws.Spec.Owner); owner != "" {
+		labels[automotivev1alpha1.LabelOwner] = owner
+	}
+	return labels
 }
 
 func (r *Reconciler) deleteWorkspacePod(ctx context.Context, ws *automotivev1alpha1.Workspace, log logr.Logger) error {
@@ -435,19 +614,26 @@ func (r *Reconciler) deleteWorkspacePod(ctx context.Context, ws *automotivev1alp
 	return client.IgnoreNotFound(err)
 }
 
-func (r *Reconciler) setStatus(ctx context.Context, ws *automotivev1alpha1.Workspace, phase, message string) error {
+func (r *Reconciler) setStatus(
+	ctx context.Context,
+	ws *automotivev1alpha1.Workspace,
+	phase string,
+	reason automotivev1alpha1.WorkspaceStatusReason,
+	message string,
+) error {
 	podName := "workspace-" + ws.Name
-	if phase == "Stopped" {
+	if phase == phaseStopped {
 		podName = ""
 	}
-	if ws.Status.Phase == phase && ws.Status.Message == message && ws.Status.PodName == podName {
+	if ws.Status.Phase == phase && ws.Status.Reason == reason && ws.Status.Message == message && ws.Status.PodName == podName {
 		return nil // no change
 	}
 	patch := client.MergeFrom(ws.DeepCopy())
 	ws.Status.Phase = phase
+	ws.Status.Reason = reason
 	ws.Status.Message = message
 	ws.Status.PodName = podName
-	if phase == "Stopped" || phase == "Pending" || phase == "Creating" {
+	if phase == phaseStopped || phase == "Pending" || phase == phaseCreating {
 		ws.Status.LastActivityTime = nil
 	}
 	return r.Status().Patch(ctx, ws, patch)
@@ -524,7 +710,7 @@ func (r *Reconciler) checkAutoPause(ctx context.Context, ws *automotivev1alpha1.
 		}
 
 		msg := fmt.Sprintf("Auto-paused after %s of inactivity", idleDuration.Truncate(time.Minute))
-		return ctrl.Result{}, r.setStatus(ctx, ws, "Stopped", msg)
+		return ctrl.Result{}, r.setStatus(ctx, ws, phaseStopped, automotivev1alpha1.WorkspaceReasonAutoPaused, msg)
 	}
 
 	remaining := timeout - idleDuration

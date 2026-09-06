@@ -5,6 +5,7 @@ import (
 	"github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/downloadcmd"
 	"github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/flashcmd"
 	"github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/image"
+	"github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/inspectcmd"
 	"github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/querycmd"
 	"github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/sealedcmd"
 	"github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/tokencmd"
@@ -14,7 +15,7 @@ type runtimeState struct {
 	ServerURL              *string
 	Manifest               *string
 	BuildName              *string
-	ShowOutputFormat       *string
+	OutputFormat           *string
 	Distro                 *string
 	Target                 *string
 	Architecture           *string
@@ -26,8 +27,11 @@ type runtimeState struct {
 	Timeout                *int
 	WaitForBuild           *bool
 	CustomDefs             *[]string
+	DefineFiles            *[]string
 	AIBExtraArgs           *[]string
+	RootPassword           *string
 	ExtraRepos             *[]string
+	LocalRepo              *string
 	Workspace              *string
 	FollowLogs             *bool
 	CompressionAlgo        *string
@@ -49,10 +53,26 @@ type runtimeState struct {
 	LeaseDuration     *string
 	LeaseName         *string
 	FlashCmd          *string
+	LeaseTags         *[]string
 
 	UseInternalRegistry       *bool
 	InternalRegistryImageName *string
 	InternalRegistryTag       *string
+
+	SecureBuild       *bool
+	Reproducible      *bool
+	TaskBundleRef     *string
+	RestoreSourcesRef *string
+	TTL               *string
+
+	S3Bucket            *string
+	S3Prefix            *string
+	S3Region            *string
+	S3Endpoint          *string
+	S3AccessKeyID       *string
+	S3SecretAccessKey   *string
+	S3CredentialsSecret *string
+	S3Insecure          *bool
 
 	InsecureSkipTLS *bool
 
@@ -72,7 +92,7 @@ func newRuntimeState() runtimeState {
 		ServerURL:              &serverURL,
 		Manifest:               &manifest,
 		BuildName:              &buildName,
-		ShowOutputFormat:       &showOutputFormat,
+		OutputFormat:           &outputFormat,
 		Distro:                 &distro,
 		Target:                 &target,
 		Architecture:           &architecture,
@@ -84,8 +104,11 @@ func newRuntimeState() runtimeState {
 		Timeout:                &timeout,
 		WaitForBuild:           &waitForBuild,
 		CustomDefs:             &customDefs,
+		DefineFiles:            &defineFiles,
 		AIBExtraArgs:           &aibExtraArgs,
+		RootPassword:           &rootPassword,
 		ExtraRepos:             &extraRepos,
+		LocalRepo:              &localRepo,
 		Workspace:              &workspaceName,
 		FollowLogs:             &followLogs,
 		CompressionAlgo:        &compressionAlgo,
@@ -107,10 +130,26 @@ func newRuntimeState() runtimeState {
 		LeaseDuration:     &leaseDuration,
 		LeaseName:         &leaseName,
 		FlashCmd:          &flashCmdOverride,
+		LeaseTags:         &leaseTags,
 
 		UseInternalRegistry:       &useInternalRegistry,
 		InternalRegistryImageName: &internalRegistryImageName,
 		InternalRegistryTag:       &internalRegistryTag,
+
+		SecureBuild:       &secureBuild,
+		Reproducible:      &reproducibleBuild,
+		TaskBundleRef:     &taskBundleRef,
+		RestoreSourcesRef: &restoreSourcesRef,
+		TTL:               &buildTTL,
+
+		S3Bucket:            &s3Bucket,
+		S3Prefix:            &s3Prefix,
+		S3Region:            &s3Region,
+		S3Endpoint:          &s3Endpoint,
+		S3AccessKeyID:       &s3AccessKeyID,
+		S3SecretAccessKey:   &s3SecretAccessKey,
+		S3CredentialsSecret: &s3CredentialsSecret,
+		S3Insecure:          &s3Insecure,
 
 		InsecureSkipTLS: &insecureSkipTLS,
 
@@ -133,6 +172,7 @@ type handlerSet struct {
 	flash    *flashcmd.Handler
 	sealed   *sealedcmd.Handler
 	token    *tokencmd.Handler
+	inspect  *inspectcmd.Handler
 }
 
 func (s runtimeState) newHandlers() handlerSet {
@@ -152,8 +192,11 @@ func (s runtimeState) newHandlers() handlerSet {
 			Timeout:                   s.Timeout,
 			WaitForBuild:              s.WaitForBuild,
 			CustomDefs:                s.CustomDefs,
+			DefineFiles:               s.DefineFiles,
 			AIBExtraArgs:              s.AIBExtraArgs,
+			RootPassword:              s.RootPassword,
 			ExtraRepos:                s.ExtraRepos,
+			LocalRepo:                 s.LocalRepo,
 			Workspace:                 s.Workspace,
 			FollowLogs:                s.FollowLogs,
 			CompressionAlgo:           s.CompressionAlgo,
@@ -172,18 +215,33 @@ func (s runtimeState) newHandlers() handlerSet {
 			LeaseName:                 s.LeaseName,
 			FlashCmd:                  s.FlashCmd,
 			ExporterSelector:          s.ExporterSelector,
+			LeaseTags:                 s.LeaseTags,
 			UseInternalRegistry:       s.UseInternalRegistry,
 			InternalRegistryImageName: s.InternalRegistryImageName,
 			InternalRegistryTag:       s.InternalRegistryTag,
+			SecureBuild:               s.SecureBuild,
+			Reproducible:              s.Reproducible,
+			TaskBundleRef:             s.TaskBundleRef,
+			RestoreSourcesRef:         s.RestoreSourcesRef,
+			TTL:                       s.TTL,
+			S3Bucket:                  s.S3Bucket,
+			S3Prefix:                  s.S3Prefix,
+			S3Region:                  s.S3Region,
+			S3Endpoint:                s.S3Endpoint,
+			S3AccessKeyID:             s.S3AccessKeyID,
+			S3SecretAccessKey:         s.S3SecretAccessKey,
+			S3CredentialsSecret:       s.S3CredentialsSecret,
+			S3Insecure:                s.S3Insecure,
 			InsecureSkipTLS:           s.InsecureSkipTLS,
+			OutputFormat:              s.OutputFormat,
 			HandleError:               handleError,
 		}),
 		query: querycmd.NewHandler(querycmd.Options{
-			ServerURL:        s.ServerURL,
-			AuthToken:        s.AuthToken,
-			ShowOutputFormat: s.ShowOutputFormat,
-			InsecureSkipTLS:  s.InsecureSkipTLS,
-			HandleError:      handleError,
+			ServerURL:       s.ServerURL,
+			AuthToken:       s.AuthToken,
+			OutputFormat:    s.OutputFormat,
+			InsecureSkipTLS: s.InsecureSkipTLS,
+			HandleError:     handleError,
 		}),
 		download: downloadcmd.NewHandler(downloadcmd.Options{
 			ServerURL:       s.ServerURL,
@@ -202,6 +260,7 @@ func (s runtimeState) newHandlers() handlerSet {
 			LeaseDuration:     s.LeaseDuration,
 			LeaseName:         s.LeaseName,
 			FlashCmd:          s.FlashCmd,
+			LeaseTags:         s.LeaseTags,
 			WaitForBuild:      s.WaitForBuild,
 			FollowLogs:        s.FollowLogs,
 			InsecureSkipTLS:   s.InsecureSkipTLS,
@@ -233,7 +292,15 @@ func (s runtimeState) newHandlers() handlerSet {
 			ServerURL:       s.ServerURL,
 			AuthToken:       s.AuthToken,
 			InsecureSkipTLS: s.InsecureSkipTLS,
+			OutputFormat:    s.OutputFormat,
 			HandleError:     handleError,
+		}),
+		inspect: inspectcmd.NewHandler(inspectcmd.Options{
+			RegistryAuthFile: s.RegistryAuthFile,
+			OutputDir:        s.OutputDir,
+			OutputFormat:     s.OutputFormat,
+			InsecureSkipTLS:  s.InsecureSkipTLS,
+			HandleError:      handleError,
 		}),
 	}
 }
@@ -254,25 +321,28 @@ func (s runtimeState) imageOptions(h handlerSet) image.Options {
 		RunInjectSigned:      h.sealed.RunInjectSigned,
 		RunToken:             h.token.RunToken,
 		RunDelete:            h.build.RunDelete,
+		RunCancel:            h.build.RunCancel,
+		RunInspect:           h.inspect.RunInspect,
 		GetDefaultArch:       getDefaultArch,
 
 		ServerURL:              s.ServerURL,
 		AuthToken:              s.AuthToken,
 		BuildName:              s.BuildName,
-		ShowOutputFormat:       s.ShowOutputFormat,
 		Distro:                 s.Distro,
 		Target:                 s.Target,
 		Architecture:           s.Architecture,
 		ExportFormat:           s.ExportFormat,
 		Mode:                   s.Mode,
 		AutomotiveImageBuilder: s.AutomotiveImageBuilder,
-		StorageClass:           s.StorageClass,
 		OutputDir:              s.OutputDir,
 		Timeout:                s.Timeout,
 		WaitForBuild:           s.WaitForBuild,
 		CustomDefs:             s.CustomDefs,
+		DefineFiles:            s.DefineFiles,
 		AIBExtraArgs:           s.AIBExtraArgs,
+		RootPassword:           s.RootPassword,
 		ExtraRepos:             s.ExtraRepos,
+		LocalRepo:              s.LocalRepo,
 		Workspace:              s.Workspace,
 		FollowLogs:             s.FollowLogs,
 		CompressionAlgo:        s.CompressionAlgo,
@@ -291,10 +361,26 @@ func (s runtimeState) imageOptions(h handlerSet) image.Options {
 		LeaseDuration:     s.LeaseDuration,
 		LeaseName:         s.LeaseName,
 		FlashCmd:          s.FlashCmd,
+		LeaseTags:         s.LeaseTags,
 
 		UseInternalRegistry:       s.UseInternalRegistry,
 		InternalRegistryImageName: s.InternalRegistryImageName,
 		InternalRegistryTag:       s.InternalRegistryTag,
+
+		SecureBuild:       s.SecureBuild,
+		Reproducible:      s.Reproducible,
+		TaskBundleRef:     s.TaskBundleRef,
+		RestoreSourcesRef: s.RestoreSourcesRef,
+		TTL:               s.TTL,
+
+		S3Bucket:            s.S3Bucket,
+		S3Prefix:            s.S3Prefix,
+		S3Region:            s.S3Region,
+		S3Endpoint:          s.S3Endpoint,
+		S3AccessKeyID:       s.S3AccessKeyID,
+		S3SecretAccessKey:   s.S3SecretAccessKey,
+		S3CredentialsSecret: s.S3CredentialsSecret,
+		S3Insecure:          s.S3Insecure,
 
 		SealedBuilderImage:      s.SealedBuilderImage,
 		SealedArchitecture:      s.SealedArchitecture,

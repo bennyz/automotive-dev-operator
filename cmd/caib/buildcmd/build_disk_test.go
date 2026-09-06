@@ -26,6 +26,7 @@ func newTestDiskOpts() Options {
 		timeout              = 60
 		waitForBuild         bool
 		customDefs           []string
+		rootPassword         string
 		aibExtraArgs         []string
 		followLogs           bool
 		compressionAlgo      = "gzip"
@@ -42,11 +43,26 @@ func newTestDiskOpts() Options {
 		jumpstarterClient    string
 		leaseDuration        = "03:00:00"
 		leaseName            string
+		leaseTags            []string
 		useInternalRegistry  bool
 		internalRegImageName string
 		internalRegTag       string
+		secureBuild          bool
+		reproducible         bool
+		taskBundleRef        string
+		restoreSourcesRef    string
+		buildTTL             string
 		insecureSkipTLS      bool
+		s3Bucket             string
+		s3Prefix             string
+		s3Region             string
+		s3Endpoint           string
+		s3AccessKeyID        string
+		s3SecretAccessKey    string
+		s3CredentialsSecret  string
+		s3Insecure           bool
 	)
+	var defineFiles []string
 	return Options{
 		ServerURL:                 &serverURL,
 		Manifest:                  &manifest,
@@ -62,6 +78,8 @@ func newTestDiskOpts() Options {
 		Timeout:                   &timeout,
 		WaitForBuild:              &waitForBuild,
 		CustomDefs:                &customDefs,
+		DefineFiles:               &defineFiles,
+		RootPassword:              &rootPassword,
 		AIBExtraArgs:              &aibExtraArgs,
 		FollowLogs:                &followLogs,
 		CompressionAlgo:           &compressionAlgo,
@@ -78,10 +96,24 @@ func newTestDiskOpts() Options {
 		JumpstarterClient:         &jumpstarterClient,
 		LeaseDuration:             &leaseDuration,
 		LeaseName:                 &leaseName,
+		LeaseTags:                 &leaseTags,
 		UseInternalRegistry:       &useInternalRegistry,
 		InternalRegistryImageName: &internalRegImageName,
 		InternalRegistryTag:       &internalRegTag,
+		SecureBuild:               &secureBuild,
+		Reproducible:              &reproducible,
+		TaskBundleRef:             &taskBundleRef,
+		RestoreSourcesRef:         &restoreSourcesRef,
+		TTL:                       &buildTTL,
 		InsecureSkipTLS:           &insecureSkipTLS,
+		S3Bucket:                  &s3Bucket,
+		S3Prefix:                  &s3Prefix,
+		S3Region:                  &s3Region,
+		S3Endpoint:                &s3Endpoint,
+		S3AccessKeyID:             &s3AccessKeyID,
+		S3SecretAccessKey:         &s3SecretAccessKey,
+		S3CredentialsSecret:       &s3CredentialsSecret,
+		S3Insecure:                &s3Insecure,
 	}
 }
 

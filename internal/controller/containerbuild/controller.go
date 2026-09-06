@@ -9,6 +9,7 @@ import (
 	"time"
 
 	automotivev1alpha1 "github.com/centos-automotive-suite/automotive-dev-operator/api/v1alpha1"
+	controllerutils "github.com/centos-automotive-suite/automotive-dev-operator/internal/controller/controllerutils"
 	"github.com/go-logr/logr"
 	shipwrightv1beta1 "github.com/shipwright-io/build/pkg/apis/build/v1beta1"
 	corev1 "k8s.io/api/core/v1"
@@ -16,7 +17,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -27,11 +28,9 @@ const (
 	phasePending   = "Pending"
 	phaseUploading = "Uploading"
 	phaseBuilding  = "Building"
+	phaseExpired   = "Expired"
 
 	maxK8sNameLength = 63
-
-	// OperatorNamespace is the namespace where the operator is deployed.
-	OperatorNamespace = "automotive-dev-operator-system"
 
 	// defaultUploadTimeoutMinutes is the default source upload timeout for container builds.
 	defaultUploadTimeoutMinutes = 10
@@ -63,18 +62,19 @@ type ContainerBuildReconciler struct {
 	client.Client
 	Scheme   *runtime.Scheme
 	Log      logr.Logger
-	Recorder record.EventRecorder
+	Recorder events.EventRecorder
 }
 
-//+kubebuilder:rbac:groups=automotive.sdv.cloud.redhat.com,resources=containerbuilds,verbs=get;list;watch;create;update;patch;delete
-//+kubebuilder:rbac:groups=automotive.sdv.cloud.redhat.com,resources=containerbuilds/status,verbs=get;update;patch
-//+kubebuilder:rbac:groups=automotive.sdv.cloud.redhat.com,resources=containerbuilds/finalizers,verbs=update
-//+kubebuilder:rbac:groups=automotive.sdv.cloud.redhat.com,resources=operatorconfigs,verbs=get;list;watch
-//+kubebuilder:rbac:groups=shipwright.io,resources=buildruns,verbs=get;list;watch;create;update;patch;delete
-//+kubebuilder:rbac:groups=shipwright.io,resources=builds,verbs=get;list;watch;create;update;patch;delete
-//+kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
-//+kubebuilder:rbac:groups="",resources=pods/exec,verbs=create
-//+kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+//+kubebuilder:rbac:groups=automotive.sdv.cloud.redhat.com,namespace=system,resources=containerbuilds,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=automotive.sdv.cloud.redhat.com,namespace=system,resources=containerbuilds/status,verbs=get;update;patch
+//+kubebuilder:rbac:groups=automotive.sdv.cloud.redhat.com,namespace=system,resources=containerbuilds/finalizers,verbs=update
+//+kubebuilder:rbac:groups=automotive.sdv.cloud.redhat.com,namespace=system,resources=operatorconfigs,verbs=get;list;watch
+//+kubebuilder:rbac:groups=shipwright.io,namespace=system,resources=buildruns,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=shipwright.io,namespace=system,resources=builds,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups="",namespace=system,resources=pods,verbs=get;list;watch
+//+kubebuilder:rbac:groups="",namespace=system,resources=pods/exec,verbs=create
+//+kubebuilder:rbac:groups="",namespace=system,resources=events,verbs=create;patch
+//+kubebuilder:rbac:groups=events.k8s.io,namespace=system,resources=events,verbs=create;patch
 
 // Reconcile handles the reconciliation loop for ContainerBuild resources.
 func (r *ContainerBuildReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -88,6 +88,10 @@ func (r *ContainerBuildReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, err
 	}
 
+	if result, expired, err := r.checkExpiry(ctx, cb); expired || err != nil {
+		return result, err
+	}
+
 	switch cb.Status.Phase {
 	case "", phasePending:
 		return r.reconcilePending(ctx, log, cb)
@@ -95,6 +99,8 @@ func (r *ContainerBuildReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return r.reconcileUploading(ctx, log, cb)
 	case phaseBuilding:
 		return r.reconcileBuilding(ctx, log, cb)
+	case phaseExpired:
+		return r.handleExpiredState(ctx, cb)
 	case phaseCompleted, phaseFailed:
 		return ctrl.Result{}, nil
 	default:
@@ -122,7 +128,7 @@ func (r *ContainerBuildReconciler) reconcilePending(
 	// Read upload timeout from OperatorConfig, falling back to default
 	uploadTimeout := time.Duration(defaultUploadTimeoutMinutes) * time.Minute
 	operatorConfig := &automotivev1alpha1.OperatorConfig{}
-	if err := r.Get(ctx, types.NamespacedName{Name: "config", Namespace: OperatorNamespace}, operatorConfig); err == nil {
+	if err := r.Get(ctx, types.NamespacedName{Name: "config", Namespace: controllerutils.OperatorNamespace()}, operatorConfig); err == nil {
 		if operatorConfig.Spec.ContainerBuilds != nil && operatorConfig.Spec.ContainerBuilds.UploadTimeoutMinutes > 0 {
 			uploadTimeout = time.Duration(operatorConfig.Spec.ContainerBuilds.UploadTimeoutMinutes) * time.Minute
 		}
@@ -317,7 +323,10 @@ func (r *ContainerBuildReconciler) updatePhase(
 	if buildRunName != "" {
 		cb.Status.BuildRunName = buildRunName
 	}
-	if phase == phaseFailed || phase == phaseCompleted {
+	if phase == phaseExpired {
+		cb.Status.PreviousPhase = oldPhase
+	}
+	if isTerminalPhase(phase) && cb.Status.CompletionTime == nil {
 		now := metav1.Now()
 		cb.Status.CompletionTime = &now
 	}
@@ -337,7 +346,7 @@ func (r *ContainerBuildReconciler) updatePhase(
 		)
 		r.emitContainerLifecycleEvent(cb, oldPhase, phase, message)
 	}
-	if phase == phaseFailed || phase == phaseCompleted {
+	if isTerminalPhase(phase) {
 		return ctrl.Result{}, nil
 	}
 	return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
@@ -396,6 +405,10 @@ func (r *ContainerBuildReconciler) emitContainerLifecycleEvent(
 	}
 }
 
+func isTerminalPhase(phase string) bool {
+	return phase == phaseFailed || phase == phaseCompleted || phase == phaseExpired
+}
+
 func eventTypeForContainerPhase(phase string) string {
 	if phase == phaseFailed {
 		return corev1.EventTypeWarning
@@ -406,12 +419,12 @@ func eventTypeForContainerPhase(phase string) string {
 func (r *ContainerBuildReconciler) emitEventf(
 	cb *automotivev1alpha1.ContainerBuild,
 	eventType, reason, messageFmt string,
-	args ...interface{},
+	args ...any,
 ) {
 	if r.Recorder == nil || cb == nil {
 		return
 	}
-	r.Recorder.Eventf(cb, eventType, reason, messageFmt, args...)
+	r.Recorder.Eventf(cb, nil, eventType, reason, reason, messageFmt, args...)
 }
 
 func (r *ContainerBuildReconciler) buildShipwrightBuildRun(
@@ -429,15 +442,13 @@ func (r *ContainerBuildReconciler) buildShipwrightBuildRun(
 
 	localName := cb.Name + "-source"
 
-	// Build paramValues for Containerfile path
+	// Shipwright's buildah strategy defaults to "Dockerfile"; pass explicitly to use our value.
 	paramValues := make([]shipwrightv1beta1.ParamValue, 0, 1+len(cb.Spec.BuildArgs))
 	containerfile := cb.Spec.GetContainerfile()
-	if containerfile != "Containerfile" {
-		paramValues = append(paramValues, shipwrightv1beta1.ParamValue{
-			Name:        "dockerfile",
-			SingleValue: &shipwrightv1beta1.SingleValue{Value: &containerfile},
-		})
-	}
+	paramValues = append(paramValues, shipwrightv1beta1.ParamValue{
+		Name:        "dockerfile",
+		SingleValue: &shipwrightv1beta1.SingleValue{Value: &containerfile},
+	})
 
 	// Collect all build args into a single ParamValue entry
 	buildArgValues := make([]shipwrightv1beta1.SingleValue, 0, len(cb.Spec.BuildArgs)+1)
@@ -454,6 +465,16 @@ func (r *ContainerBuildReconciler) buildShipwrightBuildRun(
 		Name:   "build-args",
 		Values: buildArgValues,
 	})
+
+	if cb.Spec.UseServiceAccountAuth {
+		registryHost := extractRegistryHost(cb.Spec.Output)
+		if registryHost != "" {
+			paramValues = append(paramValues, shipwrightv1beta1.ParamValue{
+				Name:   "registries-insecure",
+				Values: []shipwrightv1beta1.SingleValue{{Value: &registryHost}},
+			})
+		}
+	}
 
 	// Build output
 	output := shipwrightv1beta1.Image{
@@ -499,6 +520,19 @@ func (r *ContainerBuildReconciler) buildShipwrightBuildRun(
 	}
 
 	return buildRun
+}
+
+func extractRegistryHost(imageRef string) string {
+	ref := strings.TrimPrefix(imageRef, "docker://")
+	before, _, ok := strings.Cut(ref, "/")
+	if !ok {
+		return ""
+	}
+	host := before
+	if strings.ContainsAny(host, ".:") {
+		return host
+	}
+	return ""
 }
 
 // SetupWithManager sets up the controller with the Manager.

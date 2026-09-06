@@ -1,4 +1,4 @@
-//go:build !notmono && !codec.notmono 
+//go:build !notmono && !codec.notmono
 
 // Copyright (c) 2012-2020 Ugorji Nwoke. All rights reserved.
 // Use of this source code is governed by a MIT license found in the LICENSE file.
@@ -920,6 +920,10 @@ func (e *encoderBincBytes) MustEncode(v interface{}) {
 	return
 }
 
+func (e *encoderBincBytes) NumBytesWritten() int {
+	return e.e.NumBytesWritten()
+}
+
 func (e *encoderBincBytes) mustEncode(v interface{}) {
 	halt.onerror(e.err)
 	if e.hh == nil {
@@ -1137,11 +1141,11 @@ func (e *encoderBincBytes) rawBytes(vv Raw) {
 }
 
 func (e *encoderBincBytes) fn(t reflect.Type) *encFnBincBytes {
-	return e.dh.encFnViaBH(t, e.rtidFn, e.h, e.fp, false)
+	return e.dh.encFnViaBH(t, e.rtidFn, e.h, e.fp, true)
 }
 
 func (e *encoderBincBytes) fnNoExt(t reflect.Type) *encFnBincBytes {
-	return e.dh.encFnViaBH(t, e.rtidFnNoExt, e.h, e.fp, true)
+	return e.dh.encFnViaBH(t, e.rtidFnNoExt, e.h, e.fp, false)
 }
 
 func (e *encoderBincBytes) mapStart(length int) {
@@ -1615,7 +1619,7 @@ func (d *decoderBincBytes) kInterfaceNaked(f *decFnInfo) (rvn reflect.Value) {
 			} else {
 				rvn = reflect.New(bfn.rt)
 				if bfn.ext == SelfExt {
-					sideDecode(d.hh, &d.h.sideDecPool, func(sd decoderI) { oneOffDecode(sd, rv2i(rvn), bytes, bfn.rt, true) })
+					sideDecode(d.hh, &d.h.sideDecPool, func(sd decoderI) { oneOffDecode(sd, rv2i(rvn), bytes, bfn.rt, false) })
 				} else {
 					bfn.ext.ReadExt(rv2i(rvn), bytes)
 				}
@@ -2194,7 +2198,8 @@ func (d *decoderBincBytes) kChan(f *decFnInfo, rv reflect.Value) {
 	}
 
 	rtelem := ti.elem
-	useTransient := decUseTransient && ti.elemkind != byte(reflect.Ptr) && ti.tielem.flagCanTransient
+	useTransient := decUseTransient && ti.tielem.flagCanTransient &&
+		ti.elemkind != byte(reflect.Slice) && ti.elemkind != byte(reflect.Ptr)
 
 	for k := reflect.Kind(ti.elemkind); k == reflect.Ptr; k = rtelem.Kind() {
 		rtelem = rtelem.Elem()
@@ -2285,7 +2290,7 @@ func (d *decoderBincBytes) kMap(f *decFnInfo, rv reflect.Value) {
 	vtypePtr := vtypeKind == reflect.Ptr
 	ktypePtr := ktypeKind == reflect.Ptr
 
-	vTransient := decUseTransient && !vtypePtr && ti.tielem.flagCanTransient
+	vTransient := decUseTransient && !vtypePtr && ti.tielem.flagCanTransient && vtypeKind != reflect.Slice
 
 	kTransient := vTransient && !ktypePtr && ti.tikey.flagCanTransient
 
@@ -2846,11 +2851,11 @@ func (d *decoderBincBytes) interfaceExtConvertAndDecode(v interface{}, ext Inter
 }
 
 func (d *decoderBincBytes) fn(t reflect.Type) *decFnBincBytes {
-	return d.dh.decFnViaBH(t, d.rtidFn, d.h, d.fp, false)
+	return d.dh.decFnViaBH(t, d.rtidFn, d.h, d.fp, true)
 }
 
 func (d *decoderBincBytes) fnNoExt(t reflect.Type) *decFnBincBytes {
-	return d.dh.decFnViaBH(t, d.rtidFnNoExt, d.h, d.fp, true)
+	return d.dh.decFnViaBH(t, d.rtidFnNoExt, d.h, d.fp, false)
 }
 
 func (helperDecDriverBincBytes) newDecoderBytes(in []byte, h Handle) *decoderBincBytes {
@@ -3225,7 +3230,7 @@ func (e *bincEncDriverBytes) EncodeExt(v interface{}, basetype reflect.Type, xta
 	if ext == SelfExt {
 		bs0 = e.e.blist.get(1024)
 		bs = bs0
-		sideEncode(e.h, &e.h.sideEncPool, func(se encoderI) { oneOffEncode(se, v, &bs, basetype, true) })
+		sideEncode(e.h, &e.h.sideEncPool, func(se encoderI) { oneOffEncode(se, v, &bs, basetype, false) })
 	} else {
 		bs = ext.WriteExt(v)
 	}
@@ -3796,7 +3801,7 @@ func (d *bincDecDriverBytes) DecodeExt(rv interface{}, basetype reflect.Type, xt
 		return
 	}
 	if ext == SelfExt {
-		sideDecode(d.h, &d.h.sideDecPool, func(sd decoderI) { oneOffDecode(sd, rv, xbs, basetype, true) })
+		sideDecode(d.h, &d.h.sideDecPool, func(sd decoderI) { oneOffDecode(sd, rv, xbs, basetype, false) })
 	} else {
 		ext.ReadExt(rv, xbs)
 	}
@@ -4042,6 +4047,7 @@ func (d *bincEncDriverBytes) init(hh Handle, shared *encoderBase, enc encoderI) 
 	return
 }
 
+func (e *bincEncDriverBytes) NumBytesWritten() int    { return e.w.numWrite() }
 func (e *bincEncDriverBytes) writeBytesAsis(b []byte) { e.w.writeb(b) }
 
 func (e *bincEncDriverBytes) writerEnd() { e.w.end() }
@@ -4077,7 +4083,7 @@ func (d *bincDecDriverBytes) resetInBytes(in []byte) {
 }
 
 func (d *bincDecDriverBytes) resetInIO(r io.Reader) {
-	d.r.resetIO(r, d.h.ReaderBufferSize, d.h.MaxInitLen, &d.d.blist)
+	d.r.resetIO(r, d.h.ReaderBufferSize, d.h.maxBytes2Read(), &d.d.blist)
 }
 
 func (d *bincDecDriverBytes) descBd() string {
@@ -4989,6 +4995,10 @@ func (e *encoderBincIO) MustEncode(v interface{}) {
 	return
 }
 
+func (e *encoderBincIO) NumBytesWritten() int {
+	return e.e.NumBytesWritten()
+}
+
 func (e *encoderBincIO) mustEncode(v interface{}) {
 	halt.onerror(e.err)
 	if e.hh == nil {
@@ -5206,11 +5216,11 @@ func (e *encoderBincIO) rawBytes(vv Raw) {
 }
 
 func (e *encoderBincIO) fn(t reflect.Type) *encFnBincIO {
-	return e.dh.encFnViaBH(t, e.rtidFn, e.h, e.fp, false)
+	return e.dh.encFnViaBH(t, e.rtidFn, e.h, e.fp, true)
 }
 
 func (e *encoderBincIO) fnNoExt(t reflect.Type) *encFnBincIO {
-	return e.dh.encFnViaBH(t, e.rtidFnNoExt, e.h, e.fp, true)
+	return e.dh.encFnViaBH(t, e.rtidFnNoExt, e.h, e.fp, false)
 }
 
 func (e *encoderBincIO) mapStart(length int) {
@@ -5684,7 +5694,7 @@ func (d *decoderBincIO) kInterfaceNaked(f *decFnInfo) (rvn reflect.Value) {
 			} else {
 				rvn = reflect.New(bfn.rt)
 				if bfn.ext == SelfExt {
-					sideDecode(d.hh, &d.h.sideDecPool, func(sd decoderI) { oneOffDecode(sd, rv2i(rvn), bytes, bfn.rt, true) })
+					sideDecode(d.hh, &d.h.sideDecPool, func(sd decoderI) { oneOffDecode(sd, rv2i(rvn), bytes, bfn.rt, false) })
 				} else {
 					bfn.ext.ReadExt(rv2i(rvn), bytes)
 				}
@@ -6263,7 +6273,8 @@ func (d *decoderBincIO) kChan(f *decFnInfo, rv reflect.Value) {
 	}
 
 	rtelem := ti.elem
-	useTransient := decUseTransient && ti.elemkind != byte(reflect.Ptr) && ti.tielem.flagCanTransient
+	useTransient := decUseTransient && ti.tielem.flagCanTransient &&
+		ti.elemkind != byte(reflect.Slice) && ti.elemkind != byte(reflect.Ptr)
 
 	for k := reflect.Kind(ti.elemkind); k == reflect.Ptr; k = rtelem.Kind() {
 		rtelem = rtelem.Elem()
@@ -6354,7 +6365,7 @@ func (d *decoderBincIO) kMap(f *decFnInfo, rv reflect.Value) {
 	vtypePtr := vtypeKind == reflect.Ptr
 	ktypePtr := ktypeKind == reflect.Ptr
 
-	vTransient := decUseTransient && !vtypePtr && ti.tielem.flagCanTransient
+	vTransient := decUseTransient && !vtypePtr && ti.tielem.flagCanTransient && vtypeKind != reflect.Slice
 
 	kTransient := vTransient && !ktypePtr && ti.tikey.flagCanTransient
 
@@ -6915,11 +6926,11 @@ func (d *decoderBincIO) interfaceExtConvertAndDecode(v interface{}, ext Interfac
 }
 
 func (d *decoderBincIO) fn(t reflect.Type) *decFnBincIO {
-	return d.dh.decFnViaBH(t, d.rtidFn, d.h, d.fp, false)
+	return d.dh.decFnViaBH(t, d.rtidFn, d.h, d.fp, true)
 }
 
 func (d *decoderBincIO) fnNoExt(t reflect.Type) *decFnBincIO {
-	return d.dh.decFnViaBH(t, d.rtidFnNoExt, d.h, d.fp, true)
+	return d.dh.decFnViaBH(t, d.rtidFnNoExt, d.h, d.fp, false)
 }
 
 func (helperDecDriverBincIO) newDecoderBytes(in []byte, h Handle) *decoderBincIO {
@@ -7294,7 +7305,7 @@ func (e *bincEncDriverIO) EncodeExt(v interface{}, basetype reflect.Type, xtag u
 	if ext == SelfExt {
 		bs0 = e.e.blist.get(1024)
 		bs = bs0
-		sideEncode(e.h, &e.h.sideEncPool, func(se encoderI) { oneOffEncode(se, v, &bs, basetype, true) })
+		sideEncode(e.h, &e.h.sideEncPool, func(se encoderI) { oneOffEncode(se, v, &bs, basetype, false) })
 	} else {
 		bs = ext.WriteExt(v)
 	}
@@ -7865,7 +7876,7 @@ func (d *bincDecDriverIO) DecodeExt(rv interface{}, basetype reflect.Type, xtag 
 		return
 	}
 	if ext == SelfExt {
-		sideDecode(d.h, &d.h.sideDecPool, func(sd decoderI) { oneOffDecode(sd, rv, xbs, basetype, true) })
+		sideDecode(d.h, &d.h.sideDecPool, func(sd decoderI) { oneOffDecode(sd, rv, xbs, basetype, false) })
 	} else {
 		ext.ReadExt(rv, xbs)
 	}
@@ -8111,6 +8122,7 @@ func (d *bincEncDriverIO) init(hh Handle, shared *encoderBase, enc encoderI) (fp
 	return
 }
 
+func (e *bincEncDriverIO) NumBytesWritten() int    { return e.w.numWrite() }
 func (e *bincEncDriverIO) writeBytesAsis(b []byte) { e.w.writeb(b) }
 
 func (e *bincEncDriverIO) writerEnd() { e.w.end() }
@@ -8146,7 +8158,7 @@ func (d *bincDecDriverIO) resetInBytes(in []byte) {
 }
 
 func (d *bincDecDriverIO) resetInIO(r io.Reader) {
-	d.r.resetIO(r, d.h.ReaderBufferSize, d.h.MaxInitLen, &d.d.blist)
+	d.r.resetIO(r, d.h.ReaderBufferSize, d.h.maxBytes2Read(), &d.d.blist)
 }
 
 func (d *bincDecDriverIO) descBd() string {

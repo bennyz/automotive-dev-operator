@@ -30,10 +30,10 @@ type ImageReconciler struct {
 	Log    logr.Logger
 }
 
-// +kubebuilder:rbac:groups=automotive.sdv.cloud.redhat.com,resources=images,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=automotive.sdv.cloud.redhat.com,resources=images/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=automotive.sdv.cloud.redhat.com,resources=images/finalizers,verbs=update
-// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
+// +kubebuilder:rbac:groups=automotive.sdv.cloud.redhat.com,namespace=system,resources=images,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=automotive.sdv.cloud.redhat.com,namespace=system,resources=images/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=automotive.sdv.cloud.redhat.com,namespace=system,resources=images/finalizers,verbs=update
+// +kubebuilder:rbac:groups="",namespace=system,resources=secrets,verbs=get;list;watch
 
 // Reconcile Image
 func (r *ImageReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -67,7 +67,7 @@ func (r *ImageReconciler) handleInitialState(
 	if err := r.updateStatus(ctx, image, "Verifying", "Starting image location verification"); err != nil {
 		return ctrl.Result{RequeueAfter: time.Second * 5}, nil
 	}
-	return ctrl.Result{Requeue: true}, nil
+	return ctrl.Result{}, nil
 }
 
 func (r *ImageReconciler) handleVerifyingState(
@@ -109,7 +109,7 @@ func (r *ImageReconciler) handleAvailableState(
 		if err := r.updateStatus(ctx, image, "Verifying", "Re-verifying image location"); err != nil {
 			return ctrl.Result{RequeueAfter: time.Second * 5}, nil
 		}
-		return ctrl.Result{Requeue: true}, nil
+		return ctrl.Result{}, nil
 	}
 
 	// Already Available — only update LastVerified, and only if stale (>30 min)
@@ -131,7 +131,7 @@ func (r *ImageReconciler) handleUnavailableState(
 	if err := r.updateStatus(ctx, image, "Verifying", "Retrying image location verification"); err != nil {
 		return ctrl.Result{RequeueAfter: time.Second * 5}, nil
 	}
-	return ctrl.Result{Requeue: true}, nil
+	return ctrl.Result{}, nil
 }
 
 func (r *ImageReconciler) verifyImageLocation(ctx context.Context, image *automotivev1alpha1.Image) (bool, error) {

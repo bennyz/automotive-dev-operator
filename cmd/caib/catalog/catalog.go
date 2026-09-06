@@ -27,14 +27,15 @@ import (
 )
 
 const (
-	defaultNamespace = "default"
+	outputFormatTable = "table"
+	outputFormatJSON  = "json"
+	outputFormatYAML  = "yaml"
+	outputFormatYML   = "yml"
 )
 
 var (
-	serverURL    string
-	authToken    string
-	namespace    string
-	outputFormat string
+	serverURL string
+	authToken string
 )
 
 // NewCatalogCmd creates the catalog command with subcommands
@@ -60,8 +61,16 @@ func NewCatalogCmd() *cobra.Command {
 func addCommonFlags(cmd *cobra.Command) {
 	cmd.Flags().StringVar(&serverURL, "server", "", "REST API server base URL (env: CAIB_SERVER)")
 	cmd.Flags().StringVar(&authToken, "token", "", "Bearer token for authentication (env: CAIB_TOKEN)")
-	cmd.Flags().StringVarP(&namespace, "namespace", "n", "", "Kubernetes namespace")
-	cmd.Flags().StringVarP(&outputFormat, "output", "o", "table", "Output format (table, json, yaml)")
+}
+
+// getOutputFormat returns the output format from the root command's --output-format flag.
+func getOutputFormat(cmd *cobra.Command) string {
+	if cmd.Root() != nil {
+		if flag := cmd.Root().PersistentFlags().Lookup("output-format"); flag != nil {
+			return flag.Value.String()
+		}
+	}
+	return outputFormatTable
 }
 
 // getInsecureSkipTLS returns whether to skip TLS verification

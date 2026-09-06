@@ -24,6 +24,7 @@ import (
 	. "github.com/onsi/gomega"    //nolint:revive
 	"gopkg.in/yaml.v3"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 )
 
 func TestResources(t *testing.T) {
@@ -48,42 +49,15 @@ var _ = Describe("OperatorConfig Resources", func() {
 
 	Describe("buildBuildAPIDeployment", func() {
 		It("should use ado-operator service account", func() {
-			deployment := r.buildBuildAPIDeployment("test-namespace", false, defaultTestConfig())
-			Expect(deployment.Spec.Template.Spec.ServiceAccountName).To(Equal("ado-operator"))
-		})
-
-		It("should use ado-operator service account on OpenShift", func() {
-			deployment := r.buildBuildAPIDeployment("test-namespace", true, defaultTestConfig())
+			deployment := r.buildBuildAPIDeployment("test-namespace", defaultTestConfig())
 			Expect(deployment.Spec.Template.Spec.ServiceAccountName).To(Equal("ado-operator"))
 		})
 	})
 
 	Describe("buildBuildAPIContainers", func() {
-		It("should not include oauth-proxy on non-OpenShift", func() {
-			containers := r.buildBuildAPIContainers("test-namespace", false, defaultTestConfig())
-			Expect(containers).To(HaveLen(1))
-			Expect(containers[0].Name).To(Equal("build-api"))
-		})
-
-		It("should include oauth-proxy on OpenShift with ado-operator SA", func() {
-			containers := r.buildBuildAPIContainers("test-namespace", true, defaultTestConfig())
-			Expect(containers).To(HaveLen(2))
-
-			oauthProxy := containers[1]
-			Expect(oauthProxy.Name).To(Equal("oauth-proxy"))
-			Expect(oauthProxy.Args).To(ContainElement("--openshift-service-account=ado-operator"))
-		})
-
-		It("should not reference ado-controller-manager in oauth-proxy args", func() {
-			containers := r.buildBuildAPIContainers("test-namespace", true, defaultTestConfig())
-			for _, arg := range containers[1].Args {
-				Expect(arg).NotTo(ContainSubstring("controller-manager"))
-			}
-		})
-
 		It("should set BUILD_API_NAMESPACE environment variable to provided namespace", func() {
 			testNamespace := "custom-test-namespace"
-			containers := r.buildBuildAPIContainers(testNamespace, false, defaultTestConfig())
+			containers := r.buildBuildAPIContainers(testNamespace, defaultTestConfig())
 
 			buildAPIContainer := containers[0]
 			var foundBuildAPINamespace bool
@@ -99,7 +73,7 @@ var _ = Describe("OperatorConfig Resources", func() {
 		})
 
 		It("should have health check probes configured for build-api container", func() {
-			containers := r.buildBuildAPIContainers("test-namespace", false, defaultTestConfig())
+			containers := r.buildBuildAPIContainers("test-namespace", defaultTestConfig())
 			buildAPIContainer := containers[0]
 
 			// Check liveness probe
@@ -125,7 +99,7 @@ var _ = Describe("OperatorConfig Resources", func() {
 
 	Describe("targetDefaultsYAML", func() {
 		It("should be valid YAML", func() {
-			var parsed map[string]interface{}
+			var parsed map[string]any
 			err := yaml.Unmarshal([]byte(targetDefaultsYAML), &parsed)
 			Expect(err).NotTo(HaveOccurred(), "targetDefaultsYAML should be valid YAML")
 		})
@@ -159,6 +133,101 @@ var _ = Describe("OperatorConfig Resources", func() {
 				Expect(validArchitectures).To(HaveKey(t.Architecture),
 					"target %q has unexpected architecture %q", name, t.Architecture)
 			}
+		})
+	})
+
+	Describe("buildServiceMonitor", func() {
+		It("should have correct GVK for ServiceMonitor", func() {
+			config := &automotivev1alpha1.MonitoringConfig{Enabled: true}
+			sm := r.buildServiceMonitor("test-ns", config)
+			Expect(sm.GetKind()).To(Equal("ServiceMonitor"))
+			Expect(sm.GroupVersionKind().Group).To(Equal("monitoring.coreos.com"))
+			Expect(sm.GroupVersionKind().Version).To(Equal("v1"))
+		})
+
+		It("should select services with control-plane=operator label", func() {
+			config := &automotivev1alpha1.MonitoringConfig{Enabled: true}
+			sm := r.buildServiceMonitor("test-ns", config)
+			selector := sm.Object["spec"].(map[string]any)["selector"].(map[string]any)
+			matchLabels := selector["matchLabels"].(map[string]any)
+			Expect(matchLabels["control-plane"]).To(Equal("operator"))
+		})
+
+		It("should use bearerTokenSecret referencing the token secret", func() {
+			config := &automotivev1alpha1.MonitoringConfig{Enabled: true}
+			sm := r.buildServiceMonitor("test-ns", config)
+			endpoints := sm.Object["spec"].(map[string]any)["endpoints"].([]any)
+			ep := endpoints[0].(map[string]any)
+			tokenRef := ep["bearerTokenSecret"].(map[string]any)
+			Expect(tokenRef["name"]).To(Equal(serviceMonitorTokenSecret))
+			Expect(tokenRef["key"]).To(Equal("token"))
+		})
+
+		It("should use default interval when not specified", func() {
+			config := &automotivev1alpha1.MonitoringConfig{Enabled: true}
+			sm := r.buildServiceMonitor("test-ns", config)
+			endpoints := sm.Object["spec"].(map[string]any)["endpoints"].([]any)
+			ep := endpoints[0].(map[string]any)
+			Expect(ep["interval"]).To(Equal("30s"))
+		})
+
+		It("should use custom interval when specified", func() {
+			config := &automotivev1alpha1.MonitoringConfig{Enabled: true, Interval: "15s"}
+			sm := r.buildServiceMonitor("test-ns", config)
+			endpoints := sm.Object["spec"].(map[string]any)["endpoints"].([]any)
+			ep := endpoints[0].(map[string]any)
+			Expect(ep["interval"]).To(Equal("15s"))
+		})
+
+		It("should scrape /metrics on port https", func() {
+			config := &automotivev1alpha1.MonitoringConfig{Enabled: true}
+			sm := r.buildServiceMonitor("test-ns", config)
+			endpoints := sm.Object["spec"].(map[string]any)["endpoints"].([]any)
+			ep := endpoints[0].(map[string]any)
+			Expect(ep["path"]).To(Equal("/metrics"))
+			Expect(ep["port"]).To(Equal("https"))
+			Expect(ep["scheme"]).To(Equal("https"))
+		})
+	})
+
+	Describe("buildMetricsTokenSecret", func() {
+		It("should be a ServiceAccountToken type referencing ado-operator", func() {
+			secret := r.buildMetricsTokenSecret("test-ns")
+			Expect(secret.Type).To(Equal(corev1.SecretTypeServiceAccountToken))
+			Expect(secret.Annotations["kubernetes.io/service-account.name"]).To(Equal("ado-operator"))
+		})
+	})
+
+	Describe("buildMetricsReaderRoleBinding", func() {
+		It("should grant prometheus-user-workload SA from the correct namespace", func() {
+			binding := r.buildMetricsReaderRoleBinding("test-ns")
+			Expect(binding.Subjects).To(HaveLen(1))
+			Expect(binding.Subjects[0]).To(Equal(rbacv1.Subject{
+				Kind:      "ServiceAccount",
+				Name:      "prometheus-user-workload",
+				Namespace: "openshift-user-workload-monitoring",
+			}))
+		})
+	})
+
+	Describe("buildMetricsReaderClusterRoleBinding", func() {
+		It("should reference metrics-reader ClusterRole and ado-operator SA", func() {
+			binding := r.buildMetricsReaderClusterRoleBinding("test-ns")
+			Expect(binding.RoleRef.Name).To(Equal("metrics-reader"))
+			Expect(binding.RoleRef.Kind).To(Equal("ClusterRole"))
+			Expect(binding.Subjects).To(HaveLen(1))
+			Expect(binding.Subjects[0].Name).To(Equal("ado-operator"))
+			Expect(binding.Subjects[0].Namespace).To(Equal("test-ns"))
+		})
+	})
+
+	Describe("buildMetricsReaderRole", func() {
+		It("should scope secret access to only the metrics token secret", func() {
+			role := r.buildMetricsReaderRole("test-ns")
+			Expect(role.Rules).To(HaveLen(1))
+			Expect(role.Rules[0].Resources).To(Equal([]string{"secrets"}))
+			Expect(role.Rules[0].ResourceNames).To(Equal([]string{serviceMonitorTokenSecret}))
+			Expect(role.Rules[0].Verbs).To(Equal([]string{"get"}))
 		})
 	})
 

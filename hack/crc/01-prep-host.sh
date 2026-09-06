@@ -22,6 +22,7 @@ set -euo pipefail
 CRC_PRESET="openshift"          # [ openshift | microshift | okd ]
 CRC_VERSION="${CRC_VERSION:-2.58.0}"
 CRC_BASE_URL="https://mirror.openshift.com/pub/openshift-v4/clients/crc/${CRC_VERSION}"
+CRC_API_URL="https://api.crc.testing:6443"
 TELEMETRY="no"
 PULL_SECRET="${PULL_SECRET:-${1:-pull-secret.txt}}"
 CRC_CUSTOM_ARGS="${CRC_CUSTOM_ARGS:---cpus 4 --memory 12288 --disk-size 50}"
@@ -371,6 +372,6 @@ echo "  Useful commands:"
 echo "    crc console                # open the web console URL"
 echo "    crc console --credentials  # show kubeadmin password"
 echo "    eval \$(crc oc-env)         # configure oc CLI"
-echo "    oc login -u kubeadmin -p \$(crc console --credentials | grep kubeadmin | awk -F\"'\" '{print \$2}') https://api.crc.testing:6443"
+echo "    oc login -u kubeadmin -p \$(crc console --credentials | grep kubeadmin | awk -F\"'\" '{print \$2}') $CRC_API_URL"
 echo ""
 line

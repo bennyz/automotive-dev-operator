@@ -4,6 +4,8 @@ package main
 import (
 	"fmt"
 	"os"
+
+	caibcommon "github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/common"
 )
 
 const (
@@ -15,7 +17,7 @@ var (
 	serverURL              string
 	manifest               string
 	buildName              string
-	showOutputFormat       string
+	outputFormat           string
 	distro                 string
 	target                 string
 	architecture           string
@@ -27,8 +29,11 @@ var (
 	timeout                int
 	waitForBuild           bool
 	customDefs             []string
+	defineFiles            []string
 	aibExtraArgs           []string
+	rootPassword           string
 	extraRepos             []string
+	localRepo              string
 	workspaceName          string
 	followLogs             bool
 	version                string
@@ -53,11 +58,36 @@ var (
 	leaseDuration     string
 	leaseName         string
 	flashCmdOverride  string
+	leaseTags         []string
 
 	// Internal registry options
 	useInternalRegistry       bool
 	internalRegistryImageName string
 	internalRegistryTag       string
+
+	// Secure build
+	secureBuild bool
+
+	// Reproducible build
+	reproducibleBuild bool
+	taskBundleRef     string
+	restoreSourcesRef string
+
+	// Build TTL
+	buildTTL string
+
+	// Output options
+	quiet bool
+
+	// S3 upload options
+	s3Bucket            string
+	s3Prefix            string
+	s3Region            string
+	s3Endpoint          string
+	s3AccessKeyID       string
+	s3SecretAccessKey   string
+	s3CredentialsSecret string
+	s3Insecure          bool
 
 	// TLS options
 	insecureSkipTLS bool
@@ -77,7 +107,7 @@ var (
 func main() {
 	rootCmd := newRootCmd()
 	if err := rootCmd.Execute(); err != nil {
-		fmt.Println(err)
+		fmt.Fprintln(os.Stderr, caibcommon.FormatError(err))
 		os.Exit(1)
 	}
 }

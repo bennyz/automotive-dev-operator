@@ -31,7 +31,7 @@ import (
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -45,9 +45,6 @@ import (
 )
 
 const (
-	// OperatorNamespace is the namespace where the operator is deployed.
-	OperatorNamespace = "automotive-dev-operator-system"
-
 	phasePending   = "Pending"
 	phaseRunning   = "Running"
 	phaseCompleted = "Completed"
@@ -59,15 +56,16 @@ type Reconciler struct {
 	client.Client
 	Scheme   *runtime.Scheme
 	Log      logr.Logger
-	Recorder record.EventRecorder
+	Recorder events.EventRecorder
 }
 
-// +kubebuilder:rbac:groups=automotive.sdv.cloud.redhat.com,resources=imagereseals,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=automotive.sdv.cloud.redhat.com,resources=imagereseals/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=automotive.sdv.cloud.redhat.com,resources=imagereseals/finalizers,verbs=update
-// +kubebuilder:rbac:groups=tekton.dev,resources=tasks;taskruns;pipelineruns,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
-// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+// +kubebuilder:rbac:groups=automotive.sdv.cloud.redhat.com,namespace=system,resources=imagereseals,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=automotive.sdv.cloud.redhat.com,namespace=system,resources=imagereseals/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=automotive.sdv.cloud.redhat.com,namespace=system,resources=imagereseals/finalizers,verbs=update
+// +kubebuilder:rbac:groups=tekton.dev,namespace=system,resources=tasks;taskruns;pipelineruns,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",namespace=system,resources=secrets,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",namespace=system,resources=events,verbs=create;patch
+// +kubebuilder:rbac:groups=events.k8s.io,namespace=system,resources=events,verbs=create;patch
 
 // Reconcile handles reconciliation of ImageReseal resources.
 func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -353,6 +351,11 @@ func (r *Reconciler) createSealedTaskRun(ctx context.Context, sealed *automotive
 		signedRef = sealed.Spec.SignedRef
 	}
 
+	operatorConfig := &automotivev1alpha1.OperatorConfig{}
+	if err := r.Get(ctx, client.ObjectKey{Name: "config", Namespace: controllerutils.OperatorNamespace()}, operatorConfig); err != nil {
+		return nil, fmt.Errorf("failed to fetch OperatorConfig: %w", err)
+	}
+
 	params := []tektonv1.Param{
 		{Name: "input-ref", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: sealed.Spec.InputRef}},
 		{Name: "output-ref", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: sealed.Spec.OutputRef}},
@@ -360,12 +363,14 @@ func (r *Reconciler) createSealedTaskRun(ctx context.Context, sealed *automotive
 		{Name: "aib-image", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: sealed.Spec.GetAIBImage()}},
 		{Name: "builder-image", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: sealed.Spec.BuilderImage}},
 		{Name: "architecture", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: sealed.Spec.Architecture}},
+		{Name: "insecure-registry", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: fmt.Sprintf("%t", operatorConfig.Spec.OSBuilds != nil && operatorConfig.Spec.OSBuilds.InsecureRegistry)}},
 	}
 
 	trSpec := tektonv1.TaskRunSpec{
-		TaskRef:    &tektonv1.TaskRef{Name: tasks.SealedTaskName(operation)},
-		Params:     params,
-		Workspaces: workspaces,
+		TaskRef:            &tektonv1.TaskRef{Name: tasks.SealedTaskName(operation)},
+		Params:             params,
+		Workspaces:         workspaces,
+		ServiceAccountName: automotivev1alpha1.BuildServiceAccountName,
 	}
 	if nodeArch := archToNodeArch(sealed.Spec.Architecture); nodeArch != "" {
 		trSpec.PodTemplate = &pod.Template{
@@ -382,7 +387,7 @@ func (r *Reconciler) createSealedTaskRun(ctx context.Context, sealed *automotive
 				"automotive.sdv.cloud.redhat.com/imagereseal": sealed.Name,
 			},
 			OwnerReferences: []metav1.OwnerReference{
-				{APIVersion: automotivev1alpha1.GroupVersion.String(), Kind: "ImageReseal", Name: sealed.Name, UID: sealed.UID, Controller: ptr(true)},
+				{APIVersion: automotivev1alpha1.GroupVersion.String(), Kind: "ImageReseal", Name: sealed.Name, UID: sealed.UID, Controller: new(true)},
 			},
 		},
 		Spec: trSpec,
@@ -435,6 +440,12 @@ func (r *Reconciler) createSealedPipelineRun(ctx context.Context, sealed *automo
 		pipelineWorkspaceRefs = append(pipelineWorkspaceRefs, tektonv1.WorkspacePipelineTaskBinding{Name: "sealing-key-password", Workspace: "sealing-key-password"})
 	}
 
+	operatorConfig := &automotivev1alpha1.OperatorConfig{}
+	if err := r.Get(ctx, client.ObjectKey{Name: "config", Namespace: controllerutils.OperatorNamespace()}, operatorConfig); err != nil {
+		return nil, fmt.Errorf("failed to fetch OperatorConfig: %w", err)
+	}
+	insecureRegistry := fmt.Sprintf("%t", operatorConfig.Spec.OSBuilds != nil && operatorConfig.Spec.OSBuilds.InsecureRegistry)
+
 	pipelineTasks := make([]tektonv1.PipelineTask, 0, len(stages))
 	for i, op := range stages {
 		pt := tektonv1.PipelineTask{
@@ -465,6 +476,7 @@ func (r *Reconciler) createSealedPipelineRun(ctx context.Context, sealed *automo
 			{Name: "aib-image", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: sealed.Spec.GetAIBImage()}},
 			{Name: "builder-image", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: sealed.Spec.BuilderImage}},
 			{Name: "architecture", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: sealed.Spec.Architecture}},
+			{Name: "insecure-registry", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: insecureRegistry}},
 		}
 		pt.Workspaces = pipelineWorkspaceRefs
 		pipelineTasks = append(pipelineTasks, pt)
@@ -502,7 +514,7 @@ func (r *Reconciler) createSealedPipelineRun(ctx context.Context, sealed *automo
 				"automotive.sdv.cloud.redhat.com/imagereseal": sealed.Name,
 			},
 			OwnerReferences: []metav1.OwnerReference{
-				{APIVersion: automotivev1alpha1.GroupVersion.String(), Kind: "ImageReseal", Name: sealed.Name, UID: sealed.UID, Controller: ptr(true)},
+				{APIVersion: automotivev1alpha1.GroupVersion.String(), Kind: "ImageReseal", Name: sealed.Name, UID: sealed.UID, Controller: new(true)},
 			},
 		},
 		Spec: prSpec,
@@ -514,15 +526,13 @@ func (r *Reconciler) createSealedPipelineRun(ctx context.Context, sealed *automo
 }
 
 // archToNodeArch maps ImageReseal.Spec.Architecture to Kubernetes node label (kubernetes.io/arch).
+// Returns empty string for unrecognized architectures so callers can skip node selection.
 func archToNodeArch(arch string) string {
-	switch strings.ToLower(strings.TrimSpace(arch)) {
-	case "amd64", "x86_64":
-		return "amd64"
-	case "arm64", "aarch64":
-		return "arm64"
-	default:
+	normalized := controllerutils.NormalizeArchToK8s(arch)
+	if normalized == arch && normalized != "amd64" && normalized != "arm64" {
 		return ""
 	}
+	return normalized
 }
 
 // validateStages checks that every entry in stages is a known sealed operation.
@@ -684,12 +694,12 @@ func eventTypeForResealPhase(phase string) string {
 func (r *Reconciler) emitEventf(
 	sealed *automotivev1alpha1.ImageReseal,
 	eventType, reason, messageFmt string,
-	args ...interface{},
+	args ...any,
 ) {
 	if r.Recorder == nil || sealed == nil {
 		return
 	}
-	r.Recorder.Eventf(sealed, eventType, reason, messageFmt, args...)
+	r.Recorder.Eventf(sealed, nil, eventType, reason, reason, messageFmt, args...)
 }
 
 // transientLabel is the label used to mark secrets that were created by the API server
@@ -733,7 +743,7 @@ func (r *Reconciler) isTransientSecret(ctx context.Context, namespace, name stri
 
 func (r *Reconciler) resolveBuildConfig(ctx context.Context) (*tasks.BuildConfig, error) {
 	operatorConfig := &automotivev1alpha1.OperatorConfig{}
-	if err := r.Get(ctx, client.ObjectKey{Name: "config", Namespace: OperatorNamespace}, operatorConfig); err != nil {
+	if err := r.Get(ctx, client.ObjectKey{Name: "config", Namespace: controllerutils.OperatorNamespace()}, operatorConfig); err != nil {
 		if k8serrors.IsNotFound(err) {
 			return &tasks.BuildConfig{}, nil
 		}
@@ -768,10 +778,6 @@ func (r *Reconciler) deleteSecret(ctx context.Context, namespace, secretName, se
 	}
 	log.Error(err, "Failed to delete "+secretType+" secret (will retry)", "secret", secretName)
 	return err
-}
-
-func ptr(b bool) *bool {
-	return &b
 }
 
 // detectImageArch inspects a container image and returns its architecture (e.g. "amd64", "arm64").

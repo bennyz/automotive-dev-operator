@@ -40,7 +40,7 @@ Examples:
 What this script does:
 1. Validates the version format
 2. Creates release-X.Y.x branch from main
-3. Updates the Makefile VERSION
+3. Updates the VERSION file
 4. Creates an initial commit
 5. Pushes the branch to origin
 6. Creates a git tag for the version
@@ -65,7 +65,7 @@ if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
 fi
 
 # Parse version components
-IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION"
+IFS='.' read -r MAJOR MINOR _PATCH <<< "$VERSION"
 RELEASE_BRANCH="release-${MAJOR}.${MINOR}.x"
 
 log_info "Creating release branch for version $VERSION"
@@ -84,10 +84,10 @@ if ! git rev-parse --verify main > /dev/null 2>&1; then
     exit 1
 fi
 
-# Check for uncommitted changes
-if [[ -n $(git status --porcelain) ]]; then
+# Check for uncommitted changes (ignore untracked files)
+if [[ -n $(git status --porcelain -uno) ]]; then
     log_error "Uncommitted changes found. Please commit or stash them first."
-    git status --short
+    git status --short -uno
     exit 1
 fi
 
@@ -133,28 +133,22 @@ fi
 log_info "Creating release branch: $RELEASE_BRANCH"
 git checkout -b "$RELEASE_BRANCH"
 
-# Update VERSION in Makefile
-log_info "Updating VERSION in Makefile to $VERSION"
-if [[ "$OSTYPE" == "darwin"* ]]; then
-    # macOS sed syntax
-    sed -i '' "s/^VERSION ?= .*/VERSION ?= $VERSION/" Makefile
-else
-    # Linux sed syntax
-    sed -i "s/^VERSION ?= .*/VERSION ?= $VERSION/" Makefile
-fi
+# Update VERSION file
+log_info "Updating VERSION file to $VERSION"
+echo "$VERSION" > VERSION
 
 # Verify the change
-if ! grep -q "VERSION ?= $VERSION" Makefile; then
-    log_error "Failed to update VERSION in Makefile"
+if [[ "$(cat VERSION)" != "$VERSION" ]]; then
+    log_error "Failed to update VERSION file"
     exit 1
 fi
 
 # Commit the version update
 log_info "Committing version update..."
-git add Makefile
+git add VERSION
 git commit -m "Release $VERSION
 
-- Update VERSION in Makefile to $VERSION
+- Update VERSION file to $VERSION
 - Prepare for $VERSION release"
 
 # Create and push the branch
@@ -174,7 +168,7 @@ echo "1. The GitHub Actions will now build and release v$VERSION"
 echo "2. Monitor the release workflow: https://github.com/$(git config remote.origin.url | sed 's/.*github.com[:/]\([^.]*\).*/\1/')/actions"
 echo "3. For patch releases (${MAJOR}.${MINOR}.X+1):"
 echo "   - Cherry-pick fixes to $RELEASE_BRANCH"
-echo "   - Update VERSION in Makefile"
+echo "   - Update VERSION file"
 echo "   - Tag the new patch version"
 echo ""
 echo "Current branch: $RELEASE_BRANCH"

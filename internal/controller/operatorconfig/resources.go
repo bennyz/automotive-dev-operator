@@ -2,7 +2,6 @@ package operatorconfig
 
 import (
 	"crypto/rand"
-	"encoding/base64"
 	"fmt"
 	"os"
 	"time"
@@ -16,6 +15,8 @@ import (
 	networkingv1 "k8s.io/api/networking/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
 )
@@ -26,6 +27,10 @@ const (
 	sccPrivilegedRoleName       = "ado-build-privileged"
 	workspaceServiceAccountName = "ado-workspace"
 	workspaceSCCName            = "ado-workspace-scc"
+	serviceMonitorName          = "ado-operator-metrics"
+	serviceMonitorTokenSecret   = "ado-operator-metrics-token"
+	metricsReaderRoleName       = "ado-metrics-reader"
+	metricsReaderBindingName    = "ado-metrics-reader"
 )
 
 // getOperatorImage returns the operator image from env var, then config, then default constant
@@ -36,8 +41,7 @@ func getOperatorImage(images *automotivev1alpha1.ImagesConfig) string {
 	return images.GetOperatorImage()
 }
 
-// buildBuildAPIContainers builds the container list for build-API deployment, conditionally including oauth-proxy
-func (r *OperatorConfigReconciler) buildBuildAPIContainers(namespace string, isOpenShift bool, config *automotivev1alpha1.OperatorConfig) []corev1.Container {
+func (r *OperatorConfigReconciler) buildBuildAPIContainers(namespace string, config *automotivev1alpha1.OperatorConfig) []corev1.Container {
 	buildAPIEnv := []corev1.EnvVar{
 		{
 			Name:  "BUILD_API_NAMESPACE",
@@ -134,66 +138,15 @@ func (r *OperatorConfigReconciler) buildBuildAPIContainers(namespace string, isO
 			},
 			// No volume mounts needed - Build API reads directly from OperatorConfig CRD
 			SecurityContext: &corev1.SecurityContext{
-				AllowPrivilegeEscalation: ptr.To(false),
+				AllowPrivilegeEscalation: new(false),
 			},
 		},
-	}
-
-	// Only add oauth-proxy on OpenShift
-	if isOpenShift {
-		containers = append(containers, corev1.Container{
-			Name:  "oauth-proxy",
-			Image: images.GetOAuthProxyImage(),
-			Args: []string{
-				"--provider=openshift",
-				"--https-address=",
-				"--http-address=:8081",
-				"--upstream=http://localhost:8080",
-				"--openshift-service-account=ado-operator",
-				"--cookie-secret=$(COOKIE_SECRET)",
-				"--cookie-secure=false",
-				"--pass-access-token=true",
-				"--pass-user-bearer-token=true",
-				"--pass-user-headers=true",
-				"--request-logging=true",
-				"--skip-auth-regex=^/healthz",
-				"--skip-auth-regex=^/v1/",
-				"--skip-auth-regex=/v1/",
-				"--email-domain=*",
-				"--skip-provider-button=true",
-				"--upstream-timeout=0",
-			},
-			Env: []corev1.EnvVar{
-				{
-					Name: "COOKIE_SECRET",
-					ValueFrom: &corev1.EnvVarSource{
-						SecretKeyRef: &corev1.SecretKeySelector{
-							LocalObjectReference: corev1.LocalObjectReference{
-								Name: "ado-build-api-oauth-proxy",
-							},
-							Key: "cookie-secret",
-						},
-					},
-				},
-			},
-			Ports: []corev1.ContainerPort{
-				{
-					Name:          "proxy-http",
-					ContainerPort: 8081,
-					Protocol:      corev1.ProtocolTCP,
-				},
-			},
-			Resources: resourcesCfg.GetOAuthProxyResources(),
-			SecurityContext: &corev1.SecurityContext{
-				AllowPrivilegeEscalation: ptr.To(false),
-			},
-		})
 	}
 
 	return containers
 }
 
-func (r *OperatorConfigReconciler) buildBuildAPIDeployment(namespace string, isOpenShift bool, config *automotivev1alpha1.OperatorConfig) *appsv1.Deployment {
+func (r *OperatorConfigReconciler) buildBuildAPIDeployment(namespace string, config *automotivev1alpha1.OperatorConfig) *appsv1.Deployment {
 	return &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "ado-build-api",
@@ -221,27 +174,7 @@ func (r *OperatorConfigReconciler) buildBuildAPIDeployment(namespace string, isO
 				},
 				Spec: corev1.PodSpec{
 					ServiceAccountName: "ado-operator",
-					InitContainers: []corev1.Container{
-						{
-							Name:    "init-secrets",
-							Image:   getOperatorImage(config.Spec.GetImages()),
-							Command: []string{"/init-secrets"},
-							Env: []corev1.EnvVar{
-								{
-									Name: "POD_NAMESPACE",
-									ValueFrom: &corev1.EnvVarSource{
-										FieldRef: &corev1.ObjectFieldSelector{
-											FieldPath: "metadata.namespace",
-										},
-									},
-								},
-							},
-							SecurityContext: &corev1.SecurityContext{
-								AllowPrivilegeEscalation: ptr.To(false),
-							},
-						},
-					},
-					Containers: r.buildBuildAPIContainers(namespace, isOpenShift, config),
+					Containers:         r.buildBuildAPIContainers(namespace, config),
 					// No volumes needed - Build API reads directly from OperatorConfig CRD
 				},
 			},
@@ -249,7 +182,7 @@ func (r *OperatorConfigReconciler) buildBuildAPIDeployment(namespace string, isO
 	}
 }
 
-func (r *OperatorConfigReconciler) buildBuildAPIService(namespace string, isOpenShift bool) *corev1.Service {
+func (r *OperatorConfigReconciler) buildBuildAPIService(namespace string) *corev1.Service {
 	// Always expose port 8080 (direct access to build-api)
 	ports := []corev1.ServicePort{
 		{
@@ -258,16 +191,6 @@ func (r *OperatorConfigReconciler) buildBuildAPIService(namespace string, isOpen
 			TargetPort: intstr.FromInt(8080),
 			Protocol:   corev1.ProtocolTCP,
 		},
-	}
-
-	// On OpenShift, also expose port 8081 (oauth-proxy)
-	if isOpenShift {
-		ports = append(ports, corev1.ServicePort{
-			Name:       "proxy",
-			Port:       8081,
-			TargetPort: intstr.FromInt(8081),
-			Protocol:   corev1.ProtocolTCP,
-		})
 	}
 
 	return &corev1.Service{
@@ -387,31 +310,6 @@ func (r *OperatorConfigReconciler) buildBuildAPIIngress(namespace string) *netwo
 	}
 }
 
-func (r *OperatorConfigReconciler) buildOAuthSecret(name, namespace string) *corev1.Secret {
-	// Generate a random 32-byte cookie secret for AES-256
-	cookieSecret := make([]byte, 32)
-	if _, err := rand.Read(cookieSecret); err != nil {
-		// Fallback to a static secret if random generation fails
-		// This should never happen in practice
-		cookieSecret = []byte("fallback-secret-change-me-32bit")
-	}
-
-	return &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: namespace,
-			Labels: map[string]string{
-				"app.kubernetes.io/name":    "automotive-dev-operator",
-				"app.kubernetes.io/part-of": "automotive-dev-operator",
-			},
-		},
-		Type: corev1.SecretTypeOpaque,
-		Data: map[string][]byte{
-			"cookie-secret": []byte(base64.StdEncoding.EncodeToString(cookieSecret)[:32]),
-		},
-	}
-}
-
 func (r *OperatorConfigReconciler) buildInternalJWTSecret(name, namespace string) (*corev1.Secret, error) {
 	signingKey, err := generateRandomToken(32)
 	if err != nil {
@@ -497,7 +395,7 @@ func (r *OperatorConfigReconciler) buildBuildControllerDeployment(namespace stri
 				Spec: corev1.PodSpec{
 					ServiceAccountName: buildControllerName,
 					SecurityContext: &corev1.PodSecurityContext{
-						RunAsNonRoot: ptr.To(true),
+						RunAsNonRoot: new(true),
 					},
 					Containers: []corev1.Container{
 						{
@@ -560,7 +458,7 @@ func (r *OperatorConfigReconciler) buildBuildControllerDeployment(namespace stri
 								return resourcesCfg.GetBuildControllerResources()
 							}(),
 							SecurityContext: &corev1.SecurityContext{
-								AllowPrivilegeEscalation: ptr.To(false),
+								AllowPrivilegeEscalation: new(false),
 								Capabilities: &corev1.Capabilities{
 									Drop: []corev1.Capability{"ALL"},
 								},
@@ -986,7 +884,7 @@ func (r *OperatorConfigReconciler) buildWorkspaceSCC() *securityv1.SecurityConte
 		AllowHostNetwork:         false,
 		AllowHostPID:             false,
 		AllowHostPorts:           false,
-		AllowPrivilegeEscalation: ptr.To(true),
+		AllowPrivilegeEscalation: new(true),
 		AllowPrivilegedContainer: false,
 		AllowedCapabilities:      []corev1.Capability{"SETUID", "SETGID", "SYS_ADMIN", "DAC_OVERRIDE", "CHOWN", "FOWNER"},
 		FSGroup: securityv1.FSGroupStrategyOptions{
@@ -1038,7 +936,7 @@ func (r *OperatorConfigReconciler) buildWorkspaceSCCPrivileged() *securityv1.Sec
 		AllowHostNetwork:         false,
 		AllowHostPID:             false,
 		AllowHostPorts:           false,
-		AllowPrivilegeEscalation: ptr.To(true),
+		AllowPrivilegeEscalation: new(true),
 		AllowPrivilegedContainer: true,
 		AllowedCapabilities:      []corev1.Capability{"*"},
 		FSGroup: securityv1.FSGroupStrategyOptions{
@@ -1061,4 +959,119 @@ func (r *OperatorConfigReconciler) buildWorkspaceSCCPrivileged() *securityv1.Sec
 			securityv1.FSTypeAll,
 		},
 	}
+}
+
+func (r *OperatorConfigReconciler) buildMetricsTokenSecret(namespace string) *corev1.Secret {
+	return &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      serviceMonitorTokenSecret,
+			Namespace: namespace,
+			Annotations: map[string]string{
+				"kubernetes.io/service-account.name": "ado-operator",
+			},
+		},
+		Type: corev1.SecretTypeServiceAccountToken,
+	}
+}
+
+func (r *OperatorConfigReconciler) buildMetricsReaderRole(namespace string) *rbacv1.Role {
+	return &rbacv1.Role{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      metricsReaderRoleName,
+			Namespace: namespace,
+		},
+		Rules: []rbacv1.PolicyRule{
+			{
+				APIGroups:     []string{""},
+				Resources:     []string{"secrets"},
+				ResourceNames: []string{serviceMonitorTokenSecret},
+				Verbs:         []string{"get"},
+			},
+		},
+	}
+}
+
+func (r *OperatorConfigReconciler) buildMetricsReaderRoleBinding(namespace string) *rbacv1.RoleBinding {
+	return &rbacv1.RoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      metricsReaderRoleName,
+			Namespace: namespace,
+		},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: rbacv1.GroupName,
+			Kind:     "Role",
+			Name:     metricsReaderRoleName,
+		},
+		Subjects: []rbacv1.Subject{
+			{
+				Kind:      "ServiceAccount",
+				Name:      "prometheus-user-workload",
+				Namespace: "openshift-user-workload-monitoring",
+			},
+		},
+	}
+}
+
+func (r *OperatorConfigReconciler) buildMetricsReaderClusterRoleBinding(namespace string) *rbacv1.ClusterRoleBinding {
+	return &rbacv1.ClusterRoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: metricsReaderBindingName,
+		},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: rbacv1.GroupName,
+			Kind:     "ClusterRole",
+			Name:     "metrics-reader",
+		},
+		Subjects: []rbacv1.Subject{
+			{
+				Kind:      "ServiceAccount",
+				Name:      "ado-operator",
+				Namespace: namespace,
+			},
+		},
+	}
+}
+
+func (r *OperatorConfigReconciler) buildServiceMonitor(namespace string, config *automotivev1alpha1.MonitoringConfig) *unstructured.Unstructured {
+	interval := config.GetInterval()
+
+	sm := &unstructured.Unstructured{}
+	sm.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "monitoring.coreos.com",
+		Version: "v1",
+		Kind:    "ServiceMonitor",
+	})
+	sm.SetName(serviceMonitorName)
+	sm.SetNamespace(namespace)
+	sm.SetLabels(map[string]string{
+		"control-plane":                "operator",
+		"app.kubernetes.io/name":       "automotive-dev-operator",
+		"app.kubernetes.io/managed-by": "operator",
+		"app.kubernetes.io/component":  "monitoring",
+	})
+
+	sm.Object["spec"] = map[string]any{
+		"selector": map[string]any{
+			"matchLabels": map[string]any{
+				"control-plane": "operator",
+			},
+		},
+		"endpoints": []any{
+			map[string]any{
+				"path":     "/metrics",
+				"port":     "https",
+				"scheme":   "https",
+				"interval": interval,
+				"bearerTokenSecret": map[string]any{
+					"name": serviceMonitorTokenSecret,
+					"key":  "token",
+				},
+				"tlsConfig": map[string]any{
+					"insecureSkipVerify": true,
+				},
+			},
+		},
+	}
+
+	return sm
 }

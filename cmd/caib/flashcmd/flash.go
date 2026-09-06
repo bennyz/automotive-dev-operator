@@ -13,11 +13,13 @@ import (
 	"strings"
 	"time"
 
-	common "github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/common"
+	"github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/clilog"
+	caibcommon "github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/common"
 	"github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/logstream"
 	"github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/registryauth"
 	buildapitypes "github.com/centos-automotive-suite/automotive-dev-operator/internal/buildapi"
 	buildapiclient "github.com/centos-automotive-suite/automotive-dev-operator/internal/buildapi/client"
+	"github.com/centos-automotive-suite/automotive-dev-operator/internal/common/oci"
 	"github.com/spf13/cobra"
 )
 
@@ -40,12 +42,14 @@ type Options struct {
 	LeaseDuration     *string
 	LeaseName         *string
 	FlashCmd          *string
+	LeaseTags         *[]string
 	WaitForBuild      *bool
 	FollowLogs        *bool
 	InsecureSkipTLS   *bool
 	RegistryAuthFile  *string
 
-	HandleError func(error)
+	HandleError      func(error)
+	AnnotationReader func(imageRef string) (map[string]string, error)
 }
 
 // Handler implements flash-related Cobra run functions.
@@ -63,8 +67,32 @@ func (h *Handler) handleError(err error) {
 		h.opts.HandleError(err)
 		return
 	}
-	fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+	fmt.Fprintln(os.Stderr, caibcommon.FormatError(err))
 	os.Exit(1)
+}
+
+func (h *Handler) resolveTargetFromAnnotations(imageRef string) string {
+	var annotations map[string]string
+	var err error
+
+	if h.opts.AnnotationReader != nil {
+		annotations, err = h.opts.AnnotationReader(imageRef)
+	} else {
+		insecure := h.opts.InsecureSkipTLS != nil && *h.opts.InsecureSkipTLS
+		authFile := ""
+		if h.opts.RegistryAuthFile != nil {
+			authFile = *h.opts.RegistryAuthFile
+		}
+		sysCtx := caibcommon.NewRegistrySystemContext(imageRef, insecure, authFile)
+		annotations, _, err = caibcommon.ReadManifestAnnotations(imageRef, sysCtx)
+	}
+
+	if err != nil {
+		clilog.Warnf("Could not read image manifest for target auto-detection: %v\n", err)
+		return ""
+	}
+
+	return annotations[oci.Get().AnnotationKey("target")]
 }
 
 func (h *Handler) applyWaitFollowDefaults(cmd *cobra.Command, defaultWait, defaultFollow bool) {
@@ -81,7 +109,7 @@ func (h *Handler) RunFlash(cmd *cobra.Command, args []string) {
 	h.applyWaitFollowDefaults(cmd, true, false)
 
 	ctx := context.Background()
-	imageRef := args[0]
+	arg := args[0]
 	server := strings.TrimSpace(*h.opts.ServerURL)
 
 	if server == "" {
@@ -89,18 +117,60 @@ func (h *Handler) RunFlash(cmd *cobra.Command, args []string) {
 		return
 	}
 
-	// Resolve Jumpstarter client config (explicit path or auto-detect)
-	clientInfo, err := common.ResolveJumpstarterClient(strings.TrimSpace(*h.opts.JumpstarterClient))
+	api, err := caibcommon.CreateBuildAPIClient(server, h.opts.AuthToken, *h.opts.InsecureSkipTLS)
 	if err != nil {
 		h.handleError(err)
 		return
 	}
-	fmt.Printf("Using Jumpstarter client %q (endpoint: %s)\n", clientInfo.Name, clientInfo.Endpoint)
 
-	// Validate that either target or exporter is specified.
-	if strings.TrimSpace(*h.opts.Target) == "" && strings.TrimSpace(*h.opts.ExporterSelector) == "" {
-		h.handleError(fmt.Errorf("either --target or --exporter is required"))
+	req := buildapitypes.FlashRequest{
+		Name:             *h.opts.FlashName,
+		Target:           *h.opts.Target,
+		ExporterSelector: *h.opts.ExporterSelector,
+		LeaseName:        *h.opts.LeaseName,
+		FlashCmd:         *h.opts.FlashCmd,
+	}
+
+	imageRef := arg
+	if isCatalogName(arg) {
+		req.CatalogImage = arg
+		img, getErr := api.GetCatalogImage(ctx, arg)
+		if getErr != nil {
+			h.handleError(getErr)
+			return
+		}
+		if img.Phase != "Available" {
+			h.handleError(fmt.Errorf("catalog image %q is not Available (phase: %s)", arg, img.Phase))
+			return
+		}
+		if img.RegistryURL == "" {
+			h.handleError(fmt.Errorf("catalog image %q has no registry URL", arg))
+			return
+		}
+		imageRef = buildapitypes.PinFlashDigest(img.RegistryURL, img.Digest)
+		clilog.Infof("Using catalog image %s (%s)\n", arg, imageRef)
+	} else {
+		req.ImageRef = arg
+	}
+
+	// Resolve Jumpstarter client config (explicit path or auto-detect)
+	clientInfo, err := caibcommon.ResolveJumpstarterClient(strings.TrimSpace(*h.opts.JumpstarterClient))
+	if err != nil {
+		h.handleError(err)
 		return
+	}
+	clilog.Infof("Using Jumpstarter client %q (endpoint: %s)\n", clientInfo.Name, clientInfo.Endpoint)
+
+	// Auto-detect target from OCI annotations if neither --target nor --exporter specified.
+	if strings.TrimSpace(*h.opts.Target) == "" && strings.TrimSpace(*h.opts.ExporterSelector) == "" {
+		if detected := h.resolveTargetFromAnnotations(imageRef); detected != "" {
+			*h.opts.Target = detected
+			req.Target = detected
+			clilog.Infof("Auto-detected target from image annotations: %s\n", detected)
+		} else {
+			h.handleError(fmt.Errorf("either --target or --exporter is required (target auto-detection from image annotations failed or annotation not present)"))
+			return
+		}
 	}
 
 	// Validate mutual exclusivity of --lease and --lease-duration
@@ -109,23 +179,16 @@ func (h *Handler) RunFlash(cmd *cobra.Command, args []string) {
 		return
 	}
 
-	api, err := common.CreateBuildAPIClient(server, h.opts.AuthToken, *h.opts.InsecureSkipTLS)
+	clientConfigB64 := base64.StdEncoding.EncodeToString(clientInfo.Data)
+
+	leaseTags, err := caibcommon.ValidateAndJoinLeaseTags(h.opts.LeaseTags)
 	if err != nil {
 		h.handleError(err)
 		return
 	}
 
-	clientConfigB64 := base64.StdEncoding.EncodeToString(clientInfo.Data)
-
-	req := buildapitypes.FlashRequest{
-		Name:             *h.opts.FlashName,
-		ImageRef:         imageRef,
-		Target:           *h.opts.Target,
-		ExporterSelector: *h.opts.ExporterSelector,
-		ClientConfig:     clientConfigB64,
-		LeaseName:        *h.opts.LeaseName,
-		FlashCmd:         *h.opts.FlashCmd,
-	}
+	req.ClientConfig = clientConfigB64
+	req.LeaseTags = leaseTags
 	if req.LeaseName == "" {
 		req.LeaseDuration = *h.opts.LeaseDuration
 	}
@@ -150,11 +213,19 @@ func (h *Handler) RunFlash(cmd *cobra.Command, args []string) {
 		h.handleError(err)
 		return
 	}
-	fmt.Printf("Flash job %s accepted: %s - %s\n", resp.Name, resp.Phase, resp.Message)
+	clilog.Infof("Flash job %s accepted: %s - %s\n", resp.Name, resp.Phase, resp.Message)
 
 	if *h.opts.WaitForBuild || *h.opts.FollowLogs {
 		h.waitForFlashCompletion(ctx, api, resp.Name)
 	}
+}
+
+// isCatalogName reports whether ref is a CatalogImage name rather than an OCI
+// image reference. Kubernetes object names are RFC 1123 labels and cannot
+// contain "/", while registry refs always include at least one "/" (e.g.
+// quay.io/org/image:tag or localhost/image@sha256:...).
+func isCatalogName(ref string) bool {
+	return !strings.Contains(ref, "/")
 }
 
 // parseLeaseDuration converts HH:MM:SS format to time.Duration.
@@ -185,7 +256,7 @@ func parseLeaseDuration(duration string) (time.Duration, error) {
 
 // waitForFlashCompletion waits for a flash job to complete, optionally streaming logs.
 func (h *Handler) waitForFlashCompletion(ctx context.Context, _ *buildapiclient.Client, name string) {
-	fmt.Println("Waiting for flash to complete...")
+	clilog.Infoln("Waiting for flash to complete...")
 
 	var timeoutDuration time.Duration
 	if *h.opts.LeaseName != "" {
@@ -228,25 +299,30 @@ func (h *Handler) waitForFlashCompletion(ctx context.Context, _ *buildapiclient.
 		case <-ticker.C:
 			reqCtx, cancelReq := context.WithTimeout(timeoutCtx, 2*time.Minute)
 			var st *buildapitypes.FlashResponse
-			err := common.ExecuteWithReauth(*h.opts.ServerURL, h.opts.AuthToken, *h.opts.InsecureSkipTLS, func(api *buildapiclient.Client) error {
+			err := caibcommon.ExecuteWithReauth(*h.opts.ServerURL, h.opts.AuthToken, *h.opts.InsecureSkipTLS, func(api *buildapiclient.Client) error {
 				var getErr error
 				st, getErr = api.GetFlash(reqCtx, name)
 				return getErr
 			})
 			cancelReq()
 			if err != nil {
-				fmt.Printf("status check failed: %v\n", err)
+				fmt.Fprintf(os.Stderr, "status check failed: %v\n", err)
 				continue
 			}
 
 			if !streamState.Active && (st.Phase != lastPhase || st.Message != lastMessage) {
-				fmt.Printf("status: %s - %s\n", st.Phase, st.Message)
+				clilog.Infof("status: %s - %s\n", st.Phase, st.Message)
 				lastPhase = st.Phase
 				lastMessage = st.Message
 			}
 
 			if st.Phase == phaseCompleted {
-				fmt.Println("Flash completed successfully!")
+				if st.LeaseID != "" {
+					clilog.Infof("Flash completed successfully! Lease: %s\n", st.LeaseID)
+					clilog.Infof("Connect with: jmp shell --lease %s\n", st.LeaseID)
+				} else {
+					clilog.Infoln("Flash completed successfully!")
+				}
 				return
 			}
 			if st.Phase == phaseFailed {
@@ -261,7 +337,7 @@ func (h *Handler) waitForFlashCompletion(ctx context.Context, _ *buildapiclient.
 			if st.Phase == phasePending {
 				streamState.Reset()
 				if !pendingWarningShown {
-					fmt.Println("Waiting for flash to start before streaming logs...")
+					clilog.Infoln("Waiting for flash to start before streaming logs...")
 					pendingWarningShown = true
 				}
 				continue
@@ -269,7 +345,7 @@ func (h *Handler) waitForFlashCompletion(ctx context.Context, _ *buildapiclient.
 
 			if st.Phase == phaseRunning {
 				if streamState.RetryCount == 0 {
-					fmt.Println("Flash is running. Attempting to stream logs...")
+					clilog.Infoln("Flash is running. Attempting to stream logs...")
 					pendingWarningShown = false
 				}
 				if err := h.tryFlashLogStreaming(timeoutCtx, logClient, name, streamState); err != nil {
@@ -298,14 +374,14 @@ func (h *Handler) tryFlashLogStreaming(ctx context.Context, logClient *http.Clie
 	if err != nil {
 		return fmt.Errorf("log request failed: %w", err)
 	}
+	defer func() {
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to close response body: %v\n", closeErr)
+		}
+	}()
 
 	if resp.StatusCode == http.StatusOK {
-		defer func() {
-			if closeErr := resp.Body.Close(); closeErr != nil {
-				fmt.Fprintf(os.Stderr, "Warning: failed to close response body: %v\n", closeErr)
-			}
-		}()
-		return logstream.StreamLogsToStdout(resp.Body, state, false)
+		return logstream.StreamLogs(logstream.LogWriter(), resp.Body, state, false)
 	}
 	return logstream.HandleLogStreamError(resp, state, maxLogRetries)
 }

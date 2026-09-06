@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"os"
 
+	"github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/clilog"
 	"github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/config"
 	"github.com/spf13/cobra"
 )
@@ -67,14 +68,9 @@ func runVerify(cmd *cobra.Command, args []string) error {
 		token = os.Getenv("CAIB_TOKEN")
 	}
 
-	ns := namespace
-	if ns == "" {
-		ns = defaultNamespace
-	}
+	clilog.Infof("Verifying catalog image %q...\n", name)
 
-	fmt.Printf("Verifying catalog image %q...\n", name)
-
-	reqURL := fmt.Sprintf("%s/v1/catalog/images/%s/verify?namespace=%s", server, name, ns)
+	reqURL := fmt.Sprintf("%s/v1/catalog/images/%s/verify", server, name)
 	req, err := http.NewRequest(http.MethodPost, reqURL, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
@@ -96,7 +92,7 @@ func runVerify(cmd *cobra.Command, args []string) error {
 	}()
 
 	if resp.StatusCode == http.StatusNotFound {
-		return fmt.Errorf("catalog image %q not found in namespace %q", name, ns)
+		return fmt.Errorf("catalog image %q not found", name)
 	}
 
 	body, _ := io.ReadAll(resp.Body)
@@ -111,14 +107,14 @@ func runVerify(cmd *cobra.Command, args []string) error {
 	}
 
 	if result.Triggered {
-		fmt.Println("✓ Verification triggered successfully")
+		clilog.Infoln("✓ Verification triggered successfully")
 	} else {
-		fmt.Printf("Note: %s\n", result.Message)
+		clilog.Infof("Note: %s\n", result.Message)
 	}
 
 	// Optionally get updated status
 	if verifyWait {
-		getURL := fmt.Sprintf("%s/v1/catalog/images/%s?namespace=%s", server, name, ns)
+		getURL := fmt.Sprintf("%s/v1/catalog/images/%s", server, name)
 		getReq, _ := http.NewRequest(http.MethodGet, getURL, nil)
 		if token != "" {
 			getReq.Header.Set("Authorization", "Bearer "+token)
@@ -134,16 +130,16 @@ func runVerify(cmd *cobra.Command, args []string) error {
 				getBody, _ := io.ReadAll(getResp.Body)
 				var img CatalogImageResponse
 				if json.Unmarshal(getBody, &img) == nil {
-					fmt.Println()
-					fmt.Printf("Registry URL:  %s\n", img.RegistryURL)
-					fmt.Printf("Status:        %s\n", img.Phase)
+					clilog.Infoln()
+					clilog.Infof("Registry URL:  %s\n", img.RegistryURL)
+					clilog.Infof("Status:        %s\n", img.Phase)
 					if img.SizeBytes > 0 {
 						sizeMB := float64(img.SizeBytes) / (1024 * 1024)
 						sizeGB := float64(img.SizeBytes) / (1024 * 1024 * 1024)
 						if sizeGB >= 1 {
-							fmt.Printf("Size:          %.1f GB\n", sizeGB)
+							clilog.Infof("Size:          %.1f GB\n", sizeGB)
 						} else {
-							fmt.Printf("Size:          %.1f MB\n", sizeMB)
+							clilog.Infof("Size:          %.1f MB\n", sizeMB)
 						}
 					}
 				}

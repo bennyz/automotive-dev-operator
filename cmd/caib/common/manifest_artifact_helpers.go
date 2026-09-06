@@ -5,109 +5,273 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 
 	"gopkg.in/yaml.v3"
 )
 
-// FindLocalFileReferences extracts manifest add_files source_path references.
-func FindLocalFileReferences(manifestContent string) ([]map[string]string, error) {
-	var manifestData map[string]any
-	var localFiles []map[string]string
-
-	if err := yaml.Unmarshal([]byte(manifestContent), &manifestData); err != nil {
-		return nil, fmt.Errorf("failed to parse manifest YAML: %w", err)
+// ManifestTarget extracts the top-level "target" field from a manifest YAML.
+// Returns empty string if the field is absent, blank, or the YAML is invalid.
+func ManifestTarget(manifest []byte) string {
+	var m struct {
+		Target string `yaml:"target"`
 	}
-
-	isPathSafe := func(path string) error {
-		if path == "" || path == "/" {
-			return fmt.Errorf("empty or root path is not allowed")
-		}
-
-		if filepath.IsAbs(path) {
-			safeDirectories := configuredSafeDirectories()
-			if len(safeDirectories) > 0 {
-				cleanedPath := filepath.Clean(path)
-				isInSafeDir := false
-				for _, dir := range safeDirectories {
-					if dir == "" {
-						continue
-					}
-					cleanedDir := filepath.Clean(dir)
-					if cleanedPath == cleanedDir ||
-						strings.HasPrefix(cleanedPath, cleanedDir+string(os.PathSeparator)) {
-						isInSafeDir = true
-						break
-					}
-				}
-				if !isInSafeDir {
-					return fmt.Errorf(
-						"absolute path outside configured safe directories: %s (set CAIB_SAFE_DIRECTORIES)",
-						path,
-					)
-				}
-			}
-		}
-		return nil
+	if err := yaml.Unmarshal(manifest, &m); err != nil {
+		return ""
 	}
-
-	processAddFiles := func(addFiles []any) error {
-		for _, file := range addFiles {
-			if fileMap, ok := file.(map[string]any); ok {
-				path, hasPath := fileMap["path"].(string)
-				sourcePath, hasSourcePath := fileMap["source_path"].(string)
-				if hasPath && hasSourcePath {
-					if err := isPathSafe(sourcePath); err != nil {
-						return err
-					}
-					localFiles = append(localFiles, map[string]string{
-						"path":        path,
-						"source_path": sourcePath,
-					})
-				}
-			}
-		}
-		return nil
-	}
-
-	if content, ok := manifestData["content"].(map[string]any); ok {
-		if addFiles, ok := content["add_files"].([]any); ok {
-			if err := processAddFiles(addFiles); err != nil {
-				return nil, err
-			}
-		}
-	}
-	if qm, ok := manifestData["qm"].(map[string]any); ok {
-		if qmContent, ok := qm["content"].(map[string]any); ok {
-			if addFiles, ok := qmContent["add_files"].([]any); ok {
-				if err := processAddFiles(addFiles); err != nil {
-					return nil, err
-				}
-			}
-		}
-	}
-
-	return localFiles, nil
+	return strings.TrimSpace(m.Target)
 }
 
-func configuredSafeDirectories() []string {
-	raw := strings.TrimSpace(os.Getenv("CAIB_SAFE_DIRECTORIES"))
-	if raw == "" {
-		// Default policy: allow absolute paths when no safe directories are configured.
+// PrepareLocalFileUploads resolves local add_files sources relative to the
+// manifest directory and returns upload references and a manifest with matching
+// destinations. Cluster workspace sources are deferred when requested.
+func PrepareLocalFileUploads(manifestContent, manifestDir string, excludeClusterWorkspace bool) (string, []map[string]string, error) {
+	var manifestData map[string]any
+	if err := yaml.Unmarshal([]byte(manifestContent), &manifestData); err != nil {
+		return "", nil, fmt.Errorf("failed to parse manifest YAML: %w", err)
+	}
+	manifestDir, err := filepath.Abs(manifestDir)
+	if err != nil {
+		return "", nil, fmt.Errorf("resolve manifest directory: %w", err)
+	}
+
+	var localFiles []map[string]string
+	sources := make(map[string]string)
+	addFile := func(source string) error {
+		dest := localUploadDestination(source)
+		if dest == "" {
+			return fmt.Errorf("invalid upload source path: %q", source)
+		}
+		if !filepath.IsAbs(source) {
+			source = filepath.Join(manifestDir, source)
+		}
+		if previous, ok := sources[dest]; ok {
+			if previous != source {
+				return fmt.Errorf("local files %q and %q have the same upload destination %q", previous, source, dest)
+			}
+			return nil
+		}
+		sources[dest] = source
+		localFiles = append(localFiles, map[string]string{"source_path": source, "dest": dest})
 		return nil
 	}
 
-	parts := strings.Split(raw, string(os.PathListSeparator))
-	dirs := make([]string, 0, len(parts))
-	for _, part := range parts {
-		part = strings.TrimSpace(part)
-		if part == "" {
+	content, _ := manifestData["content"].(map[string]any)
+	qm, _ := manifestData["qm"].(map[string]any)
+	qmContent, _ := qm["content"].(map[string]any)
+	changed := false
+	for _, section := range []map[string]any{content, qmContent} {
+		files, _ := section["add_files"].([]any)
+		rewritten, err := collectAddFileRefs(files, manifestDir, excludeClusterWorkspace, addFile)
+		if err != nil {
+			return "", nil, err
+		}
+		changed = changed || rewritten
+	}
+	if !changed {
+		return manifestContent, localFiles, nil
+	}
+	out, err := yaml.Marshal(manifestData)
+	if err != nil {
+		return "", nil, fmt.Errorf("rewrite manifest for local uploads: %w", err)
+	}
+	return string(out), localFiles, nil
+}
+
+func collectAddFileRefs(addFiles []any, manifestDir string, excludeClusterWorkspace bool, addFile func(string) error) (bool, error) {
+	changed := false
+	for _, file := range addFiles {
+		entry, ok := file.(map[string]any)
+		if !ok || entry["text"] != nil || entry["url"] != nil {
 			continue
 		}
-		dirs = append(dirs, filepath.Clean(part))
+		key := "source_glob"
+		source, ok := entry[key].(string)
+		if !ok {
+			if _, hasPath := entry["path"].(string); !hasPath {
+				continue
+			}
+			key = "source_path"
+			source, ok = entry[key].(string)
+			if !ok {
+				key = "source"
+				source, ok = entry[key].(string)
+			}
+		}
+		if !ok || (excludeClusterWorkspace && isClusterWorkspacePath(source)) {
+			continue
+		}
+
+		matches := []string{source}
+		if key == "source_glob" {
+			var err error
+			matches, err = expandSourceGlob(source, manifestDir)
+			if err != nil {
+				return false, err
+			}
+		}
+		for _, match := range matches {
+			if err := addFile(match); err != nil {
+				return false, err
+			}
+		}
+		if source != "" {
+			if dest := localUploadDestination(source); dest != source {
+				entry[key] = dest
+				changed = true
+			}
+		}
 	}
-	return dirs
+	return changed, nil
+}
+
+func localUploadDestination(source string) string {
+	// Match the upload API's rooted path cleaning before find_manifest.sh adds
+	// /manifest-work/. Cleaning after that prefix would escape the staged files.
+	return strings.TrimPrefix(path.Clean("/"+filepath.ToSlash(source)), "/")
+}
+
+func isClusterWorkspacePath(p string) bool {
+	p = strings.TrimSpace(p)
+	if !strings.HasPrefix(p, "/") {
+		return false
+	}
+	cleaned := path.Clean(p)
+	return cleaned == "/workspace" || strings.HasPrefix(cleaned, "/workspace/")
+}
+
+// expandSourceGlob expands a glob pattern relative to manifestDir and returns
+// the matched file paths (relative to manifestDir if the pattern was relative).
+// Supports ** for recursive directory matching (e.g. "dir/**/*.yaml").
+func expandSourceGlob(pattern string, manifestDir string) ([]string, error) {
+	isAbs := filepath.IsAbs(pattern)
+
+	// Resolve the glob pattern relative to the manifest directory
+	var fullPattern string
+	if isAbs {
+		fullPattern = pattern
+	} else {
+		fullPattern = filepath.Join(manifestDir, pattern)
+	}
+
+	// Use recursive walk for ** patterns since filepath.Glob doesn't support **
+	var matches []string
+	if strings.Contains(fullPattern, "**") {
+		var err error
+		matches, err = expandDoubleStarGlob(fullPattern)
+		if err != nil {
+			return nil, fmt.Errorf("error expanding glob %q: %w", pattern, err)
+		}
+	} else {
+		var err error
+		matches, err = filepath.Glob(fullPattern)
+		if err != nil {
+			return nil, fmt.Errorf("invalid glob pattern %q: %w", pattern, err)
+		}
+		// filepath.Glob can return directories; filter to files only
+		matches = filterFiles(matches)
+	}
+
+	// Convert matches to the appropriate path form
+	var files []string
+	for _, m := range matches {
+		if isAbs {
+			files = append(files, m)
+		} else {
+			rel, err := filepath.Rel(manifestDir, m)
+			if err != nil {
+				return nil, fmt.Errorf("error computing relative path for %s: %w", m, err)
+			}
+			files = append(files, rel)
+		}
+	}
+
+	return files, nil
+}
+
+// filterFiles returns only regular files from a list of paths.
+func filterFiles(paths []string) []string {
+	files := make([]string, 0, len(paths))
+	for _, p := range paths {
+		info, err := os.Stat(p)
+		if err != nil || info.IsDir() {
+			continue
+		}
+		files = append(files, p)
+	}
+	return files
+}
+
+// expandDoubleStarGlob handles glob patterns containing ** by walking the
+// directory tree. It splits the pattern at the first ** segment, walks the
+// base directory recursively, and matches remaining segments against each path.
+// If the prefix before ** contains wildcards, those are expanded first.
+func expandDoubleStarGlob(pattern string) ([]string, error) {
+	// e.g. "/tmp/dir/files/**/*.yaml" -> basePattern="/tmp/dir/files", tail="*.yaml"
+	parts := strings.SplitN(pattern, "**", 2)
+	basePattern := strings.TrimRight(parts[0], string(filepath.Separator))
+	if basePattern == "" {
+		basePattern = "."
+	}
+	tail := ""
+	if len(parts) > 1 {
+		tail = strings.TrimPrefix(parts[1], string(filepath.Separator))
+	}
+
+	// Expand the base if it contains wildcards (e.g. "images/*/**/*.rpm")
+	var bases []string
+	if strings.ContainsAny(basePattern, "*?[") {
+		expanded, err := filepath.Glob(basePattern)
+		if err != nil {
+			return nil, fmt.Errorf("invalid base pattern %q: %w", basePattern, err)
+		}
+		for _, b := range expanded {
+			info, statErr := os.Stat(b)
+			if statErr == nil && info.IsDir() {
+				bases = append(bases, b)
+			}
+		}
+	} else {
+		bases = []string{filepath.Clean(basePattern)}
+	}
+
+	var matches []string
+	for _, base := range bases {
+		err := filepath.WalkDir(base, func(path string, d os.DirEntry, err error) error {
+			if err != nil || d.IsDir() {
+				return nil
+			}
+
+			if tail == "" {
+				matches = append(matches, path)
+				return nil
+			}
+
+			rel, relErr := filepath.Rel(base, path)
+			if relErr != nil {
+				return nil
+			}
+
+			// Try matching tail against every suffix of the relative path so that
+			// patterns like **/deep/nested/*.yaml match a/b/deep/nested/f.yaml.
+			segments := strings.Split(rel, string(filepath.Separator))
+			for i := range segments {
+				suffix := filepath.Join(segments[i:]...)
+				if matched, _ := filepath.Match(tail, suffix); matched {
+					matches = append(matches, path)
+					return nil
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return matches, nil
 }
 
 // compressionExtension returns the filename extension for a compression algorithm.
@@ -117,8 +281,6 @@ func compressionExtension(algo string) string {
 		return ".tar.gz"
 	case "gzip":
 		return ".gz"
-	case "lz4":
-		return ".lz4"
 	case "xz":
 		return ".xz"
 	default:
@@ -131,7 +293,6 @@ func hasCompressionExtension(filename string) bool {
 	lower := strings.ToLower(filename)
 	return strings.HasSuffix(lower, ".tar.gz") ||
 		strings.HasSuffix(lower, ".gz") ||
-		strings.HasSuffix(lower, ".lz4") ||
 		strings.HasSuffix(lower, ".xz")
 }
 
@@ -158,9 +319,6 @@ func detectFileCompression(filePath string) string {
 			return "tar.gz"
 		}
 		return "gzip"
-	}
-	if n >= 4 && header[0] == 0x04 && header[1] == 0x22 && header[2] == 0x4d && header[3] == 0x18 {
-		return "lz4"
 	}
 	if n >= 6 && header[0] == 0xfd && header[1] == 0x37 && header[2] == 0x7a &&
 		header[3] == 0x58 && header[4] == 0x5a && header[5] == 0x00 {

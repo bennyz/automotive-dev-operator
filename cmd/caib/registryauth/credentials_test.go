@@ -6,15 +6,18 @@ import (
 	"testing"
 )
 
-const authTypeDockerConfig = "docker-config"
+const (
+	authTypeDockerConfig = "docker-config"
+	testRegistryQuayIO   = "quay.io"
+)
 
 func TestExtractRegistryCredentials_FromPrimaryRefAndEnv(t *testing.T) {
 	t.Setenv("REGISTRY_USERNAME", "user1")
 	t.Setenv("REGISTRY_PASSWORD", "pass1")
 
-	gotURL, gotUser, gotPass := ExtractRegistryCredentials("quay.io/org/image:latest", "")
-	if gotURL != "quay.io" {
-		t.Fatalf("registry URL = %q, want %q", gotURL, "quay.io")
+	gotURL, gotUser, gotPass := ExtractRegistryCredentials(testRegistryQuayIO+"/org/image:latest", "")
+	if gotURL != testRegistryQuayIO {
+		t.Fatalf("registry URL = %q, want %q", gotURL, testRegistryQuayIO)
 	}
 	if gotUser != "user1" || gotPass != "pass1" {
 		t.Fatalf("unexpected credentials: user=%q pass=%q", gotUser, gotPass)
@@ -49,11 +52,11 @@ func TestValidateRegistryCredentials_PartialCredentialsError(t *testing.T) {
 		pass    string
 		wantErr bool
 	}{
-		{name: "both set", url: "quay.io", user: "u", pass: "p", wantErr: false},
-		{name: "neither set", url: "quay.io", user: "", pass: "", wantErr: false},
+		{name: "both set", url: testRegistryQuayIO, user: "u", pass: "p", wantErr: false},
+		{name: "neither set", url: testRegistryQuayIO, user: "", pass: "", wantErr: false},
 		{name: "no registry URL", url: "", user: "u", pass: "", wantErr: false},
-		{name: "username only", url: "quay.io", user: "u", pass: "", wantErr: true},
-		{name: "password only", url: "quay.io", user: "", pass: "p", wantErr: true},
+		{name: "username only", url: testRegistryQuayIO, user: "u", pass: "", wantErr: true},
+		{name: "password only", url: testRegistryQuayIO, user: "", pass: "p", wantErr: true},
 	}
 
 	for _, tt := range tests {
@@ -74,10 +77,10 @@ func TestResolveRegistryCredentials_ExplicitAuthFileOverridesEnv(t *testing.T) {
 	tmpDir := t.TempDir()
 	authFile := filepath.Join(tmpDir, "auth.json")
 	writeAuthFile(t, authFile, map[string]map[string]string{
-		"quay.io": {"auth": "from-file-token"},
+		testRegistryQuayIO: {"auth": "from-file-token"},
 	})
 
-	creds, err := ResolveRegistryCredentials("quay.io", "env-user", "env-pass", authFile)
+	creds, err := ResolveRegistryCredentials(testRegistryQuayIO, "env-user", "env-pass", authFile)
 	if err != nil {
 		t.Fatalf("ResolveRegistryCredentials() error = %v", err)
 	}
@@ -100,7 +103,7 @@ func TestResolveRegistryCredentials_ExplicitAuthFileWithEmptyRegistryURL(t *test
 	tmpDir := t.TempDir()
 	authFile := filepath.Join(tmpDir, "auth.json")
 	writeAuthFile(t, authFile, map[string]map[string]string{
-		"quay.io": {"auth": "from-file-token"},
+		testRegistryQuayIO: {"auth": "from-file-token"},
 	})
 
 	creds, err := ResolveRegistryCredentials("", "", "", authFile)
@@ -122,7 +125,7 @@ func TestResolveRegistryCredentials_ExplicitAuthFileWithEmptyRegistryURL(t *test
 }
 
 func TestResolveRegistryCredentials_UsesEnvCredentialsWhenNoAuthFile(t *testing.T) {
-	creds, err := ResolveRegistryCredentials("quay.io", "env-user", "env-pass", "")
+	creds, err := ResolveRegistryCredentials(testRegistryQuayIO, "env-user", "env-pass", "")
 	if err != nil {
 		t.Fatalf("ResolveRegistryCredentials() error = %v", err)
 	}
@@ -164,8 +167,84 @@ func TestResolveRegistryCredentials_AutoDiscoversAuthJSONFallback(t *testing.T) 
 	}
 }
 
+func TestExtractRegistryCredentials_FallsBackToRegistryURLEnv(t *testing.T) {
+	t.Setenv("REGISTRY_URL", testRegistryQuayIO)
+	t.Setenv("REGISTRY_USERNAME", "user1")
+	t.Setenv("REGISTRY_PASSWORD", "pass1")
+
+	gotURL, gotUser, gotPass := ExtractRegistryCredentials("", "")
+	if gotURL != testRegistryQuayIO {
+		t.Fatalf("registry URL = %q, want %q", gotURL, testRegistryQuayIO)
+	}
+	if gotUser != "user1" || gotPass != "pass1" {
+		t.Fatalf("unexpected credentials: user=%q pass=%q", gotUser, gotPass)
+	}
+}
+
+func TestExtractRegistryCredentials_RefTakesPrecedenceOverRegistryURLEnv(t *testing.T) {
+	t.Setenv("REGISTRY_URL", "should-not-use.io")
+	t.Setenv("REGISTRY_USERNAME", "user1")
+	t.Setenv("REGISTRY_PASSWORD", "pass1")
+
+	gotURL, _, _ := ExtractRegistryCredentials(testRegistryQuayIO+"/org/image:latest", "")
+	if gotURL != testRegistryQuayIO {
+		t.Fatalf("registry URL = %q, want %q (ref should take precedence)", gotURL, testRegistryQuayIO)
+	}
+}
+
+func TestExtractRegistryCredentials_EmptyRefsAndNoEnvReturnsEmpty(t *testing.T) {
+	t.Setenv("REGISTRY_URL", "")
+	t.Setenv("REGISTRY_USERNAME", "")
+	t.Setenv("REGISTRY_PASSWORD", "")
+
+	gotURL, gotUser, gotPass := ExtractRegistryCredentials("", "")
+	if gotURL != "" {
+		t.Fatalf("registry URL = %q, want empty", gotURL)
+	}
+	if gotUser != "" || gotPass != "" {
+		t.Fatalf("expected empty credentials, got user=%q pass=%q", gotUser, gotPass)
+	}
+}
+
+func TestResolveRegistryCredentials_RegistryURLEnvWithUsernamePassword(t *testing.T) {
+	t.Setenv("REGISTRY_AUTH_FILE", "")
+	t.Setenv("XDG_RUNTIME_DIR", "")
+	t.Setenv("HOME", t.TempDir())
+
+	creds, err := ResolveRegistryCredentials(testRegistryQuayIO, "myuser", "mypass", "")
+	if err != nil {
+		t.Fatalf("ResolveRegistryCredentials() error = %v", err)
+	}
+	if creds == nil {
+		t.Fatal("expected non-nil credentials")
+	}
+	if creds.AuthType != "username-password" {
+		t.Fatalf("authType = %q, want username-password", creds.AuthType)
+	}
+	if creds.RegistryURL != testRegistryQuayIO {
+		t.Fatalf("registryURL = %q, want %s", creds.RegistryURL, testRegistryQuayIO)
+	}
+	if creds.Username != "myuser" || creds.Password != "mypass" {
+		t.Fatalf("unexpected creds: user=%q pass=%q", creds.Username, creds.Password)
+	}
+}
+
+func TestResolveRegistryCredentials_WarnsWhenCredsSetButNoURL(t *testing.T) {
+	t.Setenv("REGISTRY_AUTH_FILE", "")
+	t.Setenv("XDG_RUNTIME_DIR", "")
+	t.Setenv("HOME", t.TempDir())
+
+	creds, err := ResolveRegistryCredentials("", "myuser", "mypass", "")
+	if err != nil {
+		t.Fatalf("ResolveRegistryCredentials() error = %v", err)
+	}
+	if creds != nil {
+		t.Fatalf("expected nil credentials when no registry URL, got %+v", creds)
+	}
+}
+
 func TestResolveRegistryCredentials_PartialCredentialsValidation(t *testing.T) {
-	_, err := ResolveRegistryCredentials("quay.io", "user-only", "", "")
+	_, err := ResolveRegistryCredentials(testRegistryQuayIO, "user-only", "", "")
 	if err == nil {
 		t.Fatal("expected validation error for partial credentials")
 	}

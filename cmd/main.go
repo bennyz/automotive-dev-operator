@@ -18,6 +18,7 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"flag"
 	"fmt"
@@ -29,8 +30,10 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
@@ -43,12 +46,14 @@ import (
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 
 	automotivev1alpha1 "github.com/centos-automotive-suite/automotive-dev-operator/api/v1alpha1"
+	"github.com/centos-automotive-suite/automotive-dev-operator/internal/common/telemetry"
 	"github.com/centos-automotive-suite/automotive-dev-operator/internal/controller/catalogimage"
 	"github.com/centos-automotive-suite/automotive-dev-operator/internal/controller/containerbuild"
 	"github.com/centos-automotive-suite/automotive-dev-operator/internal/controller/image"
 	"github.com/centos-automotive-suite/automotive-dev-operator/internal/controller/imagebuild"
 	"github.com/centos-automotive-suite/automotive-dev-operator/internal/controller/imagereseal"
 	"github.com/centos-automotive-suite/automotive-dev-operator/internal/controller/operatorconfig"
+	"github.com/centos-automotive-suite/automotive-dev-operator/internal/controller/scheduledimagebuild"
 	"github.com/centos-automotive-suite/automotive-dev-operator/internal/controller/workspace"
 	// +kubebuilder:scaffold:imports
 )
@@ -58,6 +63,20 @@ const (
 	modePlatform = "platform"
 	modeBuild    = "build"
 )
+
+type catalogPublisherAdapter struct {
+	publisher *catalogimage.Publisher
+}
+
+func (a *catalogPublisherAdapter) PublishFromImageBuild(
+	ctx context.Context,
+	imageBuild *automotivev1alpha1.ImageBuild,
+	catalogName string,
+	tags []string,
+	authSecretRef *automotivev1alpha1.AuthSecretReference,
+) (*catalogimage.PublishResult, error) {
+	return a.publisher.PublishFromImageBuild(ctx, imageBuild, catalogName, tags, authSecretRef, catalogimage.PublishSourceScheduled)
+}
 
 var (
 	scheme   = runtime.NewScheme()
@@ -100,7 +119,7 @@ func main() {
 			"'build' runs only ImageBuild/Image/CatalogImage/ContainerBuild controllers, "+
 			"'all' runs all controllers.")
 	opts := zap.Options{
-		Development: true,
+		Development: false,
 	}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -200,6 +219,23 @@ func main() {
 	// client-go defaults (QPS=5, Burst=10).
 	restConfig.QPS = 20
 	restConfig.Burst = 30
+
+	shutdownTracing := func(context.Context) error { return nil }
+	tracingEnabled, tracingEndpoint, tracingSamplingRatio, tracingInsecure := readTracingConfig(restConfig, scheme, watchNamespace)
+	if tracingEnabled {
+		var err error
+		shutdownTracing, err = telemetry.InitTracing(context.Background(), "automotive-dev-operator", tracingEndpoint, tracingSamplingRatio, tracingInsecure)
+		if err != nil {
+			setupLog.Error(err, "failed to initialize tracing, continuing without it")
+			shutdownTracing = func(context.Context) error { return nil }
+		}
+	}
+	defer func() {
+		if err := shutdownTracing(context.Background()); err != nil {
+			setupLog.Error(err, "failed to shutdown tracing")
+		}
+	}()
+
 	mgr, err := ctrl.NewManager(restConfig, mgrOptions)
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
@@ -226,7 +262,7 @@ func main() {
 			APIReader:  mgr.GetAPIReader(),
 			Scheme:     mgr.GetScheme(),
 			Log:        ctrl.Log.WithName("controllers").WithName("ImageBuild"),
-			Recorder:   mgr.GetEventRecorderFor("imagebuild-controller"),
+			Recorder:   mgr.GetEventRecorder("imagebuild-controller"),
 			RestConfig: mgr.GetConfig(),
 		}
 
@@ -261,7 +297,7 @@ func main() {
 			Client:   mgr.GetClient(),
 			Scheme:   mgr.GetScheme(),
 			Log:      ctrl.Log.WithName("controllers").WithName("ContainerBuild"),
-			Recorder: mgr.GetEventRecorderFor("containerbuild-controller"),
+			Recorder: mgr.GetEventRecorder("containerbuild-controller"),
 		}
 
 		if err = containerBuildReconciler.SetupWithManager(mgr); err != nil {
@@ -273,7 +309,7 @@ func main() {
 			Client:   mgr.GetClient(),
 			Scheme:   mgr.GetScheme(),
 			Log:      ctrl.Log.WithName("controllers").WithName("ImageReseal"),
-			Recorder: mgr.GetEventRecorderFor("imagereseal-controller"),
+			Recorder: mgr.GetEventRecorder("imagereseal-controller"),
 		}
 		if err = imageResealReconciler.SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "unable to create controller", "controller", "ImageReseal")
@@ -288,6 +324,24 @@ func main() {
 		}
 		if err = workspaceReconciler.SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "unable to create controller", "controller", "Workspace")
+			os.Exit(1)
+		}
+
+		sibPublisher := catalogimage.NewPublisher(
+			mgr.GetClient(),
+			catalogimage.NewRegistryClient(),
+			nil,
+			ctrl.Log.WithName("controllers").WithName("ScheduledImageBuild"),
+		)
+		scheduledImageBuildReconciler := &scheduledimagebuild.Reconciler{
+			Client:    mgr.GetClient(),
+			Scheme:    mgr.GetScheme(),
+			Log:       ctrl.Log.WithName("controllers").WithName("ScheduledImageBuild"),
+			Recorder:  mgr.GetEventRecorder("scheduledimagebuild-controller"),
+			Publisher: &catalogPublisherAdapter{publisher: sibPublisher},
+		}
+		if err = scheduledImageBuildReconciler.SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create controller", "controller", "ScheduledImageBuild")
 			os.Exit(1)
 		}
 	}
@@ -307,4 +361,26 @@ func main() {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}
+}
+
+func readTracingConfig(restConfig *rest.Config, s *runtime.Scheme, namespace string) (bool, string, float64, bool) {
+	c, err := client.New(restConfig, client.Options{Scheme: s})
+	if err != nil {
+		setupLog.Info("could not create startup client for tracing config, using env vars")
+		return true, "", 1.0, true
+	}
+
+	var cfg automotivev1alpha1.OperatorConfig
+	key := client.ObjectKey{Name: "config", Namespace: namespace}
+	if err := c.Get(context.Background(), key, &cfg); err != nil {
+		setupLog.Info("could not read OperatorConfig for tracing config, using env vars",
+			"name", key.Name, "namespace", key.Namespace)
+		return true, "", 1.0, true
+	}
+
+	if cfg.Spec.Tracing == nil || !cfg.Spec.Tracing.Enabled {
+		return false, "", 1.0, true
+	}
+
+	return true, cfg.Spec.Tracing.GetEndpoint(), cfg.Spec.Tracing.GetSamplingRatio(), cfg.Spec.Tracing.IsInsecure()
 }

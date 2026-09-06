@@ -37,6 +37,7 @@ const (
 	defaultVerificationInterval = 1 * time.Hour
 	retryInterval               = 30 * time.Second
 	unavailableRetryInterval    = 5 * time.Minute
+	maxVerificationFailures     = 5
 )
 
 // CatalogImageReconciler reconciles a CatalogImage object
@@ -49,11 +50,11 @@ type CatalogImageReconciler struct {
 	RegistryClient RegistryClient
 }
 
-// +kubebuilder:rbac:groups=automotive.sdv.cloud.redhat.com,resources=catalogimages,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=automotive.sdv.cloud.redhat.com,resources=catalogimages/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=automotive.sdv.cloud.redhat.com,resources=catalogimages/finalizers,verbs=update
-// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
-// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+// +kubebuilder:rbac:groups=automotive.sdv.cloud.redhat.com,namespace=system,resources=catalogimages,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=automotive.sdv.cloud.redhat.com,namespace=system,resources=catalogimages/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=automotive.sdv.cloud.redhat.com,namespace=system,resources=catalogimages/finalizers,verbs=update
+// +kubebuilder:rbac:groups="",namespace=system,resources=secrets,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",namespace=system,resources=events,verbs=create;patch
 
 // Reconcile handles CatalogImage reconciliation
 func (r *CatalogImageReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -76,7 +77,6 @@ func (r *CatalogImageReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		if err := r.Update(ctx, catalogImage); err != nil {
 			return ctrl.Result{}, err
 		}
-		return ctrl.Result{Requeue: true}, nil
 	}
 
 	log.Info("Reconciling CatalogImage", "phase", catalogImage.Status.Phase)
@@ -139,7 +139,7 @@ func (r *CatalogImageReconciler) handlePendingPhase(
 	if err := r.Status().Update(ctx, catalogImage); err != nil {
 		return ctrl.Result{}, err
 	}
-	return ctrl.Result{Requeue: true}, nil
+	return ctrl.Result{}, nil
 }
 
 // handleVerifyingPhase handles registry verification
@@ -182,6 +182,7 @@ func (r *CatalogImageReconciler) handleVerifyingPhase(
 	// Update status with metadata and transition to Available
 	catalogImage.Status.RegistryMetadata = metadata
 	catalogImage.Status.LastVerificationTime = GetCurrentTime()
+	catalogImage.Status.VerificationFailures = 0
 
 	// Set Published timestamp if not already set
 	if catalogImage.Status.PublishedAt == nil {
@@ -239,7 +240,7 @@ func (r *CatalogImageReconciler) handleAvailablePhase(
 		if err := r.Status().Update(ctx, catalogImage); err != nil {
 			return ctrl.Result{}, err
 		}
-		return ctrl.Result{Requeue: true}, nil
+		return ctrl.Result{}, nil
 	}
 
 	// Check if re-verification is needed based on interval
@@ -261,7 +262,7 @@ func (r *CatalogImageReconciler) handleAvailablePhase(
 		return ctrl.Result{}, err
 	}
 
-	return ctrl.Result{Requeue: true}, nil
+	return ctrl.Result{}, nil
 }
 
 // handleUnavailablePhase handles retry logic
@@ -279,7 +280,7 @@ func (r *CatalogImageReconciler) handleUnavailablePhase(
 	if err := r.Status().Update(ctx, catalogImage); err != nil {
 		return ctrl.Result{}, err
 	}
-	return ctrl.Result{Requeue: true}, nil
+	return ctrl.Result{}, nil
 }
 
 // handleFailedPhase handles permanent failures
@@ -297,7 +298,7 @@ func (r *CatalogImageReconciler) handleFailedPhase(
 		if err := r.Status().Update(ctx, catalogImage); err != nil {
 			return ctrl.Result{}, err
 		}
-		return ctrl.Result{Requeue: true}, nil
+		return ctrl.Result{}, nil
 	}
 
 	return ctrl.Result{}, nil
@@ -312,9 +313,20 @@ func (r *CatalogImageReconciler) transitionToUnavailable(
 	r.setCondition(catalogImage, automotivev1alpha1.CatalogImageConditionAvailable, metav1.ConditionFalse, reason, message)
 	r.setCondition(catalogImage, automotivev1alpha1.CatalogImageConditionReady, metav1.ConditionFalse, reason, message)
 
-	catalogImage.Status.Phase = automotivev1alpha1.CatalogImagePhaseUnavailable
+	catalogImage.Status.VerificationFailures++
 	catalogImage.Status.ObservedGeneration = catalogImage.Generation
 
+	if catalogImage.Status.VerificationFailures >= maxVerificationFailures {
+		catalogImage.Status.Phase = automotivev1alpha1.CatalogImagePhaseFailed
+		r.setCondition(catalogImage, automotivev1alpha1.CatalogImageConditionReady, metav1.ConditionFalse, reason,
+			fmt.Sprintf("%s (gave up after %d attempts)", message, catalogImage.Status.VerificationFailures))
+		if err := r.Status().Update(ctx, catalogImage); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
+	}
+
+	catalogImage.Status.Phase = automotivev1alpha1.CatalogImagePhaseUnavailable
 	if err := r.Status().Update(ctx, catalogImage); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -375,7 +387,7 @@ func (r *CatalogImageReconciler) ensureLabels(catalogImage *automotivev1alpha1.C
 			catalogImage.Labels[automotivev1alpha1.LabelTarget] = catalogImage.Spec.Metadata.Targets[0].Name
 		}
 		if catalogImage.Spec.Metadata.Bootc {
-			catalogImage.Labels[automotivev1alpha1.LabelBootc] = "true"
+			catalogImage.Labels[automotivev1alpha1.LabelBootc] = labelValueTrue
 		}
 	}
 }

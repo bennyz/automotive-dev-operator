@@ -54,11 +54,11 @@ This runs three phases:
 
 ### Step by step
 
-**Linux** (run as the CRC user, use `sudo` where indicated):
+**Linux** (run as the CRC user; some steps may prompt for `sudo` where indicated):
 ```bash
 sudo bash hack/crc/01-prep-host.sh /path/to/pull-secret.txt
-sudo bash hack/crc/04-expose-default-registry.sh
 eval "$(crc oc-env)" && export PATH=$PATH:/usr/local/go/bin
+bash hack/crc/04-expose-default-registry.sh        # may prompt for sudo on Linux to install certs and update /etc/hosts
 bash hack/crc/02-deploy-operator.sh
 bash hack/crc/03-crc-operator-sanity.sh            # validate
 bash hack/crc/03-crc-operator-sanity.sh --sanity   # + build test
@@ -82,7 +82,7 @@ bash hack/crc/03-crc-operator-sanity.sh
 | `01-prep-host.sh` | `sudo` (Linux) / user (macOS) | System prep, CRC install, `crc setup`, `crc start` |
 | `02-deploy-operator.sh` | non-root | Deploy operator via OLM catalog, configure OperatorConfig |
 | `03-crc-operator-sanity.sh` | non-root | Validate cluster, operator, Build API, Tekton. `--sanity` for build test |
-| `04-expose-default-registry.sh` | `sudo` (Linux) / user (macOS) | Expose internal registry via external route for podman push/pull |
+| `04-expose-default-registry.sh` | CRC user (Linux & macOS) | Expose internal registry via external route for podman push/pull. On Linux, it may prompt for `sudo` only to install the registry cert and update `/etc/hosts`. |
 | `crc-cleanup.sh` | `sudo` (Linux) / user (macOS) | Stop and delete CRC VM. `--full` removes binary, cache, sudoers |
 
 ### `01-prep-host.sh`
@@ -152,8 +152,7 @@ Use `--arch arm64` on Apple Silicon Macs, `--arch amd64` on Intel/Linux x86_64.
 
 **Step 1 -- Expose the external registry (one-time):**
 ```bash
-sudo bash hack/crc/04-expose-default-registry.sh     # Linux
-bash hack/crc/04-expose-default-registry.sh           # macOS
+bash hack/crc/04-expose-default-registry.sh     # Linux and macOS (may prompt for sudo on Linux to install certs and update /etc/hosts)
 ```
 
 **Step 2 -- Deploy:**
@@ -169,8 +168,7 @@ The internal registry (`image-registry.openshift-image-registry.svc:5000`) is on
 
 **Step 1 -- Expose the registry (one-time):**
 ```bash
-bash hack/crc/04-expose-default-registry.sh          # macOS
-sudo bash hack/crc/04-expose-default-registry.sh     # Linux
+bash hack/crc/04-expose-default-registry.sh     # Linux and macOS (may prompt for sudo on Linux to install certs and update /etc/hosts)
 ```
 
 **Step 2 -- Pull:**

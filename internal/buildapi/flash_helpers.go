@@ -7,13 +7,21 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
+
+	"github.com/containers/image/v5/docker"
+	"github.com/containers/image/v5/types"
 
 	automotivev1alpha1 "github.com/centos-automotive-suite/automotive-dev-operator/api/v1alpha1"
+	"github.com/centos-automotive-suite/automotive-dev-operator/internal/common/labels"
+	"github.com/centos-automotive-suite/automotive-dev-operator/internal/common/oci"
 	"github.com/centos-automotive-suite/automotive-dev-operator/internal/common/registryutil"
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8stypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 type httpError struct {
@@ -21,19 +29,140 @@ type httpError struct {
 	message string
 }
 
+// BuildLeaseTags merges OperatorConfig defaults, build name, and user-provided tags into a comma-separated string.
+func BuildLeaseTags(operatorConfigDefaults, buildName, userTags string) string {
+	parts := make([]string, 0, 3)
+	if operatorConfigDefaults != "" {
+		parts = append(parts, operatorConfigDefaults)
+	}
+	parts = append(parts, "build-name="+buildName)
+	if userTags != "" {
+		parts = append(parts, userTags)
+	}
+	return strings.Join(parts, ",")
+}
+
 // resolveFlashTargetConfig resolves exporter selector and flash command from request and OperatorConfig.
 func resolveFlashTargetConfig(req FlashRequest, operatorConfig *automotivev1alpha1.OperatorConfig) (string, string) {
 	exporterSelector := req.ExporterSelector
 	flashCmd := req.FlashCmd
-	if req.Target != "" && exporterSelector == "" && operatorConfig.Spec.Jumpstarter != nil {
+	if req.Target != "" && operatorConfig.Spec.Jumpstarter != nil {
 		if mapping, ok := operatorConfig.Spec.Jumpstarter.TargetMappings[req.Target]; ok {
-			exporterSelector = mapping.Selector
+			if exporterSelector == "" {
+				exporterSelector = mapping.Selector
+			}
 			if flashCmd == "" {
 				flashCmd = mapping.FlashCmd
 			}
 		}
 	}
 	return exporterSelector, flashCmd
+}
+
+// PinFlashDigest appends @digest to a registry URL when the URL is not already digest-pinned.
+func PinFlashDigest(registryURL, digest string) string {
+	if registryURL == "" || digest == "" {
+		return registryURL
+	}
+	if strings.Contains(registryURL, "@") {
+		return registryURL
+	}
+	return registryURL + "@" + digest
+}
+
+func catalogFlashDigest(img *automotivev1alpha1.CatalogImage) string {
+	if img.Spec.Digest != "" {
+		return img.Spec.Digest
+	}
+	if img.Status.RegistryMetadata != nil {
+		return img.Status.RegistryMetadata.ResolvedDigest
+	}
+	return ""
+}
+
+func resolveFlashImageFromCatalog(ctx context.Context, k8sClient client.Client, namespace, name string) (string, *httpError) {
+	img := &automotivev1alpha1.CatalogImage{}
+	if err := k8sClient.Get(ctx, k8stypes.NamespacedName{Name: name, Namespace: namespace}, img); err != nil {
+		if k8serrors.IsNotFound(err) {
+			return "", &httpError{code: http.StatusNotFound, message: fmt.Sprintf("catalog image %q not found", name)}
+		}
+		return "", &httpError{code: http.StatusInternalServerError, message: "failed to get catalog image"}
+	}
+	if img.Status.Phase != automotivev1alpha1.CatalogImagePhaseAvailable {
+		return "", &httpError{
+			code:    http.StatusBadRequest,
+			message: fmt.Sprintf("catalog image %q is not Available (phase: %s)", name, img.Status.Phase),
+		}
+	}
+	if img.Spec.RegistryURL == "" {
+		return "", &httpError{code: http.StatusBadRequest, message: fmt.Sprintf("catalog image %q has no registry URL", name)}
+	}
+	return PinFlashDigest(img.Spec.RegistryURL, catalogFlashDigest(img)), nil
+}
+
+// readImageAnnotationsFn reads OCI manifest annotations for a given image reference.
+// Overridable for testing.
+var readImageAnnotationsFn = readImageAnnotations
+
+func readImageAnnotations(ctx context.Context, imageRef string, sysCtx *types.SystemContext) (map[string]string, error) {
+	ref, err := docker.ParseReference("//" + imageRef)
+	if err != nil {
+		return nil, fmt.Errorf("parse reference: %w", err)
+	}
+
+	if sysCtx == nil {
+		sysCtx = &types.SystemContext{}
+	}
+
+	src, err := ref.NewImageSource(ctx, sysCtx)
+	if err != nil {
+		return nil, fmt.Errorf("open image source: %w", err)
+	}
+	defer func() { _ = src.Close() }()
+
+	rawManifest, _, err := src.GetManifest(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("get manifest: %w", err)
+	}
+
+	var parsed struct {
+		Annotations map[string]string `json:"annotations"`
+	}
+	if err := json.Unmarshal(rawManifest, &parsed); err != nil {
+		return nil, fmt.Errorf("parse manifest: %w", err)
+	}
+	return parsed.Annotations, nil
+}
+
+// systemContextFromCredentials builds a types.SystemContext with Docker auth
+// from FlashRequest registry credentials. Returns nil if no credentials.
+func systemContextFromCredentials(creds *RegistryCredentials) *types.SystemContext {
+	if creds == nil || !creds.Enabled {
+		return nil
+	}
+	username, password, err := extractOCICredentials(creds)
+	if err != nil || username == "" {
+		return nil
+	}
+	return &types.SystemContext{
+		DockerAuthConfig: &types.DockerAuthConfig{
+			Username: username,
+			Password: password,
+		},
+	}
+}
+
+// resolveTargetFromImage inspects OCI image annotations and returns the target name if present.
+func resolveTargetFromImage(ctx context.Context, imageRef string, creds *RegistryCredentials) string {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	sysCtx := systemContextFromCredentials(creds)
+	annotations, err := readImageAnnotationsFn(ctx, imageRef, sysCtx)
+	if err != nil {
+		return ""
+	}
+	return annotations[oci.Get().AnnotationKey("target")]
 }
 
 // createFlashClientConfigSecret creates the Jumpstarter client config secret for a standalone flash job.
@@ -50,10 +179,10 @@ func createFlashClientConfigSecret(
 			Name:      secretName,
 			Namespace: namespace,
 			Labels: map[string]string{
-				"app.kubernetes.io/managed-by":                  "build-api",
-				"app.kubernetes.io/part-of":                     "automotive-dev",
-				flashTaskRunLabel:                               req.Name,
-				"automotive.sdv.cloud.redhat.com/resource-type": "jumpstarter-client",
+				labels.ManagedBy:    labels.ValueBuildAPI,
+				labels.PartOf:       labels.ValueAutomotiveDev,
+				labels.FlashTaskRun: req.Name,
+				labels.ResourceType: "jumpstarter-client",
 			},
 		},
 		Type: corev1.SecretTypeOpaque,
@@ -93,11 +222,11 @@ func createFlashOCIAuthSecret(
 			Name:      secretName,
 			Namespace: namespace,
 			Labels: map[string]string{
-				"app.kubernetes.io/managed-by":                  "build-api",
-				"app.kubernetes.io/part-of":                     "automotive-dev",
-				flashTaskRunLabel:                               flashName,
-				"automotive.sdv.cloud.redhat.com/transient":     "true",
-				"automotive.sdv.cloud.redhat.com/resource-type": "flash-oci-auth",
+				labels.ManagedBy:    labels.ValueBuildAPI,
+				labels.PartOf:       labels.ValueAutomotiveDev,
+				labels.FlashTaskRun: flashName,
+				labels.Transient:    labels.ValueTrue,
+				labels.ResourceType: "flash-oci-auth",
 			},
 		},
 		Type: corev1.SecretTypeOpaque,

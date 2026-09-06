@@ -22,11 +22,14 @@ import (
 
 	"github.com/containers/image/v5/types"
 	"github.com/go-logr/logr"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	automotivev1alpha1 "github.com/centos-automotive-suite/automotive-dev-operator/api/v1alpha1"
 )
+
+const labelValueTrue = "true"
 
 // PublishSource indicates where the catalog image was published from
 type PublishSource string
@@ -38,6 +41,8 @@ const (
 	PublishSourceExternal PublishSource = "External"
 	// PublishSourceManual indicates the image was manually added via API
 	PublishSourceManual PublishSource = "Manual"
+	// PublishSourceScheduled indicates the image was published from a scheduled build
+	PublishSourceScheduled PublishSource = "Scheduled"
 )
 
 // PublishOptions contains options for publishing an image to the catalog
@@ -60,6 +65,8 @@ type PublishOptions struct {
 	Source PublishSource
 	// SourceImageBuildName is the name of the source ImageBuild (if applicable)
 	SourceImageBuildName string
+	// ScheduleName is the name of the ScheduledImageBuild that triggered this publish
+	ScheduleName string
 	// VerifyAccessibility determines if registry accessibility should be verified
 	VerifyAccessibility bool
 }
@@ -97,18 +104,12 @@ type PublishResult struct {
 	Metadata *automotivev1alpha1.RegistryMetadata
 }
 
-// Publish creates a new CatalogImage and optionally verifies registry accessibility
+// Publish creates or updates a CatalogImage and optionally verifies registry accessibility.
+// Existing entries are resolved by stable name first, then by registry URL (fixed-tag
+// scheduled builds). URL matches under a different name are re-homed to opts.Name.
 func (p *Publisher) Publish(ctx context.Context, opts PublishOptions) (*PublishResult, error) {
 	log := p.log.WithValues("name", opts.Name, "namespace", opts.Namespace, "registryURL", opts.RegistryURL)
 	log.Info("Publishing image to catalog")
-
-	// Check for duplicate registry URLs
-	if err := p.checkDuplicates(ctx, opts.Namespace, opts.RegistryURL); err != nil {
-		return nil, err
-	}
-
-	// Create the CatalogImage resource
-	catalogImage := p.buildCatalogImage(opts)
 
 	// Verify accessibility if requested
 	var registryMetadata *automotivev1alpha1.RegistryMetadata
@@ -118,32 +119,65 @@ func (p *Publisher) Publish(ctx context.Context, opts PublishOptions) (*PublishR
 		verified, registryMetadata, err = p.verifyAndExtractMetadata(ctx, opts)
 		if err != nil {
 			log.Error(err, "Failed to verify registry accessibility")
-			// Continue with creation, controller will handle verification
+		}
+	}
+	if registryMetadata != nil && registryMetadata.ResolvedDigest != "" {
+		opts.Digest = registryMetadata.ResolvedDigest
+	}
+
+	catalogImage, stale, err := p.resolveExisting(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	if catalogImage != nil {
+		p.updateCatalogImage(catalogImage, opts)
+
+		if err := p.client.Update(ctx, catalogImage); err != nil {
+			return nil, fmt.Errorf("failed to update CatalogImage: %w", err)
+		}
+		log.Info("Updated existing CatalogImage", "existingName", catalogImage.Name, "verified", verified)
+	} else {
+		catalogImage = p.buildCatalogImage(opts)
+
+		if err := p.client.Create(ctx, catalogImage); err != nil {
+			if !apierrors.IsAlreadyExists(err) {
+				return nil, fmt.Errorf("failed to create CatalogImage: %w", err)
+			}
+			existing := &automotivev1alpha1.CatalogImage{}
+			if getErr := p.client.Get(ctx, client.ObjectKey{Name: opts.Name, Namespace: opts.Namespace}, existing); getErr != nil {
+				return nil, fmt.Errorf("failed to get CatalogImage after create conflict: %w", getErr)
+			}
+			p.updateCatalogImage(existing, opts)
+			if updErr := p.client.Update(ctx, existing); updErr != nil {
+				return nil, fmt.Errorf("failed to update CatalogImage: %w", updErr)
+			}
+			catalogImage = existing
+			log.Info("Updated existing CatalogImage after create conflict", "name", catalogImage.Name, "verified", verified)
+		} else {
+			log.Info("Successfully created CatalogImage", "verified", verified)
 		}
 	}
 
-	// Create the CatalogImage
-	if err := p.client.Create(ctx, catalogImage); err != nil {
-		return nil, fmt.Errorf("failed to create CatalogImage: %w", err)
+	if err := p.deleteStale(ctx, catalogImage.Name, stale); err != nil {
+		return nil, err
 	}
 
-	log.Info("Successfully created CatalogImage", "verified", verified)
-
-	// Record audit event
 	if p.auditRecorder != nil {
 		p.auditRecorder.RecordPublished(ctx, catalogImage, string(opts.Source))
 	}
 
-	// If we verified and have metadata, update the status
+	catalogImage.Status.PublishedAt = GetCurrentTime()
+	if opts.SourceImageBuildName != "" {
+		catalogImage.Status.SourceImageBuild = opts.SourceImageBuildName
+	}
 	if verified && registryMetadata != nil {
 		catalogImage.Status.RegistryMetadata = registryMetadata
 		catalogImage.Status.LastVerificationTime = GetCurrentTime()
 		catalogImage.Status.Phase = automotivev1alpha1.CatalogImagePhaseAvailable
-
-		if err := p.client.Status().Update(ctx, catalogImage); err != nil {
-			log.Error(err, "Failed to update status with verification results")
-			// Non-fatal: controller will pick up verification on next reconcile
-		}
+	}
+	if err := p.client.Status().Update(ctx, catalogImage); err != nil {
+		return nil, fmt.Errorf("failed to update CatalogImage status: %w", err)
 	}
 
 	return &PublishResult{
@@ -153,12 +187,14 @@ func (p *Publisher) Publish(ctx context.Context, opts PublishOptions) (*PublishR
 	}, nil
 }
 
-// PublishFromImageBuild creates a CatalogImage from a completed ImageBuild
+// PublishFromImageBuild creates a CatalogImage from a completed ImageBuild.
 func (p *Publisher) PublishFromImageBuild(
 	ctx context.Context,
 	imageBuild *automotivev1alpha1.ImageBuild,
 	catalogName string,
 	tags []string,
+	authSecretRef *automotivev1alpha1.AuthSecretReference,
+	source PublishSource,
 ) (*PublishResult, error) {
 	log := p.log.WithValues("imageBuild", imageBuild.Name, "namespace", imageBuild.Namespace)
 
@@ -179,10 +215,17 @@ func (p *Publisher) PublishFromImageBuild(
 	}
 
 	// Build metadata from ImageBuild
+	exportFormat := resolvedExportFormat(imageBuild)
+	if imageBuild.Spec.GetContainerPush() != "" {
+		exportFormat = "oci"
+	}
+
 	metadata := &automotivev1alpha1.CatalogImageMetadata{
 		Architecture: NormalizeArchitecture(imageBuild.Spec.Architecture),
 		Distro:       imageBuild.Spec.GetDistro(),
 		BuildMode:    imageBuild.Spec.GetMode(),
+		ExportFormat: exportFormat,
+		Bootc:        imageBuild.Spec.GetMode() == "bootc",
 	}
 
 	// Add hardware target if specified
@@ -192,7 +235,14 @@ func (p *Publisher) PublishFromImageBuild(
 		}
 	}
 
-	log.Info("Publishing ImageBuild to catalog", "catalogName", catalogName, "registryURL", registryURL)
+	publishSource := source
+	if publishSource == "" {
+		publishSource = PublishSourceImageBuild
+	}
+
+	log.Info("Publishing ImageBuild to catalog", "catalogName", catalogName, "registryURL", registryURL, "source", publishSource)
+
+	scheduleName := imageBuild.Labels[automotivev1alpha1.LabelScheduledImageBuildName]
 
 	return p.Publish(ctx, PublishOptions{
 		Name:                 catalogName,
@@ -200,23 +250,111 @@ func (p *Publisher) PublishFromImageBuild(
 		RegistryURL:          registryURL,
 		Tags:                 tags,
 		Metadata:             metadata,
-		Source:               PublishSourceImageBuild,
+		AuthSecretRef:        authSecretRef,
+		Source:               publishSource,
 		SourceImageBuildName: imageBuild.Name,
+		ScheduleName:         scheduleName,
 		VerifyAccessibility:  true,
 	})
 }
 
-// checkDuplicates checks if a CatalogImage with the same registry URL already exists
-func (p *Publisher) checkDuplicates(ctx context.Context, namespace, registryURL string) error {
-	lister := NewCatalogImageLister(p.client)
-	exists, err := lister.ExistsByRegistryURL(ctx, namespace, registryURL)
-	if err != nil {
-		return fmt.Errorf("failed to check for duplicates: %w", err)
+// resolveExisting finds a CatalogImage to update. Prefer the stable name; fall back to
+// registry URL. Every URL match under a different name is stale and must be deleted.
+func (p *Publisher) resolveExisting(
+	ctx context.Context,
+	opts PublishOptions,
+) (current *automotivev1alpha1.CatalogImage, stale []automotivev1alpha1.CatalogImage, err error) {
+	var named *automotivev1alpha1.CatalogImage
+	if opts.Name != "" {
+		got := &automotivev1alpha1.CatalogImage{}
+		getErr := p.client.Get(ctx, client.ObjectKey{Name: opts.Name, Namespace: opts.Namespace}, got)
+		if getErr == nil {
+			named = got
+		} else if client.IgnoreNotFound(getErr) != nil {
+			return nil, nil, fmt.Errorf("failed to get catalog image %s: %w", opts.Name, getErr)
+		}
 	}
-	if exists {
-		return fmt.Errorf("catalog image with registry URL %q already exists in namespace %s", registryURL, namespace)
+
+	matches, err := p.listByRegistryURL(ctx, opts.Namespace, opts.RegistryURL)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	keepName := opts.Name
+	if named != nil {
+		current = named
+		keepName = named.Name
+	}
+
+	for i := range matches {
+		if keepName != "" && matches[i].Name == keepName {
+			if current == nil {
+				current = matches[i].DeepCopy()
+			}
+			continue
+		}
+		stale = append(stale, matches[i])
+	}
+	return current, stale, nil
+}
+
+func (p *Publisher) listByRegistryURL(ctx context.Context, namespace, registryURL string) ([]automotivev1alpha1.CatalogImage, error) {
+	if registryURL == "" {
+		return nil, nil
+	}
+	lister := NewCatalogImageLister(p.client)
+	list, err := lister.ListByRegistryURL(ctx, namespace, registryURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to check for existing catalog image: %w", err)
+	}
+	return list.Items, nil
+}
+
+func (p *Publisher) deleteStale(ctx context.Context, keepName string, stale []automotivev1alpha1.CatalogImage) error {
+	for i := range stale {
+		if keepName != "" && stale[i].Name == keepName {
+			continue
+		}
+		if err := p.client.Delete(ctx, &stale[i]); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("failed to delete stale CatalogImage %s: %w", stale[i].Name, err)
+		}
+		p.log.Info("Deleted stale CatalogImage after re-home", "staleName", stale[i].Name, "name", keepName)
 	}
 	return nil
+}
+
+// updateCatalogImage applies new PublishOptions to an existing CatalogImage.
+func (p *Publisher) updateCatalogImage(catalogImage *automotivev1alpha1.CatalogImage, opts PublishOptions) {
+	catalogImage.Spec.RegistryURL = opts.RegistryURL
+	catalogImage.Spec.Digest = opts.Digest
+	catalogImage.Spec.Tags = opts.Tags
+	catalogImage.Spec.AuthSecretRef = opts.AuthSecretRef
+	catalogImage.Spec.Metadata = opts.Metadata
+
+	if catalogImage.Labels == nil {
+		catalogImage.Labels = make(map[string]string)
+	}
+	delete(catalogImage.Labels, automotivev1alpha1.LabelTarget)
+	delete(catalogImage.Labels, automotivev1alpha1.LabelBootc)
+	delete(catalogImage.Labels, automotivev1alpha1.LabelScheduledImageBuildName)
+	if opts.Metadata != nil {
+		if opts.Metadata.Architecture != "" {
+			catalogImage.Labels[automotivev1alpha1.LabelArchitecture] = NormalizeArchitecture(opts.Metadata.Architecture)
+		}
+		if opts.Metadata.Distro != "" {
+			catalogImage.Labels[automotivev1alpha1.LabelDistro] = opts.Metadata.Distro
+		}
+		if len(opts.Metadata.Targets) > 0 {
+			catalogImage.Labels[automotivev1alpha1.LabelTarget] = opts.Metadata.Targets[0].Name
+		}
+		if opts.Metadata.Bootc {
+			catalogImage.Labels[automotivev1alpha1.LabelBootc] = labelValueTrue
+		}
+	}
+	catalogImage.Labels[automotivev1alpha1.LabelSourceType] = string(opts.Source)
+	if opts.ScheduleName != "" {
+		catalogImage.Labels[automotivev1alpha1.LabelScheduledImageBuildName] = opts.ScheduleName
+	}
 }
 
 // buildCatalogImage creates a CatalogImage resource from PublishOptions
@@ -257,12 +395,16 @@ func (p *Publisher) buildCatalogImage(opts PublishOptions) *automotivev1alpha1.C
 			catalogImage.Labels[automotivev1alpha1.LabelTarget] = opts.Metadata.Targets[0].Name
 		}
 		if opts.Metadata.Bootc {
-			catalogImage.Labels[automotivev1alpha1.LabelBootc] = "true"
+			catalogImage.Labels[automotivev1alpha1.LabelBootc] = labelValueTrue
 		}
 	}
 
 	// Set source type label
 	catalogImage.Labels[automotivev1alpha1.LabelSourceType] = string(opts.Source)
+
+	if opts.ScheduleName != "" {
+		catalogImage.Labels[automotivev1alpha1.LabelScheduledImageBuildName] = opts.ScheduleName
+	}
 
 	return catalogImage
 }
@@ -338,4 +480,11 @@ func (p *Publisher) Unpublish(ctx context.Context, name, namespace string) error
 
 	log.Info("Successfully removed CatalogImage from catalog")
 	return nil
+}
+
+func resolvedExportFormat(imageBuild *automotivev1alpha1.ImageBuild) string {
+	if imageBuild.Status.ResolvedExportFormat != "" {
+		return imageBuild.Status.ResolvedExportFormat
+	}
+	return imageBuild.Spec.GetExportFormat()
 }

@@ -1065,6 +1065,10 @@ func (e *encoder[T]) MustEncode(v interface{}) {
 	return
 }
 
+func (e *encoder[T]) NumBytesWritten() int {
+	return e.e.NumBytesWritten()
+}
+
 func (e *encoder[T]) mustEncode(v interface{}) {
 	halt.onerror(e.err)
 	if e.hh == nil {
@@ -1296,11 +1300,11 @@ func (e *encoder[T]) rawBytes(vv Raw) {
 }
 
 func (e *encoder[T]) fn(t reflect.Type) *encFn[T] {
-	return e.dh.encFnViaBH(t, e.rtidFn, e.h, e.fp, false)
+	return e.dh.encFnViaBH(t, e.rtidFn, e.h, e.fp, true)
 }
 
 func (e *encoder[T]) fnNoExt(t reflect.Type) *encFn[T] {
-	return e.dh.encFnViaBH(t, e.rtidFnNoExt, e.h, e.fp, true)
+	return e.dh.encFnViaBH(t, e.rtidFnNoExt, e.h, e.fp, false)
 }
 
 // ---- container tracker methods
@@ -1510,7 +1514,7 @@ func (dh helperEncDriver[T]) encFnLoad(rt reflect.Type, rtid uintptr, tinfos *Ty
 
 	// anything can be an extension except the built-in ones: time, raw and rawext.
 	// ensure we check for these types, then if extension, before checking if
-	// it implementes one of the pre-declared interfaces.
+	// it implements one of the pre-declared interfaces.
 
 	// fi.addrEf = true
 

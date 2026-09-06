@@ -3,6 +3,8 @@ package tasks
 
 import (
 	_ "embed"
+
+	"github.com/centos-automotive-suite/automotive-dev-operator/internal/common/oci"
 )
 
 //go:embed scripts/common.sh
@@ -26,6 +28,12 @@ var pushArtifactScript string
 // PushArtifactScript contains the embedded shell script for pushing artifacts.
 var PushArtifactScript = ""
 
+//go:embed scripts/push_artifact_s3.sh
+var pushArtifactS3Script string
+
+// PushArtifactS3Script contains the embedded shell script for pushing artifacts to S3.
+var PushArtifactS3Script = ""
+
 //go:embed scripts/build_builder.sh
 var buildBuilderScript string
 
@@ -39,11 +47,13 @@ var flashImageScript string
 var FlashImageScript = ""
 
 func init() {
-	BuildImageScript = commonScript + "\n" + buildImageScript
+	ociVars := oci.Get().ShellVars()
+	BuildImageScript = commonScript + "\n" + ociVars + "\n" + buildImageScript
 	BuildBuilderScript = commonScript + "\n" + buildBuilderScript
-	PushArtifactScript = commonScript + "\n" + pushArtifactScript
+	PushArtifactScript = commonScript + "\n" + ociVars + "\n" + pushArtifactScript
+	PushArtifactS3Script = commonScript + "\n" + pushArtifactS3Script
 	FlashImageScript = commonScript + "\n" + flashImageScript
-	SealedOperationScript = commonScript + "\n" + sealedOperationScript
+	SealedOperationScript = commonScript + "\n" + ociVars + "\n" + sealedOperationScript
 }
 
 //go:embed scripts/sealed_operation.sh

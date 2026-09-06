@@ -5,7 +5,7 @@ metadata:
   namespace: openshift-marketplace
 spec:
   sourceType: grpc
-  image: image-registry.openshift-image-registry.svc:5000/openshift-marketplace/automotive-dev-operator-catalog:v0.0.1
+  image: image-registry.openshift-image-registry.svc:5000/openshift-marketplace/automotive-dev-operator-catalog:latest
   displayName: CentOS Automotive Suite
   publisher: Red Hat
   updateStrategy:

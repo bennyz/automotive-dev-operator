@@ -76,6 +76,26 @@ spec:
               image:
                 description: Image is the toolchain container image to use
                 type: string
+              imagePullSecrets:
+                description: ImagePullSecrets overrides the global imagePullSecrets
+                  for this workspace
+                items:
+                  description: |-
+                    LocalObjectReference contains enough information to let you locate the
+                    referenced object inside the same namespace.
+                  properties:
+                    name:
+                      default: ""
+                      description: |-
+                        Name of the referent.
+                        This field is effectively required, but due to backwards compatibility is
+                        allowed to be empty. Instances of this type with an empty value here are
+                        almost certainly wrong.
+                        More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                      type: string
+                  type: object
+                  x-kubernetes-map-type: atomic
+                type: array
               leaseID:
                 description: LeaseID is the Jumpstarter lease ID for board access
                 type: string
@@ -102,7 +122,7 @@ spec:
                       Claims lists the names of resources, defined in spec.resourceClaims,
                       that are used by this container.
 
-                      This is an alpha field and requires enabling the
+                      This field depends on the
                       DynamicResourceAllocation feature gate.
 
                       This field is immutable. It can only be set for containers.
@@ -203,6 +223,24 @@ spec:
                 type: string
               pvcName:
                 description: PVCName is the generated name of the workspace PVC
+                type: string
+              reason:
+                description: Reason is a stable, machine-readable explanation of the
+                  current phase
+                enum:
+                - AutoPaused
+                - ContainerConfigurationError
+                - ContainerExited
+                - ContainerRestarting
+                - ContainerRuntimeError
+                - ContainerStarting
+                - ImageConfigurationError
+                - ImagePulling
+                - PodCreationError
+                - PodExited
+                - PodFailed
+                - Scheduling
+                - StorageError
                 type: string
             type: object
         type: object

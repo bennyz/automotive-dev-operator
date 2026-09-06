@@ -3,14 +3,23 @@ package imagebuild
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
+	"regexp"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	automotivev1alpha1 "github.com/centos-automotive-suite/automotive-dev-operator/api/v1alpha1"
+	"github.com/centos-automotive-suite/automotive-dev-operator/internal/buildapi"
+	"github.com/centos-automotive-suite/automotive-dev-operator/internal/common/bundleverify"
+	"github.com/centos-automotive-suite/automotive-dev-operator/internal/common/labels"
 	"github.com/centos-automotive-suite/automotive-dev-operator/internal/common/registryutil"
 	"github.com/centos-automotive-suite/automotive-dev-operator/internal/common/tasks"
 	controllerutils "github.com/centos-automotive-suite/automotive-dev-operator/internal/controller/controllerutils"
@@ -18,9 +27,13 @@ import (
 	routev1 "github.com/openshift/api/route/v1"
 	pod "github.com/tektoncd/pipeline/pkg/apis/pipeline/pod"
 	tektonv1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	authnv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -29,21 +42,26 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	kuberneteslib "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/yaml"
 )
 
-const (
-	// OperatorNamespace is the namespace where the operator is deployed.
-	OperatorNamespace = "automotive-dev-operator-system"
+var ibTracer = otel.Tracer("imagebuild-controller")
 
-	// Phase constants for ImageBuild status
-	phaseBuilding  = "Building"
-	phaseCompleted = "Completed"
-	phaseFailed    = "Failed"
+const (
+	// Phase constants — aliases for readability; canonical values in api/v1alpha1
+	phaseBuilding  = automotivev1alpha1.ImageBuildPhaseBuilding
+	phaseCancelled = automotivev1alpha1.ImageBuildPhaseCancelled
+	phaseCompleted = automotivev1alpha1.ImageBuildPhaseCompleted
+	phaseFailed    = automotivev1alpha1.ImageBuildPhaseFailed
+	phaseUploading = automotivev1alpha1.ImageBuildPhaseUploading
 
 	// Tekton condition type for completion status
 	conditionSucceeded = "Succeeded"
@@ -51,7 +69,11 @@ const (
 	maxK8sNameLength = 63
 )
 
+// digestPinnedRef matches an OCI reference with a sha256 digest.
+var digestPinnedRef = regexp.MustCompile(`^.+@sha256:[a-fA-F0-9]{64}$`)
+
 const (
+	eventReasonBuildExpired     = "BuildExpired"
 	eventReasonPhaseChanged     = "PhaseChanged"
 	eventReasonPipelineRunReady = "PipelineRunReady"
 	eventReasonUploadPodReady   = "UploadPodReady"
@@ -64,6 +86,11 @@ const (
 	eventReasonDiskBuildRunning = "DiskBuildRunning"
 	eventReasonDiskBuildFailed  = "DiskBuildFailed"
 	eventReasonDiskBuildDone    = "DiskBuildCompleted"
+)
+
+var (
+	isTerminalPhase   = automotivev1alpha1.IsTerminalBuildPhase
+	errTerminalConfig = stderrors.New("terminal configuration error")
 )
 
 // safeDerivedName generates a Kubernetes-safe derived resource name by truncating
@@ -92,73 +119,200 @@ func safeDerivedName(baseName, suffix string) string {
 	return fmt.Sprintf("%s-%s%s", truncated, hexHash, suffix)
 }
 
+func getTraceID(imageBuild *automotivev1alpha1.ImageBuild) string {
+	if imageBuild.Annotations != nil {
+		return imageBuild.Annotations[automotivev1alpha1.AnnotationTraceID]
+	}
+	return ""
+}
+
+func buildLabels(imageBuild *automotivev1alpha1.ImageBuild, taskType string) map[string]string {
+	labels := map[string]string{
+		tektonv1.ManagedByLabelKey:             "automotive-dev-operator",
+		automotivev1alpha1.LabelImageBuildName: imageBuild.Name,
+		automotivev1alpha1.LabelDistro:         controllerutils.SanitizeLabelValue(imageBuild.Spec.GetDistro()),
+		automotivev1alpha1.LabelArchitecture:   controllerutils.SanitizeLabelValue(imageBuild.Spec.Architecture),
+		automotivev1alpha1.LabelTarget:         controllerutils.SanitizeLabelValue(imageBuild.Spec.GetTarget()),
+		automotivev1alpha1.LabelBuildMode:      controllerutils.SanitizeLabelValue(imageBuild.Spec.GetMode()),
+	}
+	if traceID := getTraceID(imageBuild); traceID != "" {
+		labels[automotivev1alpha1.LabelTraceID] = traceID
+	}
+	if taskType != "" {
+		labels[automotivev1alpha1.LabelTaskType] = taskType
+	}
+	return labels
+}
+
+func ensureTraceID(ctx context.Context, imageBuild *automotivev1alpha1.ImageBuild) string {
+	if id := getTraceID(imageBuild); id != "" {
+		return id
+	}
+	if imageBuild.Annotations == nil {
+		imageBuild.Annotations = map[string]string{}
+	}
+
+	// Use the OTel trace ID from the active span when tracing is enabled.
+	// When tracing is disabled (noop provider), generate a random trace ID
+	// in the same 32-hex-char format so log correlation always works and
+	// the value matches OTel conventions if tracing is enabled later.
+	sc := trace.SpanFromContext(ctx).SpanContext()
+	var id string
+	if sc.TraceID().IsValid() {
+		id = sc.TraceID().String()
+	} else {
+		id = generateTraceID()
+	}
+
+	imageBuild.Annotations[automotivev1alpha1.AnnotationTraceID] = id
+	return id
+}
+
+func generateTraceID() string {
+	var tid trace.TraceID
+	_, _ = rand.Read(tid[:])
+	return tid.String()
+}
+
+func (r *ImageBuildReconciler) buildLogger(imageBuild *automotivev1alpha1.ImageBuild) logr.Logger {
+	log := r.Log.WithValues("imagebuild", types.NamespacedName{Name: imageBuild.Name, Namespace: imageBuild.Namespace})
+	if traceID := getTraceID(imageBuild); traceID != "" {
+		log = log.WithValues("traceID", traceID)
+	}
+	return log
+}
+
 // ImageBuildReconciler reconciles a ImageBuild object
 //
 //nolint:revive // Name follows Kubebuilder convention for reconcilers
 type ImageBuildReconciler struct {
 	client.Client
-	APIReader  client.Reader
-	Scheme     *runtime.Scheme
-	Log        logr.Logger
-	Recorder   record.EventRecorder
-	RestConfig *rest.Config
+	APIReader       client.Reader
+	Scheme          *runtime.Scheme
+	Log             logr.Logger
+	Recorder        events.EventRecorder
+	RestConfig      *rest.Config
+	verifiedBundles sync.Map
+	// hydrating tracks in-flight background workspace hydrations keyed by
+	// "namespace/name" so the long-running copy does not block a reconcile
+	// worker. Values are *hydrateJob.
+	hydrating sync.Map
+	// hydrateFunc performs the copy; overridable in tests. nil means the
+	// default buildapi.HydrateWorkspaceForImageBuild.
+	hydrateFunc hydrateFunc
 }
 
-// +kubebuilder:rbac:groups=automotive.sdv.cloud.redhat.com,resources=workspaces,verbs=get;update
-// +kubebuilder:rbac:groups=automotive.sdv.cloud.redhat.com,resources=imagebuilds,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=automotive.sdv.cloud.redhat.com,resources=imagebuilds/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=automotive.sdv.cloud.redhat.com,resources=imagebuilds/finalizers,verbs=update
+// hydrateFunc copies a build's workspace add_files onto its upload pod.
+type hydrateFunc func(context.Context, *rest.Config, client.Client, *automotivev1alpha1.ImageBuild) error
+
+// hydrateJob is the state of a background hydration. err is written once, before
+// done is set, so a reader that observes done==true also observes err.
+type hydrateJob struct {
+	done atomic.Bool
+	err  error
+}
+
+// +kubebuilder:rbac:groups=automotive.sdv.cloud.redhat.com,namespace=system,resources=workspaces,verbs=get;update
+// +kubebuilder:rbac:groups=automotive.sdv.cloud.redhat.com,namespace=system,resources=imagebuilds,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=automotive.sdv.cloud.redhat.com,namespace=system,resources=imagebuilds/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=automotive.sdv.cloud.redhat.com,namespace=system,resources=imagebuilds/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch;create
-// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;delete
-// +kubebuilder:rbac:groups="",resources=serviceaccounts,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=serviceaccounts/token,verbs=create
-// +kubebuilder:rbac:groups=image.openshift.io,resources=imagestreams,verbs=get;create;update;delete
-// +kubebuilder:rbac:groups=image.openshift.io,resources=imagestreamtags,verbs=delete
-// +kubebuilder:rbac:groups=tekton.dev,resources=tasks;pipelines;pipelineruns;taskruns,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=pods/exec,verbs=create;get
-// +kubebuilder:rbac:groups="",resources=pods/log,verbs=get
-// +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=route.openshift.io,resources=routes,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+// +kubebuilder:rbac:groups="",namespace=system,resources=configmaps,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",namespace=system,resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",namespace=system,resources=secrets,verbs=get;list;watch;delete
+// +kubebuilder:rbac:groups="",namespace=system,resources=serviceaccounts,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",namespace=system,resources=serviceaccounts/token,verbs=create
+// +kubebuilder:rbac:groups=image.openshift.io,namespace=system,resources=imagestreams,verbs=get;create;update;delete
+// +kubebuilder:rbac:groups=image.openshift.io,namespace=system,resources=imagestreamtags,verbs=delete
+// +kubebuilder:rbac:groups=tekton.dev,namespace=system,resources=tasks;pipelines;pipelineruns;taskruns,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",namespace=system,resources=pods,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",namespace=system,resources=pods/exec,verbs=create;get
+// +kubebuilder:rbac:groups="",namespace=system,resources=pods/log,verbs=get
+// +kubebuilder:rbac:groups="",namespace=system,resources=services,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=route.openshift.io,resources=routes,verbs=get
+// +kubebuilder:rbac:groups=route.openshift.io,namespace=system,resources=routes,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",namespace=system,resources=events,verbs=create;patch
+// +kubebuilder:rbac:groups=events.k8s.io,namespace=system,resources=events,verbs=create;patch
 
 // Reconcile handles ImageBuild reconciliation and manages the build lifecycle
-func (r *ImageBuildReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *ImageBuildReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, err error) {
+	ctx, span := ibTracer.Start(ctx, "ImageBuild.Reconcile",
+		trace.WithAttributes(
+			attribute.String("imagebuild.name", req.Name),
+			attribute.String("imagebuild.namespace", req.Namespace),
+		),
+	)
+	defer controllerutils.EndSpanWithError(span, &err)
+
 	log := r.Log.WithValues("imagebuild", req.NamespacedName)
 
 	imageBuild := &automotivev1alpha1.ImageBuild{}
 	if err := r.Get(ctx, req.NamespacedName, imageBuild); err != nil {
+		if errors.IsNotFound(err) {
+			// Drop any background hydration state for a deleted build.
+			r.hydrating.Delete(req.Namespace + "/" + req.Name)
+		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
+	if getTraceID(imageBuild) == "" {
+		ensureTraceID(ctx, imageBuild)
+		if err := r.Update(ctx, imageBuild); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to set trace-id annotation: %w", err)
+		}
+	}
+	log = log.WithValues("traceID", getTraceID(imageBuild))
+
+	span.SetAttributes(
+		attribute.String("imagebuild.phase", imageBuild.Status.Phase),
+	)
+
+	expiryResult, expired, expiryErr := r.checkExpiry(ctx, imageBuild)
+	if expired || expiryErr != nil {
+		return expiryResult, expiryErr
+	}
+
+	var phaseResult ctrl.Result
+	var phaseErr error
 	switch imageBuild.Status.Phase {
 	case "":
-		return r.handleInitialState(ctx, imageBuild)
-	case "Uploading":
-		return r.handleUploadingState(ctx, imageBuild)
+		phaseResult, phaseErr = r.handleInitialState(ctx, imageBuild)
+	case phaseUploading:
+		phaseResult, phaseErr = r.handleUploadingState(ctx, imageBuild)
 	case phaseBuilding:
-		return r.handleBuildingState(ctx, imageBuild)
+		phaseResult, phaseErr = r.handleBuildingState(ctx, imageBuild)
 	case "Pushing":
-		// Legacy phase - push is now part of the pipeline
-		return r.handlePushingState(ctx, imageBuild)
+		phaseResult, phaseErr = r.handlePushingState(ctx, imageBuild)
 	case "Flashing":
-		// Legacy phase - flash is now part of the pipeline
-		// Handle gracefully for any in-progress builds from before this change
-		return r.handleFlashingState(ctx, imageBuild)
+		phaseResult, phaseErr = r.handleFlashingState(ctx, imageBuild)
 	case phaseCompleted:
-		return r.handleCompletedState(ctx, imageBuild)
-	case phaseFailed:
-		// Retry cleanup of any transient secrets that failed to delete.
-		if err := r.cleanupTransientSecrets(ctx, imageBuild, r.Log); err != nil {
-			return ctrl.Result{RequeueAfter: secretCleanupRequeue}, nil
+		phaseResult = r.handleCompletedState(ctx, imageBuild)
+	case automotivev1alpha1.ImageBuildPhaseExpired:
+		phaseResult = r.handleExpiredState(ctx, imageBuild)
+	case phaseCancelled, phaseFailed:
+		if shutdownErr := r.shutdownUploadPod(ctx, imageBuild); shutdownErr != nil {
+			log.Error(shutdownErr, "Failed to shutdown upload pod, will retry")
+			phaseResult = ctrl.Result{RequeueAfter: secretCleanupRequeue}
+		} else if cleanupErr := r.cleanupTransientSecrets(ctx, imageBuild, r.Log); cleanupErr != nil {
+			log.Error(cleanupErr, "Failed to cleanup transient secrets, will retry")
+			phaseResult = ctrl.Result{RequeueAfter: secretCleanupRequeue}
 		}
-		return ctrl.Result{}, nil
 	default:
 		log.Info("Unknown phase", "phase", imageBuild.Status.Phase)
-		return ctrl.Result{}, nil
 	}
+	if traceID := getTraceID(imageBuild); traceID != "" {
+		span.SetAttributes(attribute.String("imagebuild.trace_id", traceID))
+	}
+
+	if phaseErr != nil {
+		return phaseResult, phaseErr
+	}
+
+	if expiryResult.RequeueAfter > 0 &&
+		(phaseResult.RequeueAfter == 0 || expiryResult.RequeueAfter < phaseResult.RequeueAfter) {
+		phaseResult.RequeueAfter = expiryResult.RequeueAfter
+	}
+	return phaseResult, nil
 }
 
 // ensureImageStreamOwnerRef adds a non-controller owner reference from the
@@ -177,10 +331,7 @@ func (r *ImageBuildReconciler) ensureImageStreamOwnerRef(
 		return nil
 	}
 
-	log := r.Log.WithValues(
-		"imagebuild",
-		types.NamespacedName{Name: imageBuild.Name, Namespace: imageBuild.Namespace},
-	)
+	log := r.buildLogger(imageBuild)
 
 	is := &unstructured.Unstructured{}
 	is.SetGroupVersionKind(schema.GroupVersionKind{
@@ -193,7 +344,7 @@ func (r *ImageBuildReconciler) ensureImageStreamOwnerRef(
 		Name:      streamName,
 		Namespace: imageBuild.Namespace,
 	}, is); err != nil {
-		if errors.IsNotFound(err) {
+		if errors.IsNotFound(err) || meta.IsNoMatchError(err) {
 			log.Info("ImageStream not found, skipping owner ref", "imageStream", streamName)
 			return nil
 		}
@@ -219,35 +370,47 @@ func (r *ImageBuildReconciler) ensureImageStreamOwnerRef(
 	return nil
 }
 
-// extractImageStreamName extracts the ImageStream name from the ImageBuild's
-// internal registry URLs (GetContainerPush and GetExportOCI).
-func extractImageStreamName(imageBuild *automotivev1alpha1.ImageBuild) string {
+// extractInternalImageStreamTags returns ImageStreamTag names ("name:tag") for
+// any internal registry URLs in the ImageBuild's export configuration.
+func extractInternalImageStreamTags(imageBuild *automotivev1alpha1.ImageBuild) []string {
 	prefix := tasks.DefaultInternalRegistryURL + "/"
-	for _, ref := range []string{imageBuild.Spec.GetContainerPush(), imageBuild.Spec.GetExportOCI()} {
+	refs := []string{imageBuild.Spec.GetContainerPush(), imageBuild.Spec.GetExportOCI()}
+	tags := make([]string, 0, len(refs))
+	for _, ref := range refs {
 		after, ok := strings.CutPrefix(ref, prefix)
 		if !ok {
 			continue
 		}
 		parts := strings.SplitN(after, "/", 2)
-		if len(parts) < 2 {
+		if len(parts) < 2 || parts[1] == "" {
 			continue
 		}
-		nameTag := strings.SplitN(parts[1], ":", 2)
-		if nameTag[0] != "" {
-			return nameTag[0]
+		ist := parts[1]
+		if !strings.Contains(ist, ":") {
+			ist += ":latest"
 		}
+		tags = append(tags, ist)
 	}
-	return ""
+	return tags
+}
+
+func extractImageStreamName(imageBuild *automotivev1alpha1.ImageBuild) string {
+	tags := extractInternalImageStreamTags(imageBuild)
+	if len(tags) == 0 {
+		return ""
+	}
+	name, _, _ := strings.Cut(tags[0], ":")
+	return name
 }
 
 func (r *ImageBuildReconciler) handleInitialState(
 	ctx context.Context,
 	imageBuild *automotivev1alpha1.ImageBuild,
-) (ctrl.Result, error) {
-	log := r.Log.WithValues(
-		"imagebuild",
-		types.NamespacedName{Name: imageBuild.Name, Namespace: imageBuild.Namespace},
-	)
+) (result ctrl.Result, err error) {
+	ctx, span := ibTracer.Start(ctx, "ImageBuild.HandleInitialState")
+	defer controllerutils.EndSpanWithError(span, &err)
+
+	log := r.buildLogger(imageBuild)
 
 	if err := r.ensureImageStreamOwnerRef(ctx, imageBuild); err != nil {
 		return ctrl.Result{}, err
@@ -257,33 +420,33 @@ func (r *ImageBuildReconciler) handleInitialState(
 		if err := r.createUploadPod(ctx, imageBuild); err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to create upload server: %w", err)
 		}
-		if err := r.updateStatus(ctx, imageBuild, "Uploading", "Waiting for file uploads"); err != nil {
+		if err := r.updateStatus(ctx, imageBuild, phaseUploading, "Waiting for file uploads"); err != nil {
 			log.Error(err, "Failed to update status to Uploading")
 			return ctrl.Result{}, err
 		}
-		return ctrl.Result{Requeue: true}, nil
+		return ctrl.Result{}, nil
 	}
 
 	if err := r.updateStatus(ctx, imageBuild, phaseBuilding, "Build started"); err != nil {
 		log.Error(err, "Failed to update status to Building")
 		return ctrl.Result{}, err
 	}
-	return ctrl.Result{Requeue: true}, nil
+	return ctrl.Result{}, nil
 }
 
 func (r *ImageBuildReconciler) handleUploadingState(
 	ctx context.Context,
 	imageBuild *automotivev1alpha1.ImageBuild,
-) (ctrl.Result, error) {
-	log := r.Log.WithValues(
-		"imagebuild",
-		types.NamespacedName{Name: imageBuild.Name, Namespace: imageBuild.Namespace},
-	)
+) (result ctrl.Result, err error) {
+	ctx, span := ibTracer.Start(ctx, "ImageBuild.HandleUploadingState")
+	defer controllerutils.EndSpanWithError(span, &err)
+
+	log := r.buildLogger(imageBuild)
 
 	// Fail the build if uploads have not completed within the configured timeout
 	uploadTimeout := 30 * time.Minute // default
 	operatorConfig := &automotivev1alpha1.OperatorConfig{}
-	if err := r.Get(ctx, types.NamespacedName{Name: "config", Namespace: OperatorNamespace}, operatorConfig); err == nil {
+	if err := r.Get(ctx, types.NamespacedName{Name: "config", Namespace: controllerutils.OperatorNamespace()}, operatorConfig); err == nil {
 		if operatorConfig.Spec.OSBuilds != nil && operatorConfig.Spec.OSBuilds.UploadTimeoutMinutes > 0 {
 			uploadTimeout = time.Duration(operatorConfig.Spec.OSBuilds.UploadTimeoutMinutes) * time.Minute
 		}
@@ -306,8 +469,31 @@ func (r *ImageBuildReconciler) handleUploadingState(
 		return ctrl.Result{}, nil
 	}
 
-	uploadsComplete := imageBuild.Annotations != nil &&
-		imageBuild.Annotations["automotive.sdv.cloud.redhat.com/uploads-complete"] == "true"
+	hydrated, hydrateErr := r.ensureWorkspaceHydrate(ctx, imageBuild)
+	if hydrateErr != nil {
+		return r.handleWorkspaceHydrateError(ctx, imageBuild, hydrateErr)
+	}
+	if !hydrated {
+		// Copy is running in the background; poll without blocking the worker.
+		return ctrl.Result{RequeueAfter: workspaceHydratePoll}, nil
+	}
+
+	var uploadsComplete bool
+	if buildapi.ShouldSelfCompleteUploads(imageBuild.Annotations) {
+		patched := imageBuild.DeepCopy()
+		if patched.Annotations == nil {
+			patched.Annotations = map[string]string{}
+		}
+		patched.Annotations[labels.UploadsComplete] = labels.ValueTrue
+		if err := r.Patch(ctx, patched, client.MergeFrom(imageBuild)); err != nil {
+			return ctrl.Result{}, fmt.Errorf("mark uploads complete after workspace hydrate: %w", err)
+		}
+		imageBuild.Annotations = patched.Annotations
+		uploadsComplete = true
+	} else {
+		uploadsComplete = imageBuild.Annotations != nil &&
+			imageBuild.Annotations[labels.UploadsComplete] == labels.ValueTrue
+	}
 
 	if !uploadsComplete {
 		return ctrl.Result{RequeueAfter: time.Second * 10}, nil
@@ -321,17 +507,176 @@ func (r *ImageBuildReconciler) handleUploadingState(
 		log.Error(err, "Failed to update status to Building")
 		return ctrl.Result{}, err
 	}
-	return ctrl.Result{Requeue: true}, nil
+	return ctrl.Result{}, nil
+}
+
+const (
+	maxWorkspaceHydrateAttempts = 6
+	workspaceHydrateRetry       = 5 * time.Second
+	workspaceHydrateTimeout     = 2 * time.Minute
+	// workspaceHydratePoll is how often the reconciler re-checks a background
+	// hydration that is still running.
+	workspaceHydratePoll = 3 * time.Second
+)
+
+func (r *ImageBuildReconciler) handleWorkspaceHydrateError(
+	ctx context.Context,
+	imageBuild *automotivev1alpha1.ImageBuild,
+	err error,
+) (ctrl.Result, error) {
+	log := r.buildLogger(imageBuild)
+	if stderrors.Is(err, buildapi.ErrUploadPodNotReady) {
+		if imageBuild.Status.Message != "Waiting for upload pod" {
+			if statusErr := r.updateStatus(ctx, imageBuild, phaseUploading, "Waiting for upload pod"); statusErr != nil {
+				log.Error(statusErr, "Failed to update status while waiting for upload pod")
+			}
+		}
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+	}
+
+	attempts := hydrateAttemptCount(imageBuild)
+	if !buildapi.IsPermanentHydrateError(err) && attempts < maxWorkspaceHydrateAttempts {
+		if bumpErr := r.bumpHydrateAttempts(ctx, imageBuild, attempts+1); bumpErr != nil {
+			return ctrl.Result{}, bumpErr
+		}
+		msg := fmt.Sprintf("Retrying workspace file copy (%d/%d): %v", attempts+1, maxWorkspaceHydrateAttempts, err)
+		if statusErr := r.updateStatus(ctx, imageBuild, phaseUploading, msg); statusErr != nil {
+			log.Error(statusErr, "Failed to update status while retrying workspace hydrate")
+		}
+		return ctrl.Result{RequeueAfter: workspaceHydrateRetry}, nil
+	}
+
+	log.Error(err, "Failed to hydrate workspace files into upload pod")
+	if shutdownErr := r.shutdownUploadPod(ctx, imageBuild); shutdownErr != nil {
+		log.Error(shutdownErr, "Failed to shutdown upload pod after hydrate failure")
+	}
+	if statusErr := r.updateStatus(ctx, imageBuild, phaseFailed,
+		fmt.Sprintf("Workspace file hydrate failed: %v", err)); statusErr != nil {
+		log.Error(statusErr, "Failed to update status to Failed")
+		return ctrl.Result{}, statusErr
+	}
+	return ctrl.Result{}, nil
+}
+
+func hydrateAttemptCount(imageBuild *automotivev1alpha1.ImageBuild) int {
+	if imageBuild.Annotations == nil {
+		return 0
+	}
+	n, err := strconv.Atoi(imageBuild.Annotations[labels.WorkspaceHydrateAttempts])
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
+}
+
+func (r *ImageBuildReconciler) bumpHydrateAttempts(
+	ctx context.Context,
+	imageBuild *automotivev1alpha1.ImageBuild,
+	n int,
+) error {
+	patched := imageBuild.DeepCopy()
+	if patched.Annotations == nil {
+		patched.Annotations = map[string]string{}
+	}
+	patched.Annotations[labels.WorkspaceHydrateAttempts] = strconv.Itoa(n)
+	if err := r.Patch(ctx, patched, client.MergeFrom(imageBuild)); err != nil {
+		return fmt.Errorf("record workspace hydrate attempt: %w", err)
+	}
+	imageBuild.Annotations = patched.Annotations
+	return nil
+}
+
+// ensureWorkspaceHydrate drives workspace hydration off the reconcile worker.
+// The copy runs in a background goroutine keyed by build name; the reconciler
+// polls its result instead of blocking. It returns:
+//
+//   - (true, nil)  hydration is complete or not needed; proceed.
+//   - (false, nil) a copy is running (or was just started); requeue and poll.
+//   - (false, err) a copy finished with err for handleWorkspaceHydrateError to
+//     classify as transient (retry) or permanent (fail).
+func (r *ImageBuildReconciler) ensureWorkspaceHydrate(
+	ctx context.Context,
+	imageBuild *automotivev1alpha1.ImageBuild,
+) (bool, error) {
+	if imageBuild.Annotations == nil || imageBuild.Annotations[labels.WorkspaceHydrate] == "" {
+		return true, nil
+	}
+	if imageBuild.Annotations[labels.WorkspaceHydrateDone] == labels.ValueTrue {
+		return true, nil
+	}
+
+	key := imageBuild.Namespace + "/" + imageBuild.Name
+	if v, ok := r.hydrating.Load(key); ok {
+		job := v.(*hydrateJob)
+		if !job.done.Load() {
+			return false, nil // copy still running
+		}
+		r.hydrating.Delete(key)
+		if job.err != nil {
+			return false, job.err
+		}
+		if err := r.markWorkspaceHydrateDone(ctx, imageBuild); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+
+	// No job yet. Defer until the destination pod is Running so we do not spawn
+	// goroutines that would immediately fail with ErrUploadPodNotReady.
+	ready, err := buildapi.UploadPodReady(ctx, r.Client, imageBuild.Namespace, imageBuild.Name)
+	if err != nil {
+		return false, err
+	}
+	if !ready {
+		return false, buildapi.ErrUploadPodNotReady
+	}
+
+	job := &hydrateJob{}
+	r.hydrating.Store(key, job)
+	// The reconcile ctx is cancelled when Reconcile returns, so the copy uses
+	// its own timeout-bounded context. Hydration is idempotent (it skips files
+	// already present), so an interrupted or restarted copy resumes safely.
+	ib := imageBuild.DeepCopy()
+	fn := r.workspaceHydrateFunc()
+	go func() {
+		hydrateCtx, cancel := context.WithTimeout(context.Background(), workspaceHydrateTimeout)
+		defer cancel()
+		job.err = fn(hydrateCtx, r.RestConfig, r.Client, ib)
+		job.done.Store(true)
+	}()
+	return false, nil
+}
+
+func (r *ImageBuildReconciler) workspaceHydrateFunc() hydrateFunc {
+	if r.hydrateFunc != nil {
+		return r.hydrateFunc
+	}
+	return buildapi.HydrateWorkspaceForImageBuild
+}
+
+func (r *ImageBuildReconciler) markWorkspaceHydrateDone(
+	ctx context.Context,
+	imageBuild *automotivev1alpha1.ImageBuild,
+) error {
+	patched := imageBuild.DeepCopy()
+	if patched.Annotations == nil {
+		patched.Annotations = map[string]string{}
+	}
+	patched.Annotations[labels.WorkspaceHydrateDone] = labels.ValueTrue
+	if err := r.Patch(ctx, patched, client.MergeFrom(imageBuild)); err != nil {
+		return fmt.Errorf("mark workspace hydrate done: %w", err)
+	}
+	imageBuild.Annotations = patched.Annotations
+	return nil
 }
 
 func (r *ImageBuildReconciler) handleBuildingState(
 	ctx context.Context,
 	imageBuild *automotivev1alpha1.ImageBuild,
-) (ctrl.Result, error) {
-	log := r.Log.WithValues(
-		"imagebuild",
-		types.NamespacedName{Name: imageBuild.Name, Namespace: imageBuild.Namespace},
-	)
+) (result ctrl.Result, err error) {
+	ctx, span := ibTracer.Start(ctx, "ImageBuild.HandleBuildingState")
+	defer controllerutils.EndSpanWithError(span, &err)
+	log := r.buildLogger(imageBuild)
 
 	if imageBuild.Status.PipelineRunName != "" {
 		return r.checkBuildProgress(ctx, imageBuild)
@@ -378,6 +723,102 @@ func (r *ImageBuildReconciler) handleBuildingState(
 	return r.startNewBuild(ctx, imageBuild)
 }
 
+// checkExpiry returns (result, expired, error). Caller should return immediately if expired.
+func (r *ImageBuildReconciler) checkExpiry(
+	ctx context.Context,
+	imageBuild *automotivev1alpha1.ImageBuild,
+) (ctrl.Result, bool, error) {
+	log := r.buildLogger(imageBuild)
+
+	if imageBuild.Status.Phase == automotivev1alpha1.ImageBuildPhaseExpired {
+		return ctrl.Result{}, false, nil
+	}
+
+	if imageBuild.Annotations[automotivev1alpha1.NoExpireAnnotation] == "true" ||
+		imageBuild.Spec.Workspace != "" {
+		if err := r.updateExpiresAt(ctx, imageBuild, nil); err != nil {
+			return ctrl.Result{}, false, err
+		}
+		return ctrl.Result{}, false, nil
+	}
+
+	ttl, err := r.resolveEffectiveTTL(ctx, imageBuild)
+	if err != nil {
+		log.Error(err, "Failed to resolve TTL, skipping expiry check")
+		r.emitEventf(imageBuild, corev1.EventTypeWarning, "InvalidTTL",
+			"Failed to resolve TTL, expiry disabled for this build: %v", err)
+		return ctrl.Result{}, false, nil
+	}
+	if ttl == 0 {
+		if err := r.updateExpiresAt(ctx, imageBuild, nil); err != nil {
+			return ctrl.Result{}, false, err
+		}
+		return ctrl.Result{}, false, nil
+	}
+
+	if imageBuild.Status.CompletionTime == nil {
+		return ctrl.Result{}, false, nil
+	}
+	anchor := imageBuild.Status.CompletionTime.Time
+
+	expiresAt := anchor.Add(ttl)
+	remaining := time.Until(expiresAt)
+
+	if err := r.updateExpiresAt(ctx, imageBuild, &expiresAt); err != nil {
+		return ctrl.Result{}, false, err
+	}
+
+	if remaining > 0 {
+		log.Info("Build not yet expired", "expiresAt", expiresAt, "remaining", remaining.Truncate(time.Second))
+		return ctrl.Result{RequeueAfter: remaining}, false, nil
+	}
+
+	log.Info("Build expired, transitioning to Expired phase", "ttl", ttl, "anchor", anchor,
+		"previousPhase", imageBuild.Status.Phase)
+	r.emitEventf(imageBuild, corev1.EventTypeNormal, eventReasonBuildExpired,
+		"Build expired after %s, cleaning up resources", ttl)
+
+	if err := r.updateStatus(ctx, imageBuild, automotivev1alpha1.ImageBuildPhaseExpired,
+		fmt.Sprintf("Build expired after %s", ttl)); err != nil {
+		return ctrl.Result{}, false, fmt.Errorf("failed to transition expired build: %w", err)
+	}
+	return ctrl.Result{}, true, nil
+}
+
+// resolveEffectiveTTL returns 0 if expiry is disabled.
+func (r *ImageBuildReconciler) resolveEffectiveTTL(
+	ctx context.Context,
+	imageBuild *automotivev1alpha1.ImageBuild,
+) (time.Duration, error) {
+	operatorConfig := &automotivev1alpha1.OperatorConfig{}
+	if err := r.Get(ctx, types.NamespacedName{
+		Name: "config", Namespace: controllerutils.OperatorNamespace(),
+	}, operatorConfig); err != nil && !errors.IsNotFound(err) {
+		return 0, fmt.Errorf("failed to load OperatorConfig: %w", err)
+	}
+	return controllerutils.ResolveBuildTTL(imageBuild.Spec.GetTTL(), operatorConfig.Spec.OSBuilds)
+}
+
+// updateExpiresAt sets or clears status.ExpiresAt. Pass nil to clear.
+func (r *ImageBuildReconciler) updateExpiresAt(
+	ctx context.Context,
+	imageBuild *automotivev1alpha1.ImageBuild,
+	expiresAt *time.Time,
+) error {
+	desired, needsUpdate := controllerutils.ComputeExpiresAt(imageBuild.Status.ExpiresAt, expiresAt)
+	if !needsUpdate {
+		return nil
+	}
+	fresh := &automotivev1alpha1.ImageBuild{}
+	if err := r.Get(ctx, types.NamespacedName{
+		Name: imageBuild.Name, Namespace: imageBuild.Namespace,
+	}, fresh); err != nil {
+		return err
+	}
+	fresh.Status.ExpiresAt = desired
+	return r.Status().Update(ctx, fresh)
+}
+
 // secretCleanupRequeue is the interval for retrying transient secret deletion
 // in terminal state handlers.
 const secretCleanupRequeue = 30 * time.Second
@@ -385,26 +826,119 @@ const secretCleanupRequeue = 30 * time.Second
 func (r *ImageBuildReconciler) handleCompletedState(
 	ctx context.Context,
 	imageBuild *automotivev1alpha1.ImageBuild,
-) (ctrl.Result, error) {
-	// Retry cleanup of any transient secrets that failed to delete when
-	// the build first reached terminal state.
+) ctrl.Result {
 	if err := r.cleanupTransientSecrets(ctx, imageBuild, r.Log); err != nil {
-		return ctrl.Result{RequeueAfter: secretCleanupRequeue}, nil
+		return ctrl.Result{RequeueAfter: secretCleanupRequeue}
 	}
-	return ctrl.Result{}, nil
+	return ctrl.Result{}
+}
+
+func (r *ImageBuildReconciler) handleExpiredState(
+	ctx context.Context,
+	imageBuild *automotivev1alpha1.ImageBuild,
+) ctrl.Result {
+	log := r.buildLogger(imageBuild)
+
+	var retryNeeded bool
+	deleteObj := func(obj client.Object, kind string) {
+		if err := r.Delete(ctx, obj); err != nil {
+			if !errors.IsNotFound(err) {
+				log.Error(err, "Failed to delete "+kind, "name", obj.GetName())
+				retryNeeded = true
+			}
+		} else {
+			log.Info("Deleted "+kind, "name", obj.GetName())
+		}
+	}
+
+	ns := imageBuild.Namespace
+
+	if err := r.shutdownUploadPod(ctx, imageBuild); err != nil {
+		log.Error(err, "Failed to shutdown upload pod")
+		retryNeeded = true
+	}
+
+	if name := imageBuild.Status.PipelineRunName; name != "" {
+		deleteObj(&tektonv1.PipelineRun{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}}, "PipelineRun")
+	}
+	if name := imageBuild.Status.PushTaskRunName; name != "" {
+		deleteObj(&tektonv1.TaskRun{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}}, "push TaskRun")
+	}
+	if name := imageBuild.Status.FlashTaskRunName; name != "" {
+		deleteObj(&tektonv1.TaskRun{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}}, "flash TaskRun")
+	}
+	if name := imageBuild.Status.PVCName; name != "" {
+		if name == imageBuild.Spec.BuildCachePVC {
+			log.Info("Skipping PVC deletion: shared build-cache PVC", "pvc", name)
+		} else {
+			deleteObj(&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}}, "PVC")
+		}
+	}
+
+	cmName := safeDerivedName(imageBuild.Name, "-manifest")
+	deleteObj(&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: cmName, Namespace: ns}}, "manifest ConfigMap")
+
+	if r.deleteExpiredImageStreams(ctx, imageBuild, log) {
+		retryNeeded = true
+	}
+
+	if err := r.cleanupTransientSecrets(ctx, imageBuild, log); err != nil {
+		retryNeeded = true
+	}
+
+	if retryNeeded {
+		log.Info("Some expired resources could not be cleaned up, will retry",
+			"requeueAfter", secretCleanupRequeue)
+		return ctrl.Result{RequeueAfter: secretCleanupRequeue}
+	}
+	return ctrl.Result{}
+}
+
+func (r *ImageBuildReconciler) deleteExpiredImageStreams(
+	ctx context.Context,
+	imageBuild *automotivev1alpha1.ImageBuild,
+	log logr.Logger,
+) bool {
+	var failed bool
+	tags := extractInternalImageStreamTags(imageBuild)
+	seen := make(map[string]struct{}, len(tags))
+	for _, tag := range tags {
+		name, _, _ := strings.Cut(tag, ":")
+		if _, ok := seen[name]; ok || name == "" {
+			continue
+		}
+		seen[name] = struct{}{}
+
+		is := &unstructured.Unstructured{}
+		is.SetGroupVersionKind(schema.GroupVersionKind{
+			Group: "image.openshift.io", Version: "v1", Kind: "ImageStream",
+		})
+		is.SetName(name)
+		is.SetNamespace(imageBuild.Namespace)
+
+		if err := r.Delete(ctx, is); err != nil {
+			if !errors.IsNotFound(err) {
+				log.Error(err, "Failed to delete ImageStream", "name", name)
+				failed = true
+			}
+		} else {
+			log.Info("Deleted ImageStream", "name", name)
+		}
+	}
+	return failed
 }
 
 func (r *ImageBuildReconciler) checkBuildProgress(
 	ctx context.Context,
 	imageBuild *automotivev1alpha1.ImageBuild,
-) (ctrl.Result, error) {
-	log := r.Log.WithValues(
-		"imagebuild",
-		types.NamespacedName{Name: imageBuild.Name, Namespace: imageBuild.Namespace},
-	)
+) (result ctrl.Result, err error) {
+	ctx, span := ibTracer.Start(ctx, "ImageBuild.CheckBuildProgress")
+	defer controllerutils.EndSpanWithError(span, &err)
+
+	log := r.buildLogger(imageBuild)
 
 	pipelineRun := &tektonv1.PipelineRun{}
-	err := r.Get(ctx, types.NamespacedName{
+	err = r.Get(ctx, types.NamespacedName{
 		Name:      imageBuild.Status.PipelineRunName,
 		Namespace: imageBuild.Namespace,
 	}, pipelineRun)
@@ -421,61 +955,38 @@ func (r *ImageBuildReconciler) checkBuildProgress(
 	}
 
 	if isPipelineRunSuccessful(pipelineRun) {
-		fresh := &automotivev1alpha1.ImageBuild{}
-		nsName := types.NamespacedName{Name: imageBuild.Name, Namespace: imageBuild.Namespace}
-		if err := r.Get(ctx, nsName, fresh); err != nil {
+		aibImageUsed, builderImageUsed := extractProvenance(pipelineRun, imageBuild.Spec.GetAIBImage())
+		leaseID := ""
+		if imageBuild.Spec.IsFlashEnabled() {
+			leaseID = extractLeaseID(pipelineRun)
+		}
+
+		msg := "Build completed successfully"
+		if imageBuild.Spec.IsFlashEnabled() {
+			msg = "Build and flash completed successfully"
+		}
+
+		if err := r.updateStatus(ctx, imageBuild, phaseCompleted, msg, func(ib *automotivev1alpha1.ImageBuild) {
+			ib.Status.AIBImageUsed = aibImageUsed
+			ib.Status.BuilderImageUsed = builderImageUsed
+			if leaseID != "" {
+				ib.Status.LeaseID = leaseID
+			}
+		}); err != nil {
 			return ctrl.Result{}, err
 		}
 
-		patch := client.MergeFrom(fresh.DeepCopy())
-
-		// Extract and populate build provenance
-		aibImageUsed, builderImageUsed := extractProvenance(pipelineRun, fresh.Spec.GetAIBImage())
-		fresh.Status.AIBImageUsed = aibImageUsed
-		fresh.Status.BuilderImageUsed = builderImageUsed
-
-		// Extract lease ID if flash was enabled
-		if fresh.Spec.IsFlashEnabled() {
-			fresh.Status.LeaseID = extractLeaseID(pipelineRun)
+		recordBuildMetrics(imageBuild, pipelineRun, buildStatusSuccess)
+		if imageBuild.Spec.IsFlashEnabled() {
+			r.recordPipelineFlashMetrics(ctx, imageBuild, pipelineRun, buildStatusSuccess)
 		}
-
-		// Pipeline includes push-disk-artifact and flash-image tasks (when enabled)
-		// Pipeline completion means everything succeeded
-		fresh.Status.Phase = phaseCompleted
-		if fresh.Spec.IsFlashEnabled() {
-			fresh.Status.Message = "Build and flash completed successfully"
-		} else {
-			fresh.Status.Message = "Build completed successfully"
-		}
-		if fresh.Status.CompletionTime == nil {
-			now := metav1.Now()
-			fresh.Status.CompletionTime = &now
-		}
-
-		if err := r.Status().Patch(ctx, fresh, patch); err != nil {
-			log.Error(err, "Failed to patch status to Completed")
-			return ctrl.Result{}, err
-		}
-		recordBuildMetrics(fresh, pipelineRun, buildStatusSuccess)
-
-		r.emitEventf(
-			fresh,
-			corev1.EventTypeNormal,
-			eventReasonBuildCompleted,
-			"Build completed successfully: mode=%s target=%s arch=%s toDisk=%t pipelineRun=%s",
-			fresh.Spec.GetMode(),
-			fresh.Spec.GetTarget(),
-			fresh.Spec.Architecture,
-			fresh.Spec.GetBuildDiskImage(),
-			pipelineRun.Name,
-		)
 
 		// Cleanup transient secrets
 		cleanupErr := r.cleanupTransientSecrets(ctx, imageBuild, r.Log)
 
 		// Write lease back to workspace for reuse by subsequent builds
-		if fresh.Spec.Workspace != "" && fresh.Status.LeaseID != "" {
-			r.updateWorkspaceLease(ctx, fresh, log)
+		if imageBuild.Spec.Workspace != "" && imageBuild.Status.LeaseID != "" {
+			r.updateWorkspaceLease(ctx, imageBuild, log)
 		}
 
 		if cleanupErr != nil {
@@ -484,14 +995,37 @@ func (r *ImageBuildReconciler) checkBuildProgress(
 		return ctrl.Result{}, nil
 	}
 
-	// Build failed - cleanup transient secrets
 	cleanupErr := r.cleanupTransientSecrets(ctx, imageBuild, r.Log)
+
+	if pipelineRun.Spec.Status == tektonv1.PipelineRunSpecStatusCancelled {
+		if imageBuild.Status.Phase == phaseCancelled {
+			if cleanupErr != nil {
+				return ctrl.Result{RequeueAfter: secretCleanupRequeue}, nil
+			}
+			return ctrl.Result{}, nil
+		}
+		if err := r.updateStatus(ctx, imageBuild, phaseCancelled, "Build cancelled by user"); err != nil {
+			log.Error(err, "Failed to update status to Cancelled")
+			return ctrl.Result{}, err
+		}
+		recordBuildMetrics(imageBuild, pipelineRun, buildStatusFailure)
+		if imageBuild.Spec.IsFlashEnabled() {
+			r.recordPipelineFlashMetrics(ctx, imageBuild, pipelineRun, buildStatusFailure)
+		}
+		if cleanupErr != nil {
+			return ctrl.Result{RequeueAfter: secretCleanupRequeue}, nil
+		}
+		return ctrl.Result{}, nil
+	}
 
 	if err := r.updateStatus(ctx, imageBuild, phaseFailed, r.pipelineRunFailureDetail(ctx, pipelineRun)); err != nil {
 		log.Error(err, "Failed to update status to Failed")
 		return ctrl.Result{}, err
 	}
 	recordBuildMetrics(imageBuild, pipelineRun, buildStatusFailure)
+	if imageBuild.Spec.IsFlashEnabled() {
+		r.recordPipelineFlashMetrics(ctx, imageBuild, pipelineRun, buildStatusFailure)
+	}
 	if cleanupErr != nil {
 		return ctrl.Result{RequeueAfter: secretCleanupRequeue}, nil
 	}
@@ -501,10 +1035,20 @@ func (r *ImageBuildReconciler) checkBuildProgress(
 func (r *ImageBuildReconciler) startNewBuild(
 	ctx context.Context,
 	imageBuild *automotivev1alpha1.ImageBuild,
-) (ctrl.Result, error) {
+) (result ctrl.Result, err error) {
+	ctx, span := ibTracer.Start(ctx, "ImageBuild.StartNewBuild")
+	defer controllerutils.EndSpanWithError(span, &err)
+
 	// PVC is now created via VolumeClaimTemplate in createBuildTaskRun
 	// to ensure proper zone affinity with WaitForFirstConsumer
 	if err := r.createBuildTaskRun(ctx, imageBuild); err != nil {
+		if stderrors.Is(err, errTerminalConfig) {
+			msg := strings.TrimSuffix(err.Error(), ": "+errTerminalConfig.Error())
+			if statusErr := r.updateStatus(ctx, imageBuild, phaseFailed, msg); statusErr != nil {
+				return ctrl.Result{}, statusErr
+			}
+			return ctrl.Result{}, nil
+		}
 		return ctrl.Result{}, fmt.Errorf("failed to create build task run: %w", err)
 	}
 
@@ -516,15 +1060,21 @@ func (r *ImageBuildReconciler) createBuildTaskRun(
 	ctx context.Context,
 	imageBuild *automotivev1alpha1.ImageBuild,
 ) error {
-	nsName := types.NamespacedName{Name: imageBuild.Name, Namespace: imageBuild.Namespace}
-	log := r.Log.WithValues("imagebuild", nsName)
+	log := r.buildLogger(imageBuild)
 	log.Info("Creating PipelineRun for ImageBuild")
+
+	exportFormat := r.resolveExportFormat(ctx, imageBuild)
 
 	// Fetch OperatorConfig from the operator namespace to get build configuration
 	operatorConfig := &automotivev1alpha1.OperatorConfig{}
-	err := r.Get(ctx, types.NamespacedName{Name: "config", Namespace: OperatorNamespace}, operatorConfig)
+	err := r.Get(ctx, types.NamespacedName{Name: "config", Namespace: controllerutils.OperatorNamespace()}, operatorConfig)
 	if err != nil && !errors.IsNotFound(err) {
 		return fmt.Errorf("failed to get OperatorConfig configuration: %w", err)
+	}
+
+	// Fail closed: secureBuild must not silently fall back to the cluster pipeline
+	if imageBuild.Spec.SecureBuild && (err != nil || operatorConfig.Spec.OSBuilds == nil) {
+		return fmt.Errorf("secureBuild requested but OperatorConfig or spec.osBuilds is not available: %w", errTerminalConfig)
 	}
 
 	var buildConfig *tasks.BuildConfig
@@ -543,9 +1093,62 @@ func (r *ImageBuildReconciler) createBuildTaskRun(
 			UsePVCScratchVolumes:        operatorConfig.Spec.OSBuilds.GetUsePVCScratchVolumes(),
 		}
 		controllerutils.ApplyTrustedCABundleFromOSBuilds(buildConfig, operatorConfig.Spec.OSBuilds)
-	}
-	_ = buildConfig // buildConfig used for RuntimeClassName if needed
 
+		controllerutils.ApplyOCIVolumesConfig(buildConfig, &operatorConfig.Spec)
+
+		if imageBuild.Spec.SecureBuild {
+			// Use the digest-pinned ref snapshotted on the CR by the Build API,
+			// not the current OperatorConfig value (which may have changed).
+			ref := strings.TrimSpace(imageBuild.Spec.TaskBundleRef)
+			if ref == "" {
+				return fmt.Errorf("secureBuild requested but taskBundleRef is not set on the ImageBuild: %w", errTerminalConfig)
+			}
+			if !digestPinnedRef.MatchString(ref) {
+				return fmt.Errorf("secureBuild requires a digest-pinned taskBundleRef (must match image@sha256:<64 hex>), got %q: %w", ref, errTerminalConfig)
+			}
+
+			if operatorConfig.Spec.OSBuilds.TaskBundleVerify {
+				if _, ok := r.verifiedBundles.Load(ref); !ok {
+					verifyCtx, verifyCancel := context.WithTimeout(ctx, 30*time.Second)
+					defer verifyCancel()
+					pubKeyPEM, err := bundleverify.FetchCosignPublicKey(verifyCtx, r.Client, operatorConfig.Spec.OSBuilds.TaskBundleCosignKeyRef, controllerutils.OperatorNamespace())
+					if err != nil {
+						return fmt.Errorf("secureBuild: cosign key is unavailable: %w: %w", err, errTerminalConfig)
+					}
+					if err := bundleverify.VerifyBundle(verifyCtx, ref, pubKeyPEM); err != nil {
+						return fmt.Errorf("task bundle signature verification failed: %w: %w", err, errTerminalConfig)
+					}
+					r.verifiedBundles.Store(ref, struct{}{})
+				}
+			}
+
+			buildConfig.TaskResolver = tasks.TaskResolverBundle
+			buildConfig.TaskBundleRef = ref
+
+			// Bundle tasks are exported with nil BuildConfig (defaults only).
+			// Reject settings that would silently diverge from the bundle.
+			if buildConfig.TrustedCABundleName != "" && buildConfig.TrustedCABundleName != tasks.DefaultTrustedCABundleConfigMap {
+				return fmt.Errorf("secureBuild: OperatorConfig specifies custom CA bundle %q but bundle tasks use default %q; build a custom bundle or remove the CA override: %w",
+					buildConfig.TrustedCABundleName, tasks.DefaultTrustedCABundleConfigMap, errTerminalConfig)
+			}
+			if buildConfig.TrustedCABundleKind != "" && !strings.EqualFold(buildConfig.TrustedCABundleKind, "ConfigMap") {
+				return fmt.Errorf("secureBuild: OperatorConfig specifies CA bundle kind %q but bundle tasks use ConfigMap; build a custom bundle or remove the CA override: %w",
+					buildConfig.TrustedCABundleKind, errTerminalConfig)
+			}
+			if buildConfig.UseMemoryVolumes {
+				r.emitEventf(imageBuild, corev1.EventTypeWarning, "SecureBuildConfigDrift",
+					"OperatorConfig.useMemoryVolumes is enabled but bundle tasks use disk-backed emptyDir; memory volumes will not apply to this build")
+			}
+			if buildConfig.UsePVCScratchVolumes {
+				r.emitEventf(imageBuild, corev1.EventTypeWarning, "SecureBuildConfigDrift",
+					"OperatorConfig.usePVCScratchVolumes is enabled but bundle tasks use emptyDir; PVC scratch will not apply to this build")
+			}
+			if buildConfig.UseOCIVolumes {
+				r.emitEventf(imageBuild, corev1.EventTypeWarning, "SecureBuildConfigDrift",
+					"OperatorConfig has OCIVolumes enabled but bundle tasks do not include OCI volume mounts; ORAS will be downloaded at runtime")
+			}
+		}
+	}
 	// PVC is created via VolumeClaimTemplate in the PipelineRun workspace binding
 	// to ensure proper zone affinity with WaitForFirstConsumer storage class
 
@@ -582,7 +1185,7 @@ func (r *ImageBuildReconciler) createBuildTaskRun(
 			Name: "export-format",
 			Value: tektonv1.ParamValue{
 				Type:      tektonv1.ParamTypeString,
-				StringVal: imageBuild.Spec.GetExportFormat(),
+				StringVal: exportFormat,
 			},
 		},
 		{
@@ -621,6 +1224,41 @@ func (r *ImageBuildReconciler) createBuildTaskRun(
 			},
 		},
 		{
+			Name: "s3-bucket",
+			Value: tektonv1.ParamValue{
+				Type:      tektonv1.ParamTypeString,
+				StringVal: imageBuild.Spec.GetS3Bucket(),
+			},
+		},
+		{
+			Name: "s3-prefix",
+			Value: tektonv1.ParamValue{
+				Type:      tektonv1.ParamTypeString,
+				StringVal: s3Prefix(imageBuild),
+			},
+		},
+		{
+			Name: "s3-endpoint",
+			Value: tektonv1.ParamValue{
+				Type:      tektonv1.ParamTypeString,
+				StringVal: imageBuild.Spec.GetS3Endpoint(),
+			},
+		},
+		{
+			Name: "s3-region",
+			Value: tektonv1.ParamValue{
+				Type:      tektonv1.ParamTypeString,
+				StringVal: imageBuild.Spec.GetS3Region(),
+			},
+		},
+		{
+			Name: "s3-insecure-skip-tls-verify",
+			Value: tektonv1.ParamValue{
+				Type:      tektonv1.ParamTypeString,
+				StringVal: fmt.Sprintf("%t", imageBuild.Spec.GetS3InsecureSkipTLSVerify()),
+			},
+		},
+		{
 			Name: "builder-image",
 			Value: tektonv1.ParamValue{
 				Type:      tektonv1.ParamTypeString,
@@ -648,6 +1286,62 @@ func (r *ImageBuildReconciler) createBuildTaskRun(
 				StringVal: fmt.Sprintf("%t", imageBuild.Spec.BuildCachePVC != ""),
 			},
 		},
+		{
+			Name: "secure-build",
+			Value: tektonv1.ParamValue{
+				Type:      tektonv1.ParamTypeString,
+				StringVal: fmt.Sprintf("%t", imageBuild.Spec.SecureBuild),
+			},
+		},
+		{
+			Name: "insecure-registry",
+			Value: tektonv1.ParamValue{
+				Type:      tektonv1.ParamTypeString,
+				StringVal: fmt.Sprintf("%t", operatorConfig.Spec.OSBuilds != nil && operatorConfig.Spec.OSBuilds.InsecureRegistry),
+			},
+		},
+		{
+			Name: "reproducible",
+			Value: tektonv1.ParamValue{
+				Type:      tektonv1.ParamTypeString,
+				StringVal: fmt.Sprintf("%t", imageBuild.Spec.Reproducible),
+			},
+		},
+		{
+			Name: "task-bundle-ref",
+			Value: tektonv1.ParamValue{
+				Type:      tektonv1.ParamTypeString,
+				StringVal: imageBuild.Spec.TaskBundleRef,
+			},
+		},
+		{
+			Name: "restore-sources-ref",
+			Value: tektonv1.ParamValue{
+				Type:      tektonv1.ParamTypeString,
+				StringVal: imageBuild.Spec.RestoreSourcesRef,
+			},
+		},
+		{
+			Name: "custom-defines",
+			Value: tektonv1.ParamValue{
+				Type:      tektonv1.ParamTypeString,
+				StringVal: strings.Join(imageBuild.Spec.GetCustomDefs(), "\n"),
+			},
+		},
+		{
+			Name: "aib-extra-args",
+			Value: tektonv1.ParamValue{
+				Type:      tektonv1.ParamTypeString,
+				StringVal: strings.Join(r.resolveExtraArgs(ctx, imageBuild), "\n"),
+			},
+		},
+		{
+			Name: "trace-id",
+			Value: tektonv1.ParamValue{
+				Type:      tektonv1.ParamTypeString,
+				StringVal: getTraceID(imageBuild),
+			},
+		},
 	}
 
 	clusterRegistryRoute := ""
@@ -660,7 +1354,11 @@ func (r *ImageBuildReconciler) createBuildTaskRun(
 	} else {
 		route := &routev1.Route{}
 		routeNS := types.NamespacedName{Name: "default-route", Namespace: "openshift-image-registry"}
-		if err := routeReader.Get(ctx, routeNS, route); err == nil {
+		if err := routeReader.Get(ctx, routeNS, route); err != nil {
+			if !errors.IsNotFound(err) && !meta.IsNoMatchError(err) {
+				return fmt.Errorf("failed to look up cluster registry route %s: %w", routeNS, err)
+			}
+		} else {
 			clusterRegistryRoute = route.Spec.Host
 			log.Info("Auto-detected cluster registry route", "route", clusterRegistryRoute)
 		}
@@ -692,21 +1390,21 @@ func (r *ImageBuildReconciler) createBuildTaskRun(
 	// Add flash params if flash is enabled
 	var flashExporterSelector, flashCmd, flashOCIAuthSecretName string
 	if imageBuild.Spec.IsFlashEnabled() {
-		// User-specified exporter selector bypasses target lookup entirely
 		flashExporterSelector = imageBuild.Spec.GetFlashExporterSelector()
-		if flashExporterSelector == "" {
-			target := imageBuild.Spec.GetTarget()
-			if operatorConfig.Spec.Jumpstarter != nil {
-				if mapping, ok := operatorConfig.Spec.Jumpstarter.TargetMappings[target]; ok {
+		target := imageBuild.Spec.GetTarget()
+		// Look up target mapping for selector (if not overridden) and flash command
+		if operatorConfig.Spec.Jumpstarter != nil {
+			if mapping, ok := operatorConfig.Spec.Jumpstarter.TargetMappings[target]; ok {
+				if flashExporterSelector == "" {
 					flashExporterSelector = mapping.Selector
-					flashCmd = mapping.FlashCmd
 				}
+				flashCmd = mapping.FlashCmd
 			}
-			if flashExporterSelector == "" {
-				return fmt.Errorf("flash enabled but no Jumpstarter target mapping found for target %q; "+
-					"configure OperatorConfig.spec.jumpstarter.targetMappings[%q] with selector and flashCmd, "+
-					"or set flash.exporterSelector directly", target, target)
-			}
+		}
+		if flashExporterSelector == "" {
+			return fmt.Errorf("flash enabled but no Jumpstarter target mapping found for target %q; "+
+				"configure OperatorConfig.spec.jumpstarter.targetMappings[%q] with selector and flashCmd, "+
+				"or set flash.exporterSelector directly: %w", target, target, errTerminalConfig)
 		}
 		// User-specified flash command overrides OperatorConfig
 		if userCmd := imageBuild.Spec.GetFlashCmd(); userCmd != "" {
@@ -716,8 +1414,9 @@ func (r *ImageBuildReconciler) createBuildTaskRun(
 		// Require an external route and fail fast if unavailable.
 		if imageBuild.Spec.GetUseServiceAccountAuth() && clusterRegistryRoute == "" {
 			return fmt.Errorf(
-				"flash with internal registry requires an external registry route; " +
-					"set OperatorConfig.spec.osBuilds.clusterRegistryRoute or expose openshift-image-registry/default-route",
+				"flash with internal registry requires an external registry route; "+
+					"set OperatorConfig.spec.osBuilds.clusterRegistryRoute or expose openshift-image-registry/default-route: %w",
+				errTerminalConfig,
 			)
 		}
 
@@ -862,6 +1561,10 @@ func (r *ImageBuildReconciler) createBuildTaskRun(
 				Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: imageBuild.Spec.GetFlashLeaseName()},
 			},
 			tektonv1.Param{
+				Name:  "flash-lease-tags",
+				Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: buildapi.BuildLeaseTags(operatorConfig.Spec.Jumpstarter.GetDefaultLeaseTags(), imageBuild.Name, imageBuild.Spec.GetFlashLeaseTags())},
+			},
+			tektonv1.Param{
 				Name:  "jumpstarter-image",
 				Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: operatorConfig.Spec.Jumpstarter.GetJumpstarterImage()},
 			},
@@ -946,6 +1649,15 @@ func (r *ImageBuildReconciler) createBuildTaskRun(
 		})
 	}
 
+	if imageBuild.Spec.GetS3CredentialsSecret() != "" {
+		pipelineWorkspaces = append(pipelineWorkspaces, tektonv1.WorkspaceBinding{
+			Name: "s3-auth",
+			Secret: &corev1.SecretVolumeSource{
+				SecretName: imageBuild.Spec.GetS3CredentialsSecret(),
+			},
+		})
+	}
+
 	if imageBuild.Spec.IsFlashEnabled() {
 		pipelineWorkspaces = append(pipelineWorkspaces, tektonv1.WorkspaceBinding{
 			Name: "jumpstarter-client",
@@ -971,7 +1683,7 @@ func (r *ImageBuildReconciler) createBuildTaskRun(
 						{
 							Key:      corev1.LabelArchStable,
 							Operator: corev1.NodeSelectorOpIn,
-							Values:   []string{imageBuild.Spec.Architecture},
+							Values:   []string{controllerutils.NormalizeArchToK8s(imageBuild.Spec.Architecture)},
 						},
 					},
 				},
@@ -996,35 +1708,50 @@ func (r *ImageBuildReconciler) createBuildTaskRun(
 		log.Info("Setting RuntimeClassName from ImageBuild spec", "runtimeClassName", imageBuild.Spec.RuntimeClassName)
 		podTemplate.RuntimeClassName = &imageBuild.Spec.RuntimeClassName
 	}
+	podTemplate.Volumes = append(podTemplate.Volumes, tasks.OCIVolumes(buildConfig)...)
+	podTemplate.Volumes = append(podTemplate.Volumes, ociRepoVolumes(imageBuild.Spec.GetOCIRepoImages())...)
+	pipelineRunSpec := tektonv1.PipelineRunSpec{
+		Params:     params,
+		Workspaces: pipelineWorkspaces,
+		TaskRunTemplate: tektonv1.PipelineTaskRunTemplate{
+			PodTemplate:        podTemplate,
+			ServiceAccountName: automotivev1alpha1.BuildServiceAccountName,
+		},
+	}
+
+	if buildConfig != nil && buildConfig.TaskResolver == tasks.TaskResolverBundle {
+		pipelineRunSpec.PipelineRef = &tektonv1.PipelineRef{
+			ResolverRef: tektonv1.ResolverRef{
+				Resolver: tektonv1.ResolverName(tasks.TektonResolverBundles),
+				Params: tektonv1.Params{
+					{Name: "bundle", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: buildConfig.TaskBundleRef}},
+					{Name: "name", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: "automotive-build-pipeline"}},
+					{Name: "kind", Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: "pipeline"}},
+				},
+			},
+		}
+	} else {
+		pipelineRunSpec.PipelineRef = &tektonv1.PipelineRef{
+			Name: "automotive-build-pipeline",
+		}
+	}
+
 	pipelineRun := &tektonv1.PipelineRun{
 		ObjectMeta: metav1.ObjectMeta{
 			GenerateName: safeDerivedName(imageBuild.Name, "-build-"),
 			Namespace:    imageBuild.Namespace,
-			Labels: map[string]string{
-				tektonv1.ManagedByLabelKey:                        "automotive-dev-operator",
-				"automotive.sdv.cloud.redhat.com/imagebuild-name": imageBuild.Name,
-			},
+			Labels:       buildLabels(imageBuild, "build"),
 			OwnerReferences: []metav1.OwnerReference{
 				{
 					APIVersion: imageBuild.APIVersion,
 					Kind:       imageBuild.Kind,
 					Name:       imageBuild.Name,
 					UID:        imageBuild.UID,
-					Controller: ptr.To(true),
+					Controller: new(true),
 				},
 			},
 		},
-		Spec: tektonv1.PipelineRunSpec{
-			PipelineRef: &tektonv1.PipelineRef{
-				Name: "automotive-build-pipeline",
-			},
-			Params:     params,
-			Workspaces: pipelineWorkspaces,
-			TaskRunTemplate: tektonv1.PipelineTaskRunTemplate{
-				PodTemplate:        podTemplate,
-				ServiceAccountName: automotivev1alpha1.BuildServiceAccountName,
-			},
-		},
+		Spec: pipelineRunSpec,
 	}
 
 	if err := r.Create(ctx, pipelineRun); err != nil {
@@ -1037,6 +1764,7 @@ func (r *ImageBuildReconciler) createBuildTaskRun(
 	}
 
 	fresh.Status.PipelineRunName = pipelineRun.Name
+	fresh.Status.ResolvedExportFormat = exportFormat
 	if err := r.Status().Update(ctx, fresh); err != nil {
 		return fmt.Errorf("failed to update ImageBuild with PipelineRun name: %w", err)
 	}
@@ -1091,8 +1819,11 @@ func (r *ImageBuildReconciler) createOrUpdateManifestConfigMap(
 		if customDefs := imageBuild.Spec.GetCustomDefs(); len(customDefs) > 0 {
 			cm.Data["custom-definitions.env"] = strings.Join(customDefs, "\n")
 		}
-		if extraArgs := imageBuild.Spec.GetAIBExtraArgs(); len(extraArgs) > 0 {
+		if extraArgs := r.resolveExtraArgs(ctx, imageBuild); len(extraArgs) > 0 {
 			cm.Data["aib-extra-args.txt"] = strings.Join(extraArgs, "\n")
+		}
+		if rootPw := imageBuild.Spec.GetRootPassword(); rootPw != "" {
+			cm.Data["root-password.txt"] = rootPw
 		}
 
 		return controllerutil.SetControllerReference(imageBuild, cm, r.Scheme)
@@ -1104,8 +1835,11 @@ func (r *ImageBuildReconciler) createOrUpdateManifestConfigMap(
 	return configMapName, nil
 }
 
-func (r *ImageBuildReconciler) createPushTaskRun(ctx context.Context, imageBuild *automotivev1alpha1.ImageBuild, artifactFilename string) error {
-	log := r.Log.WithValues("imagebuild", types.NamespacedName{Name: imageBuild.Name, Namespace: imageBuild.Namespace})
+func (r *ImageBuildReconciler) createPushTaskRun(ctx context.Context, imageBuild *automotivev1alpha1.ImageBuild, artifactFilename string) (err error) {
+	ctx, span := ibTracer.Start(ctx, "ImageBuild.CreatePushTaskRun")
+	defer controllerutils.EndSpanWithError(span, &err)
+
+	log := r.buildLogger(imageBuild)
 	log.Info("Creating push TaskRun for ImageBuild", "artifactFilename", artifactFilename)
 
 	if !imageBuild.Spec.HasDiskExport() {
@@ -1128,10 +1862,9 @@ func (r *ImageBuildReconciler) createPushTaskRun(ctx context.Context, imageBuild
 		return fmt.Errorf("target is required for push: aib.target must be set")
 	}
 
-	exportFormat := imageBuild.Spec.GetExportFormat()
-	// exportFormat has a default of "qcow2", but validate anyway
+	exportFormat := imageBuild.Status.ResolvedExportFormat
 	if exportFormat == "" {
-		return fmt.Errorf("export format is required for push")
+		exportFormat = r.resolveExportFormat(ctx, imageBuild)
 	}
 
 	pushSecretRef := imageBuild.Spec.GetPushSecretRef()
@@ -1143,9 +1876,14 @@ func (r *ImageBuildReconciler) createPushTaskRun(ctx context.Context, imageBuild
 		return fmt.Errorf("artifact filename is required for push")
 	}
 
-	// Fetch OperatorConfig to resolve image overrides for the push task
+	// Fetch OperatorConfig to resolve image overrides and registry settings for the push task
 	pushBuildConfig := r.resolveBuildConfig(ctx)
-	pushTask := tasks.GeneratePushArtifactRegistryTask(OperatorNamespace, pushBuildConfig)
+	pushTask := tasks.GeneratePushArtifactRegistryTask(controllerutils.OperatorNamespace(), pushBuildConfig)
+
+	operatorConfig := &automotivev1alpha1.OperatorConfig{}
+	if err := r.Get(ctx, types.NamespacedName{Name: "config", Namespace: controllerutils.OperatorNamespace()}, operatorConfig); err != nil {
+		return fmt.Errorf("failed to fetch OperatorConfig for push task: %w", err)
+	}
 
 	params := []tektonv1.Param{
 		{
@@ -1197,6 +1935,55 @@ func (r *ImageBuildReconciler) createPushTaskRun(ctx context.Context, imageBuild
 				StringVal: artifactFilename,
 			},
 		},
+		{
+			Name: "insecure-registry",
+			Value: tektonv1.ParamValue{
+				Type:      tektonv1.ParamTypeString,
+				StringVal: fmt.Sprintf("%t", operatorConfig.Spec.OSBuilds != nil && operatorConfig.Spec.OSBuilds.InsecureRegistry),
+			},
+		},
+		{
+			Name: "secure-build",
+			Value: tektonv1.ParamValue{
+				Type:      tektonv1.ParamTypeString,
+				StringVal: fmt.Sprintf("%t", imageBuild.Spec.SecureBuild),
+			},
+		},
+		{
+			Name: "reproducible",
+			Value: tektonv1.ParamValue{
+				Type:      tektonv1.ParamTypeString,
+				StringVal: fmt.Sprintf("%t", imageBuild.Spec.Reproducible),
+			},
+		},
+		{
+			Name: "task-bundle-ref",
+			Value: tektonv1.ParamValue{
+				Type:      tektonv1.ParamTypeString,
+				StringVal: imageBuild.Spec.TaskBundleRef,
+			},
+		},
+		{
+			Name: "custom-defines",
+			Value: tektonv1.ParamValue{
+				Type:      tektonv1.ParamTypeString,
+				StringVal: strings.Join(imageBuild.Spec.GetCustomDefs(), "\n"),
+			},
+		},
+		{
+			Name: "aib-extra-args",
+			Value: tektonv1.ParamValue{
+				Type:      tektonv1.ParamTypeString,
+				StringVal: strings.Join(r.resolveExtraArgs(ctx, imageBuild), "\n"),
+			},
+		},
+		{
+			Name: "trace-id",
+			Value: tektonv1.ParamValue{
+				Type:      tektonv1.ParamTypeString,
+				StringVal: getTraceID(imageBuild),
+			},
+		},
 	}
 
 	workspaces := []tektonv1.WorkspaceBinding{
@@ -1208,29 +1995,30 @@ func (r *ImageBuildReconciler) createPushTaskRun(ctx context.Context, imageBuild
 		},
 	}
 
+	var pushPodTemplate *pod.PodTemplate
+	if ociVols := tasks.OCIVolumes(pushBuildConfig); len(ociVols) > 0 {
+		pushPodTemplate = &pod.PodTemplate{Volumes: ociVols}
+	}
 	taskRun := &tektonv1.TaskRun{
 		ObjectMeta: metav1.ObjectMeta{
 			GenerateName: safeDerivedName(imageBuild.Name, "-push-"),
 			Namespace:    imageBuild.Namespace,
-			Labels: map[string]string{
-				tektonv1.ManagedByLabelKey:                        "automotive-dev-operator",
-				"automotive.sdv.cloud.redhat.com/imagebuild-name": imageBuild.Name,
-				"automotive.sdv.cloud.redhat.com/task-type":       "push",
-			},
+			Labels:       buildLabels(imageBuild, "push"),
 			OwnerReferences: []metav1.OwnerReference{
 				{
 					APIVersion: imageBuild.APIVersion,
 					Kind:       imageBuild.Kind,
 					Name:       imageBuild.Name,
 					UID:        imageBuild.UID,
-					Controller: ptr.To(true),
+					Controller: new(true),
 				},
 			},
 		},
 		Spec: tektonv1.TaskRunSpec{
-			TaskSpec:   &pushTask.Spec,
-			Params:     params,
-			Workspaces: workspaces,
+			TaskSpec:    &pushTask.Spec,
+			Params:      params,
+			Workspaces:  workspaces,
+			PodTemplate: pushPodTemplate,
 		},
 	}
 
@@ -1255,9 +2043,11 @@ func (r *ImageBuildReconciler) createPushTaskRun(ctx context.Context, imageBuild
 func (r *ImageBuildReconciler) handlePushingState(
 	ctx context.Context,
 	imageBuild *automotivev1alpha1.ImageBuild,
-) (ctrl.Result, error) {
-	nsName := types.NamespacedName{Name: imageBuild.Name, Namespace: imageBuild.Namespace}
-	log := r.Log.WithValues("imagebuild", nsName)
+) (result ctrl.Result, err error) {
+	ctx, span := ibTracer.Start(ctx, "ImageBuild.HandlePushingState")
+	defer controllerutils.EndSpanWithError(span, &err)
+
+	log := r.buildLogger(imageBuild)
 
 	if imageBuild.Status.PushTaskRunName == "" {
 		// Fetch PipelineRun to get artifact filename from results
@@ -1286,7 +2076,7 @@ func (r *ImageBuildReconciler) handlePushingState(
 
 	// Check push TaskRun status
 	taskRun := &tektonv1.TaskRun{}
-	err := r.Get(ctx, types.NamespacedName{
+	err = r.Get(ctx, types.NamespacedName{
 		Name:      imageBuild.Status.PushTaskRunName,
 		Namespace: imageBuild.Namespace,
 	}, taskRun)
@@ -1298,7 +2088,7 @@ func (r *ImageBuildReconciler) handlePushingState(
 				log.Error(statusErr, "Failed to clear PushTaskRunName in status")
 				return ctrl.Result{}, statusErr
 			}
-			return ctrl.Result{Requeue: true}, nil
+			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, err
 	}
@@ -1310,40 +2100,21 @@ func (r *ImageBuildReconciler) handlePushingState(
 	// Push completed - cleanup transient secrets and update status
 	cleanupErr := r.cleanupTransientSecrets(ctx, imageBuild, log)
 
-	fresh := &automotivev1alpha1.ImageBuild{}
-	if err := r.Get(ctx, types.NamespacedName{Name: imageBuild.Name, Namespace: imageBuild.Namespace}, fresh); err != nil {
-		return ctrl.Result{}, err
-	}
-
-	patch := client.MergeFrom(fresh.DeepCopy())
-
 	if isTaskRunSuccessful(taskRun) {
-		// Check if flash is enabled
-		if fresh.Spec.IsFlashEnabled() {
-			fresh.Status.Phase = "Flashing"
-			fresh.Status.Message = "Flashing image to device"
-			if err := r.Status().Patch(ctx, fresh, patch); err != nil {
-				log.Error(err, "Failed to patch status to Flashing")
+		if imageBuild.Spec.IsFlashEnabled() {
+			if err := r.updateStatus(ctx, imageBuild, "Flashing", "Flashing image to device"); err != nil {
 				return ctrl.Result{}, err
 			}
-			return ctrl.Result{Requeue: true}, nil
+			return ctrl.Result{}, nil
 		}
 
-		fresh.Status.Phase = phaseCompleted
-		fresh.Status.Message = "Build and push completed successfully"
+		if err := r.updateStatus(ctx, imageBuild, phaseCompleted, "Build and push completed successfully"); err != nil {
+			return ctrl.Result{}, err
+		}
 	} else {
-		fresh.Status.Phase = phaseFailed
-		fresh.Status.Message = "Push to registry failed"
-	}
-
-	if fresh.Status.CompletionTime == nil {
-		now := metav1.Now()
-		fresh.Status.CompletionTime = &now
-	}
-
-	if err := r.Status().Patch(ctx, fresh, patch); err != nil {
-		log.Error(err, "Failed to patch status after push completion")
-		return ctrl.Result{}, err
+		if err := r.updateStatus(ctx, imageBuild, phaseFailed, "Push to registry failed"); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	if cleanupErr != nil {
@@ -1355,9 +2126,11 @@ func (r *ImageBuildReconciler) handlePushingState(
 func (r *ImageBuildReconciler) handleFlashingState(
 	ctx context.Context,
 	imageBuild *automotivev1alpha1.ImageBuild,
-) (ctrl.Result, error) {
-	nsName := types.NamespacedName{Name: imageBuild.Name, Namespace: imageBuild.Namespace}
-	log := r.Log.WithValues("imagebuild", nsName)
+) (result ctrl.Result, err error) {
+	ctx, span := ibTracer.Start(ctx, "ImageBuild.HandleFlashingState")
+	defer controllerutils.EndSpanWithError(span, &err)
+
+	log := r.buildLogger(imageBuild)
 
 	if imageBuild.Status.FlashTaskRunName == "" {
 		// No flash TaskRun yet, create one
@@ -1375,7 +2148,7 @@ func (r *ImageBuildReconciler) handleFlashingState(
 
 	// Check flash TaskRun status
 	taskRun := &tektonv1.TaskRun{}
-	err := r.Get(ctx, types.NamespacedName{
+	err = r.Get(ctx, types.NamespacedName{
 		Name:      imageBuild.Status.FlashTaskRunName,
 		Namespace: imageBuild.Namespace,
 	}, taskRun)
@@ -1387,7 +2160,7 @@ func (r *ImageBuildReconciler) handleFlashingState(
 				log.Error(statusErr, "Failed to clear FlashTaskRunName in status")
 				return ctrl.Result{}, statusErr
 			}
-			return ctrl.Result{Requeue: true}, nil
+			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, err
 	}
@@ -1399,29 +2172,17 @@ func (r *ImageBuildReconciler) handleFlashingState(
 	// Flash completed - cleanup and update status
 	cleanupErr := r.cleanupTransientSecrets(ctx, imageBuild, log)
 
-	fresh := &automotivev1alpha1.ImageBuild{}
-	if err := r.Get(ctx, types.NamespacedName{Name: imageBuild.Name, Namespace: imageBuild.Namespace}, fresh); err != nil {
-		return ctrl.Result{}, err
-	}
-
-	patch := client.MergeFrom(fresh.DeepCopy())
-
-	if isTaskRunSuccessful(taskRun) {
-		fresh.Status.Phase = phaseCompleted
-		fresh.Status.Message = "Build, push, and flash completed successfully"
+	flashSucceeded := isTaskRunSuccessful(taskRun)
+	if flashSucceeded {
+		if err := r.updateStatus(ctx, imageBuild, phaseCompleted, "Build, push, and flash completed successfully"); err != nil {
+			return ctrl.Result{}, err
+		}
+		recordFlashMetrics(imageBuild, taskRun, buildStatusSuccess)
 	} else {
-		fresh.Status.Phase = phaseFailed
-		fresh.Status.Message = taskRunFailureMessage(taskRun, "Flash to device failed")
-	}
-
-	if fresh.Status.CompletionTime == nil {
-		now := metav1.Now()
-		fresh.Status.CompletionTime = &now
-	}
-
-	if err := r.Status().Patch(ctx, fresh, patch); err != nil {
-		log.Error(err, "Failed to patch status after flash completion")
-		return ctrl.Result{}, err
+		if err := r.updateStatus(ctx, imageBuild, phaseFailed, taskRunFailureMessage(taskRun, "Flash to device failed")); err != nil {
+			return ctrl.Result{}, err
+		}
+		recordFlashMetrics(imageBuild, taskRun, buildStatusFailure)
 	}
 
 	if cleanupErr != nil {
@@ -1433,8 +2194,11 @@ func (r *ImageBuildReconciler) handleFlashingState(
 func (r *ImageBuildReconciler) createFlashTaskRun(
 	ctx context.Context,
 	imageBuild *automotivev1alpha1.ImageBuild,
-) error {
-	log := r.Log.WithValues("imagebuild", types.NamespacedName{Name: imageBuild.Name, Namespace: imageBuild.Namespace})
+) (err error) {
+	ctx, span := ibTracer.Start(ctx, "ImageBuild.CreateFlashTaskRun")
+	defer controllerutils.EndSpanWithError(span, &err)
+
+	log := r.buildLogger(imageBuild)
 	log.Info("Creating flash TaskRun for ImageBuild")
 
 	if !imageBuild.Spec.IsFlashEnabled() {
@@ -1443,7 +2207,7 @@ func (r *ImageBuildReconciler) createFlashTaskRun(
 
 	// Get exporter selector from OperatorConfig based on target
 	operatorConfig := &automotivev1alpha1.OperatorConfig{}
-	err := r.Get(ctx, types.NamespacedName{Name: "config", Namespace: OperatorNamespace}, operatorConfig)
+	err = r.Get(ctx, types.NamespacedName{Name: "config", Namespace: controllerutils.OperatorNamespace()}, operatorConfig)
 	if err != nil {
 		return fmt.Errorf("failed to get OperatorConfig: %w", err)
 	}
@@ -1483,7 +2247,7 @@ func (r *ImageBuildReconciler) createFlashTaskRun(
 		FlashTimeoutMinutes:  operatorConfig.Spec.OSBuilds.GetFlashTimeoutMinutes(),
 		DefaultLeaseDuration: operatorConfig.Spec.Jumpstarter.GetDefaultLeaseDuration(),
 	}
-	flashTask := tasks.GenerateFlashTask(OperatorNamespace, flashBuildConfig)
+	flashTask := tasks.GenerateFlashTask(controllerutils.OperatorNamespace(), flashBuildConfig)
 
 	params := []tektonv1.Param{
 		{
@@ -1506,6 +2270,14 @@ func (r *ImageBuildReconciler) createFlashTaskRun(
 			Name:  "lease-name",
 			Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: imageBuild.Spec.GetFlashLeaseName()},
 		},
+		{
+			Name:  "lease-tags",
+			Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: buildapi.BuildLeaseTags(operatorConfig.Spec.Jumpstarter.GetDefaultLeaseTags(), imageBuild.Name, imageBuild.Spec.GetFlashLeaseTags())},
+		},
+		{
+			Name:  "trace-id",
+			Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: getTraceID(imageBuild)},
+		},
 	}
 
 	workspaces := []tektonv1.WorkspaceBinding{
@@ -1521,18 +2293,14 @@ func (r *ImageBuildReconciler) createFlashTaskRun(
 		ObjectMeta: metav1.ObjectMeta{
 			GenerateName: safeDerivedName(imageBuild.Name, "-flash-"),
 			Namespace:    imageBuild.Namespace,
-			Labels: map[string]string{
-				tektonv1.ManagedByLabelKey:                        "automotive-dev-operator",
-				"automotive.sdv.cloud.redhat.com/imagebuild-name": imageBuild.Name,
-				"automotive.sdv.cloud.redhat.com/task-type":       "flash",
-			},
+			Labels:       buildLabels(imageBuild, "flash"),
 			OwnerReferences: []metav1.OwnerReference{
 				{
 					APIVersion: imageBuild.APIVersion,
 					Kind:       imageBuild.Kind,
 					Name:       imageBuild.Name,
 					UID:        imageBuild.UID,
-					Controller: ptr.To(true),
+					Controller: new(true),
 				},
 			},
 		},
@@ -1594,58 +2362,76 @@ func (r *ImageBuildReconciler) cleanupTransientSecrets(
 			firstErr = err
 		}
 	}
+	uid := imageBuild.UID
 	if imageBuild.Spec.SecretRef != "" {
-		collect(r.deleteSecret(ctx, imageBuild.Namespace, imageBuild.Spec.SecretRef, "registry auth", log))
+		collect(r.deleteSecret(ctx, imageBuild.Namespace, imageBuild.Spec.SecretRef, "registry auth", log, uid))
 	}
 	if imageBuild.Spec.PushSecretRef != "" {
-		collect(r.deleteSecret(ctx, imageBuild.Namespace, imageBuild.Spec.PushSecretRef, "push auth", log))
+		collect(r.deleteSecret(ctx, imageBuild.Namespace, imageBuild.Spec.PushSecretRef, "push auth", log, uid))
 	}
 	if flashSecretRef := imageBuild.Spec.GetFlashClientConfigSecretRef(); flashSecretRef != "" {
-		collect(r.deleteSecret(ctx, imageBuild.Namespace, flashSecretRef, "flash client config", log))
+		collect(r.deleteSecret(ctx, imageBuild.Namespace, flashSecretRef, "flash client config", log, uid))
 	}
-	collect(r.deleteSecret(ctx, imageBuild.Namespace, imageBuild.Name+"-flash-oci-auth", "flash OCI auth", log))
+	collect(r.deleteSecret(ctx, imageBuild.Namespace, imageBuild.Name+"-flash-oci-auth", "flash OCI auth", log, uid))
+	if s3SecretRef := imageBuild.Spec.GetS3CredentialsSecret(); s3SecretRef != "" {
+		collect(r.deleteSecret(ctx, imageBuild.Namespace, s3SecretRef, "S3 credentials", log, uid))
+	}
 	return firstErr
 }
 
-// deleteSecret attempts to delete a secret. Returns nil on success or if
-// the secret is already gone (NotFound). Returns the error on transient
-// failure so the caller can schedule a retry.
+// deleteSecret deletes a secret only if it is owned by the given ImageBuild
+// (i.e. has a matching controller owner reference). User-provided shared
+// secrets are left untouched. Returns nil on success, if the secret is
+// already gone, or if it is not owned by this build.
 func (r *ImageBuildReconciler) deleteSecret(
 	ctx context.Context,
 	namespace, secretName, secretType string,
 	log logr.Logger,
+	ownerUID types.UID,
 ) error {
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      secretName,
-			Namespace: namespace,
-		},
+	secret := &corev1.Secret{}
+	if err := r.Get(ctx, types.NamespacedName{Name: secretName, Namespace: namespace}, secret); err != nil {
+		if errors.IsNotFound(err) {
+			return nil
+		}
+		log.Error(err, "Failed to get "+secretType+" secret (will retry)", "secret", secretName)
+		return err
 	}
-	err := r.Delete(ctx, secret)
-	if err == nil {
-		log.Info("Deleted "+secretType+" secret", "secret", secretName)
+
+	owner := metav1.GetControllerOf(secret)
+	if owner == nil || owner.UID != ownerUID {
+		log.V(1).Info("Skipping deletion of "+secretType+" secret not owned by this build", "secret", secretName)
 		return nil
 	}
-	if errors.IsNotFound(err) {
-		return nil
+
+	if err := r.Delete(ctx, secret, client.Preconditions{UID: &secret.UID}); err != nil {
+		if errors.IsNotFound(err) {
+			return nil
+		}
+		log.Error(err, "Failed to delete "+secretType+" secret (will retry)", "secret", secretName)
+		return err
 	}
-	log.Error(err, "Failed to delete "+secretType+" secret (will retry)", "secret", secretName)
-	return err
+	log.Info("Deleted "+secretType+" secret", "secret", secretName)
+	return nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *ImageBuildReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	builder := ctrl.NewControllerManagedBy(mgr).
+	if err := mgr.Add(r.seedMetricsFromCRs(mgr)); err != nil {
+		return fmt.Errorf("failed to register metrics seeder: %w", err)
+	}
+
+	b := ctrl.NewControllerManagedBy(mgr).
+		WithOptions(controller.Options{MaxConcurrentReconciles: 4}).
 		For(&automotivev1alpha1.ImageBuild{}).
 		Owns(&tektonv1.PipelineRun{}).
 		Owns(&tektonv1.TaskRun{}).
 		Owns(&corev1.Pod{}).
 		Owns(&corev1.PersistentVolumeClaim{}).
 		Owns(&corev1.Service{}).
-		Owns(&corev1.ConfigMap{}).
-		Owns(&corev1.Secret{})
+		Owns(&corev1.Secret{}, builder.WithPredicates(predicate.GenerationChangedPredicate{}))
 
-	return builder.Complete(r)
+	return b.Complete(r)
 }
 
 func isTaskRunCompleted(taskRun *tektonv1.TaskRun) bool {
@@ -1681,9 +2467,9 @@ func pipelineRunFailureMessage(pipelineRun *tektonv1.PipelineRun) string {
 
 // pipelineTaskLabel maps pipeline task names to user-friendly labels for error messages.
 var pipelineTaskLabel = map[string]string{
-	"build-image":        "Image build failed",
-	"push-disk-artifact": "Disk image push failed",
-	"flash-image":        "Flash failed",
+	tasks.PipelineTaskBuildImage: "Image build failed",
+	"push-disk-artifact":         "Disk image push failed",
+	"flash-image":                "Flash failed",
 }
 
 func (r *ImageBuildReconciler) pipelineRunFailureDetail(ctx context.Context, pipelineRun *tektonv1.PipelineRun) string {
@@ -1759,6 +2545,44 @@ func recordBuildMetrics(imageBuild *automotivev1alpha1.ImageBuild, pipelineRun *
 	}
 }
 
+func (r *ImageBuildReconciler) recordPipelineFlashMetrics(
+	ctx context.Context,
+	imageBuild *automotivev1alpha1.ImageBuild,
+	pipelineRun *tektonv1.PipelineRun,
+	status string,
+) {
+	target := imageBuild.Spec.GetTarget()
+
+	for _, child := range pipelineRun.Status.ChildReferences {
+		if child.PipelineTaskName != "flash-image" {
+			continue
+		}
+		taskRun := &tektonv1.TaskRun{}
+		if err := r.Get(ctx, types.NamespacedName{
+			Name:      child.Name,
+			Namespace: pipelineRun.Namespace,
+		}, taskRun); err != nil {
+			break
+		}
+		FlashTotal.WithLabelValues(target, status).Inc()
+		if taskRun.Status.CompletionTime != nil {
+			duration := taskRun.Status.CompletionTime.Sub(taskRun.CreationTimestamp.Time).Seconds()
+			FlashDuration.WithLabelValues(target, status).Observe(duration)
+		}
+		return
+	}
+}
+
+func recordFlashMetrics(imageBuild *automotivev1alpha1.ImageBuild, taskRun *tektonv1.TaskRun, status string) {
+	target := imageBuild.Spec.GetTarget()
+	FlashTotal.WithLabelValues(target, status).Inc()
+
+	if taskRun.Status.CompletionTime != nil {
+		duration := taskRun.Status.CompletionTime.Sub(taskRun.CreationTimestamp.Time).Seconds()
+		FlashDuration.WithLabelValues(target, status).Observe(duration)
+	}
+}
+
 func extractProvenance(pipelineRun *tektonv1.PipelineRun, aibImage string) (aibImageUsed, builderImageUsed string) {
 	aibImageUsed = aibImage // Always record the AIB image that was requested
 
@@ -1793,6 +2617,13 @@ func extractLeaseID(pipelineRun *tektonv1.PipelineRun) string {
 	return ""
 }
 
+func s3Prefix(imageBuild *automotivev1alpha1.ImageBuild) string {
+	if p := imageBuild.Spec.GetS3Prefix(); p != "" {
+		return p
+	}
+	return "builds/" + imageBuild.Name
+}
+
 func isTaskRunSuccessful(taskRun *tektonv1.TaskRun) bool {
 	conditions := taskRun.Status.Conditions
 	if len(conditions) == 0 {
@@ -1803,7 +2634,7 @@ func isTaskRunSuccessful(taskRun *tektonv1.TaskRun) bool {
 }
 
 func (r *ImageBuildReconciler) createUploadPod(ctx context.Context, imageBuild *automotivev1alpha1.ImageBuild) error {
-	log := r.Log.WithValues("imagebuild", types.NamespacedName{Name: imageBuild.Name, Namespace: imageBuild.Namespace})
+	log := r.buildLogger(imageBuild)
 
 	podName := safeDerivedName(imageBuild.Name, "-upload-pod")
 	existingPod := &corev1.Pod{}
@@ -1862,6 +2693,14 @@ func (r *ImageBuildReconciler) createUploadPod(ctx context.Context, imageBuild *
 		"app.kubernetes.io/name":                          "upload-pod",
 	}
 
+	// Fetch OperatorConfig to inherit nodeSelector and tolerations for the upload pod.
+	// This ensures the upload pod (the PVC's first consumer) schedules in the same
+	// availability zone as the build pod.
+	operatorConfig := &automotivev1alpha1.OperatorConfig{}
+	if err := r.Get(ctx, types.NamespacedName{Name: "config", Namespace: controllerutils.OperatorNamespace()}, operatorConfig); err != nil && !errors.IsNotFound(err) {
+		return fmt.Errorf("failed to get OperatorConfig: %w", err)
+	}
+
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      podName,
@@ -1873,8 +2712,8 @@ func (r *ImageBuildReconciler) createUploadPod(ctx context.Context, imageBuild *
 					Kind:               imageBuild.Kind,
 					Name:               imageBuild.Name,
 					UID:                imageBuild.UID,
-					Controller:         ptr.To(true),
-					BlockOwnerDeletion: ptr.To(true),
+					Controller:         new(true),
+					BlockOwnerDeletion: new(true),
 				},
 			},
 		},
@@ -1883,7 +2722,7 @@ func (r *ImageBuildReconciler) createUploadPod(ctx context.Context, imageBuild *
 				RunAsUser:    ptr.To[int64](1000),
 				RunAsGroup:   ptr.To[int64](1000),
 				FSGroup:      ptr.To[int64](1000),
-				RunAsNonRoot: ptr.To(true),
+				RunAsNonRoot: new(true),
 			},
 			Containers: []corev1.Container{
 				{
@@ -1921,6 +2760,35 @@ func (r *ImageBuildReconciler) createUploadPod(ctx context.Context, imageBuild *
 		},
 	}
 
+	// Apply the same scheduling constraints used by build pods so the upload
+	// pod lands in the same AZ and architecture, ensuring the WaitForFirstConsumer
+	// PVC is provisioned on a topology reachable by the build pod.
+	if operatorConfig.Spec.OSBuilds != nil && len(operatorConfig.Spec.OSBuilds.NodeSelector) > 0 {
+		pod.Spec.NodeSelector = operatorConfig.Spec.OSBuilds.NodeSelector
+	}
+	if operatorConfig.Spec.OSBuilds != nil && len(operatorConfig.Spec.OSBuilds.Tolerations) > 0 {
+		pod.Spec.Tolerations = operatorConfig.Spec.OSBuilds.Tolerations
+	}
+	if imageBuild.Spec.Architecture != "" {
+		pod.Spec.Affinity = &corev1.Affinity{
+			NodeAffinity: &corev1.NodeAffinity{
+				RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+					NodeSelectorTerms: []corev1.NodeSelectorTerm{
+						{
+							MatchExpressions: []corev1.NodeSelectorRequirement{
+								{
+									Key:      corev1.LabelArchStable,
+									Operator: corev1.NodeSelectorOpIn,
+									Values:   []string{controllerutils.NormalizeArchToK8s(imageBuild.Spec.Architecture)},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+	}
+
 	if err := r.Create(ctx, pod); err != nil && !errors.IsAlreadyExists(err) {
 		return fmt.Errorf("failed to create upload pod: %w", err)
 	}
@@ -1941,7 +2809,7 @@ func (r *ImageBuildReconciler) createUploadPod(ctx context.Context, imageBuild *
 // Returns a minimal BuildConfig with defaults if OperatorConfig is unavailable.
 func (r *ImageBuildReconciler) resolveBuildConfig(ctx context.Context) *tasks.BuildConfig {
 	operatorConfig := &automotivev1alpha1.OperatorConfig{}
-	if err := r.Get(ctx, types.NamespacedName{Name: "config", Namespace: OperatorNamespace}, operatorConfig); err != nil {
+	if err := r.Get(ctx, types.NamespacedName{Name: "config", Namespace: controllerutils.OperatorNamespace()}, operatorConfig); err != nil {
 		return &tasks.BuildConfig{}
 	}
 	bc := &tasks.BuildConfig{
@@ -1958,13 +2826,82 @@ func (r *ImageBuildReconciler) resolveBuildConfig(ctx context.Context) *tasks.Bu
 		bc.FlashTimeoutMinutes = operatorConfig.Spec.OSBuilds.GetFlashTimeoutMinutes()
 		controllerutils.ApplyTrustedCABundleFromOSBuilds(bc, operatorConfig.Spec.OSBuilds)
 	}
+
+	controllerutils.ApplyOCIVolumesConfig(bc, &operatorConfig.Spec)
+
 	return bc
+}
+
+type targetDefaults struct {
+	DefaultFormat string   `yaml:"defaultFormat"`
+	ExtraArgs     []string `yaml:"extraArgs"`
+}
+
+func (r *ImageBuildReconciler) getTargetDefaults(ctx context.Context, target string) *targetDefaults {
+	if target == "" {
+		return nil
+	}
+	cm := &corev1.ConfigMap{}
+	if err := r.Get(ctx, types.NamespacedName{
+		Name:      "aib-target-defaults",
+		Namespace: controllerutils.OperatorNamespace(),
+	}, cm); err != nil {
+		if !errors.IsNotFound(err) {
+			r.Log.Error(err, "Failed to read aib-target-defaults ConfigMap, falling back to defaults")
+		}
+		return nil
+	}
+	data, ok := cm.Data["target-defaults.yaml"]
+	if !ok {
+		return nil
+	}
+	var parsed struct {
+		Targets map[string]targetDefaults `yaml:"targets"`
+	}
+	if err := yaml.Unmarshal([]byte(data), &parsed); err != nil {
+		return nil
+	}
+	if t, ok := parsed.Targets[target]; ok {
+		return &t
+	}
+	return nil
+}
+
+// resolveExportFormat returns the effective export format for a build.
+// Priority: user-specified Export.Format > target-defaults ConfigMap defaultFormat > "qcow2".
+func (r *ImageBuildReconciler) resolveExportFormat(ctx context.Context, imageBuild *automotivev1alpha1.ImageBuild) string {
+	if imageBuild.Spec.Export != nil && imageBuild.Spec.Export.Format != "" {
+		return imageBuild.Spec.Export.Format
+	}
+	target := imageBuild.Spec.GetTarget()
+	if td := r.getTargetDefaults(ctx, target); td != nil && td.DefaultFormat != "" {
+		r.buildLogger(imageBuild).Info("Resolved export format from target-defaults",
+			"target", target, "format", td.DefaultFormat)
+		return td.DefaultFormat
+	}
+	return "qcow2"
+}
+
+// resolveExtraArgs returns the effective AIB extra args for a build.
+// Priority: user-specified AIBExtraArgs > target-defaults ConfigMap extraArgs > empty.
+func (r *ImageBuildReconciler) resolveExtraArgs(ctx context.Context, imageBuild *automotivev1alpha1.ImageBuild) []string {
+	if specArgs := imageBuild.Spec.GetAIBExtraArgs(); len(specArgs) > 0 {
+		return specArgs
+	}
+	target := imageBuild.Spec.GetTarget()
+	if td := r.getTargetDefaults(ctx, target); td != nil && len(td.ExtraArgs) > 0 {
+		r.buildLogger(imageBuild).Info("Resolved extra args from target-defaults",
+			"target", target, "extraArgs", td.ExtraArgs)
+		return td.ExtraArgs
+	}
+	return nil
 }
 
 func (r *ImageBuildReconciler) updateStatus(
 	ctx context.Context,
 	imageBuild *automotivev1alpha1.ImageBuild,
 	phase, message string,
+	mutations ...func(*automotivev1alpha1.ImageBuild),
 ) error {
 	fresh := &automotivev1alpha1.ImageBuild{}
 	if err := r.Get(ctx, types.NamespacedName{
@@ -1974,9 +2911,24 @@ func (r *ImageBuildReconciler) updateStatus(
 		return err
 	}
 
+	if fresh.Status.Phase == phaseCancelled && phase != phaseCancelled {
+		return nil
+	}
+	if fresh.Status.Phase == automotivev1alpha1.ImageBuildPhaseExpired && phase != automotivev1alpha1.ImageBuildPhaseExpired {
+		return nil
+	}
+
 	patch := client.MergeFrom(fresh.DeepCopy())
 	oldPhase := fresh.Status.Phase
 	oldMessage := fresh.Status.Message
+
+	for _, fn := range mutations {
+		fn(fresh)
+	}
+
+	if phase == automotivev1alpha1.ImageBuildPhaseExpired {
+		fresh.Status.PreviousPhase = fresh.Status.Phase
+	}
 
 	fresh.Status.Phase = phase
 	fresh.Status.Message = message
@@ -1984,14 +2936,18 @@ func (r *ImageBuildReconciler) updateStatus(
 	if phase == phaseBuilding && fresh.Status.StartTime == nil {
 		now := metav1.Now()
 		fresh.Status.StartTime = &now
-	} else if (phase == phaseCompleted || phase == phaseFailed) && fresh.Status.CompletionTime == nil {
+	} else if isTerminalPhase(phase) && fresh.Status.CompletionTime == nil {
 		now := metav1.Now()
 		fresh.Status.CompletionTime = &now
 	}
 
+	setImageBuildConditions(fresh, phase, message)
+
 	if err := r.Status().Patch(ctx, fresh, patch); err != nil {
 		return err
 	}
+	fresh.DeepCopyInto(imageBuild)
+	adjustActiveBuildsGauge(oldPhase, phase)
 	if oldPhase != phase || oldMessage != message {
 		r.emitEventf(
 			fresh,
@@ -2016,7 +2972,7 @@ func (r *ImageBuildReconciler) emitImageBuildLifecycleEvent(
 	oldPhase, newPhase, message string,
 ) {
 	switch newPhase {
-	case "Uploading":
+	case phaseUploading:
 		r.emitEventf(
 			imageBuild,
 			corev1.EventTypeNormal,
@@ -2118,22 +3074,66 @@ func eventTypeForPhase(phase string) string {
 	return corev1.EventTypeNormal
 }
 
+func setImageBuildConditions(imageBuild *automotivev1alpha1.ImageBuild, phase, message string) {
+	switch phase {
+	case phaseCompleted:
+		meta.SetStatusCondition(&imageBuild.Status.Conditions, metav1.Condition{
+			Type:    automotivev1alpha1.ImageBuildConditionProgressing,
+			Status:  metav1.ConditionFalse,
+			Reason:  "Completed",
+			Message: message,
+		})
+		meta.SetStatusCondition(&imageBuild.Status.Conditions, metav1.Condition{
+			Type:    automotivev1alpha1.ImageBuildConditionReady,
+			Status:  metav1.ConditionTrue,
+			Reason:  "BuildSucceeded",
+			Message: message,
+		})
+	case phaseFailed, phaseCancelled, automotivev1alpha1.ImageBuildPhaseExpired:
+		meta.SetStatusCondition(&imageBuild.Status.Conditions, metav1.Condition{
+			Type:    automotivev1alpha1.ImageBuildConditionProgressing,
+			Status:  metav1.ConditionFalse,
+			Reason:  phase,
+			Message: message,
+		})
+		meta.SetStatusCondition(&imageBuild.Status.Conditions, metav1.Condition{
+			Type:    automotivev1alpha1.ImageBuildConditionReady,
+			Status:  metav1.ConditionFalse,
+			Reason:  phase,
+			Message: message,
+		})
+	default:
+		meta.SetStatusCondition(&imageBuild.Status.Conditions, metav1.Condition{
+			Type:    automotivev1alpha1.ImageBuildConditionProgressing,
+			Status:  metav1.ConditionTrue,
+			Reason:  phase,
+			Message: message,
+		})
+		meta.SetStatusCondition(&imageBuild.Status.Conditions, metav1.Condition{
+			Type:    automotivev1alpha1.ImageBuildConditionReady,
+			Status:  metav1.ConditionFalse,
+			Reason:  phase,
+			Message: message,
+		})
+	}
+}
+
 func (r *ImageBuildReconciler) emitEventf(
 	imageBuild *automotivev1alpha1.ImageBuild,
 	eventType, reason, messageFmt string,
-	args ...interface{},
+	args ...any,
 ) {
 	if r.Recorder == nil || imageBuild == nil {
 		return
 	}
-	r.Recorder.Eventf(imageBuild, eventType, reason, messageFmt, args...)
+	r.Recorder.Eventf(imageBuild, nil, eventType, reason, reason, messageFmt, args...)
 }
 
 func (r *ImageBuildReconciler) getOrCreateWorkspacePVC(
 	ctx context.Context,
 	imageBuild *automotivev1alpha1.ImageBuild,
 ) (string, error) {
-	log := r.Log.WithValues("imagebuild", types.NamespacedName{Name: imageBuild.Name, Namespace: imageBuild.Namespace})
+	log := r.buildLogger(imageBuild)
 
 	if imageBuild.Status.PVCName != "" {
 		existingPVC := &corev1.PersistentVolumeClaim{}
@@ -2153,7 +3153,7 @@ func (r *ImageBuildReconciler) getOrCreateWorkspacePVC(
 
 	// Fetch OperatorConfig to get PVC size and storage class configuration
 	operatorConfig := &automotivev1alpha1.OperatorConfig{}
-	err := r.Get(ctx, types.NamespacedName{Name: "config", Namespace: OperatorNamespace}, operatorConfig)
+	err := r.Get(ctx, types.NamespacedName{Name: "config", Namespace: controllerutils.OperatorNamespace()}, operatorConfig)
 
 	storageSize := resource.MustParse("8Gi")
 	if err == nil && operatorConfig.Spec.OSBuilds != nil && operatorConfig.Spec.OSBuilds.PVCSize != "" {
@@ -2178,8 +3178,8 @@ func (r *ImageBuildReconciler) getOrCreateWorkspacePVC(
 					Kind:               imageBuild.Kind,
 					Name:               imageBuild.Name,
 					UID:                imageBuild.UID,
-					Controller:         ptr.To(true),
-					BlockOwnerDeletion: ptr.To(true),
+					Controller:         new(true),
+					BlockOwnerDeletion: new(true),
 				},
 			},
 		},
@@ -2210,7 +3210,7 @@ func (r *ImageBuildReconciler) getOrCreateWorkspacePVC(
 }
 
 func (r *ImageBuildReconciler) shutdownUploadPod(ctx context.Context, imageBuild *automotivev1alpha1.ImageBuild) error {
-	log := r.Log.WithValues("imagebuild", types.NamespacedName{Name: imageBuild.Name, Namespace: imageBuild.Namespace})
+	log := r.buildLogger(imageBuild)
 
 	podName := safeDerivedName(imageBuild.Name, "-upload-pod")
 	pod := &corev1.Pod{
@@ -2268,6 +3268,26 @@ func extractFlashCredentials(secret *corev1.Secret, registryURL string, log logr
 	}
 	log.Error(nil, "No matching credentials found in docker config", "secret", secret.Name, "registry", registryURL)
 	return nil, nil
+}
+
+// ociRepoVolumes returns the OCI repo volume for the PipelineRun PodTemplate.
+// If an OCI image ref is provided, uses ImageVolumeSource; otherwise EmptyDir
+// so the Task's VolumeMount always resolves.
+func ociRepoVolumes(ociRepoImages []string) []corev1.Volume {
+	vol := corev1.Volume{Name: tasks.OCIRepoVolumeName}
+	if len(ociRepoImages) > 0 {
+		vol.VolumeSource = corev1.VolumeSource{
+			Image: &corev1.ImageVolumeSource{
+				Reference:  ociRepoImages[0],
+				PullPolicy: corev1.PullAlways,
+			},
+		}
+	} else {
+		vol.VolumeSource = corev1.VolumeSource{
+			EmptyDir: &corev1.EmptyDirVolumeSource{},
+		}
+	}
+	return []corev1.Volume{vol}
 }
 
 func decodeAuthEntry(auth string, log logr.Logger) ([]byte, []byte) {

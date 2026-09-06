@@ -33,6 +33,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	automotivev1alpha1 "github.com/centos-automotive-suite/automotive-dev-operator/api/v1alpha1"
+	controllerutils "github.com/centos-automotive-suite/automotive-dev-operator/internal/controller/controllerutils"
 )
 
 // RegistryClient provides methods to interact with container registries
@@ -363,14 +364,7 @@ func (c *DefaultRegistryClient) VerifyDigest(
 
 // NormalizeArchitecture normalizes architecture names to OCI standard
 func NormalizeArchitecture(arch string) string {
-	switch strings.ToLower(arch) {
-	case "x86_64", "amd64":
-		return "amd64"
-	case "aarch64", "arm64":
-		return "arm64"
-	default:
-		return arch
-	}
+	return controllerutils.NormalizeArchToK8s(arch)
 }
 
 // GetCurrentTime returns the current time as a metav1.Time

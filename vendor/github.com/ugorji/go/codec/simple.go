@@ -113,7 +113,7 @@ func (e *simpleEncDriver[T]) EncodeExt(v interface{}, basetype reflect.Type, xta
 	if ext == SelfExt {
 		bs0 = e.e.blist.get(1024)
 		bs = bs0
-		sideEncode(e.h, &e.h.sideEncPool, func(se encoderI) { oneOffEncode(se, v, &bs, basetype, true) })
+		sideEncode(e.h, &e.h.sideEncPool, func(se encoderI) { oneOffEncode(se, v, &bs, basetype, false) })
 	} else {
 		bs = ext.WriteExt(v)
 	}
@@ -477,7 +477,7 @@ func (d *simpleDecDriver[T]) DecodeExt(rv interface{}, basetype reflect.Type, xt
 		return
 	}
 	if ext == SelfExt {
-		sideDecode(d.h, &d.h.sideDecPool, func(sd decoderI) { oneOffDecode(sd, rv, xbs, basetype, true) })
+		sideDecode(d.h, &d.h.sideDecPool, func(sd decoderI) { oneOffDecode(sd, rv, xbs, basetype, false) })
 	} else {
 		ext.ReadExt(rv, xbs)
 	}
@@ -698,6 +698,7 @@ func (d *simpleEncDriver[T]) init(hh Handle, shared *encoderBase, enc encoderI) 
 	return
 }
 
+func (e *simpleEncDriver[T]) NumBytesWritten() int    { return e.w.numWrite() }
 func (e *simpleEncDriver[T]) writeBytesAsis(b []byte) { e.w.writeb(b) }
 
 func (e *simpleEncDriver[T]) writerEnd() { e.w.end() }
@@ -735,7 +736,7 @@ func (d *simpleDecDriver[T]) resetInBytes(in []byte) {
 }
 
 func (d *simpleDecDriver[T]) resetInIO(r io.Reader) {
-	d.r.resetIO(r, d.h.ReaderBufferSize, d.h.MaxInitLen, &d.d.blist)
+	d.r.resetIO(r, d.h.ReaderBufferSize, d.h.maxBytes2Read(), &d.d.blist)
 }
 
 // ---- (custom stanza)

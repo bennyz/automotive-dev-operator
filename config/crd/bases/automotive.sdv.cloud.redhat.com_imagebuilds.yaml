@@ -79,6 +79,7 @@ spec:
                     type: boolean
                   manifest:
                     description: Manifest holds the inline AIB manifest YAML content
+                    maxLength: 921600
                     type: string
                   manifestFileName:
                     description: |-
@@ -94,10 +95,24 @@ spec:
                     - bootc
                     - disk
                     type: string
+                  ociRepoImages:
+                    description: |-
+                      OCIRepoImages are OCI image references containing RPM repositories.
+                      Each image is mounted as a read-only volume via ImageVolumeSource in the build pod,
+                      providing RPM repos at file:///extra-repos/oci-repo-N paths.
+                    items:
+                      type: string
+                    maxItems: 1
+                    type: array
                   rebuildBuilder:
                     description: RebuildBuilder forces rebuilding the bootc builder
                       image even if a cached version exists in the registry.
                     type: boolean
+                  rootPassword:
+                    description: |-
+                      RootPassword is a hashed root password passed to AIB's --root-password flag.
+                      See crypt(5) for supported hash formats.
+                    type: string
                   target:
                     description: Target specifies the build target platform (e.g.,
                       "qemu", "aws")
@@ -116,6 +131,11 @@ spec:
                   When set, the build pod mounts this PVC and passes --build-dir to AIB,
                   enabling osbuild checkpoint reuse and dnf cache persistence across builds.
                 type: string
+              callbackSecretRef:
+                description: CallbackSecretRef holds the endpoint and HMAC key outside
+                  this resource.
+                maxLength: 253
+                type: string
               export:
                 description: Export contains configuration for exporting build artifacts
                 properties:
@@ -128,7 +148,6 @@ spec:
                     description: Compression specifies the compression algorithm for
                       artifacts
                     enum:
-                    - lz4
                     - gzip
                     - xz
                     type: string
@@ -143,11 +162,49 @@ spec:
                         description: OCI is the registry URL to push the disk image
                           as an OCI artifact
                         type: string
+                      s3:
+                        description: S3 contains configuration for pushing to S3-compatible
+                          storage
+                        properties:
+                          bucket:
+                            description: Bucket is the S3 bucket name
+                            type: string
+                          credentialsSecret:
+                            description: |-
+                              CredentialsSecret is the name of a secret containing AWS credentials
+                              Should have keys: access-key-id, secret-access-key
+                              If not provided, the build pod will use IAM role or environment credentials, allows users to grant write access
+                              to the operator AWS IAM User + Role, instead of providing credentials with every request.
+                            type: string
+                          endpoint:
+                            description: |-
+                              Endpoint is the S3 endpoint URL (for MinIO, Ceph, etc.)
+                              Leave empty for AWS S3
+                            type: string
+                          insecureSkipTLSVerify:
+                            description: |-
+                              InsecureSkipTLSVerify disables TLS certificate verification for the S3 endpoint.
+                              Only relevant when Endpoint is set. When false (default), the operator's
+                              trusted CA bundle is used to verify the endpoint certificate.
+                            type: boolean
+                          prefix:
+                            description: |-
+                              Prefix is the S3 key prefix (path within bucket)
+                              Defaults to "builds/<build-name>" if not specified
+                            type: string
+                          region:
+                            default: us-east-1
+                            description: Region is the S3 region
+                            type: string
+                        required:
+                        - bucket
+                        type: object
                     type: object
                   format:
-                    default: qcow2
-                    description: Format specifies the disk image output format (e.g.,
-                      raw, qcow2, simg, or any AIB-supported format)
+                    description: |-
+                      Format specifies the disk image output format (e.g., raw, qcow2, simg, or any AIB-supported format).
+                      When omitted, the controller resolves the format from the aib-target-defaults ConfigMap,
+                      falling back to qcow2 if no target default is configured.
                     type: string
                   useServiceAccountAuth:
                     description: |-
@@ -155,6 +212,9 @@ spec:
                       using a service account token instead of explicit credentials
                     type: boolean
                 type: object
+              externalId:
+                maxLength: 512
+                type: string
               flash:
                 description: Flash contains configuration for flashing the built image
                   to hardware via Jumpstarter
@@ -184,11 +244,27 @@ spec:
                       LeaseName is an existing Jumpstarter lease name to use instead of creating a new one
                       Mutually exclusive with LeaseDuration
                     type: string
+                  leaseTags:
+                    description: LeaseTags are additional key=value tags for the Jumpstarter
+                      lease (comma-separated)
+                    type: string
                 type: object
               pushSecretRef:
                 description: |-
                   PushSecretRef is the name of the kubernetes.io/dockerconfigjson secret for pushing artifacts
                   This is separate from SecretRef because push operations require docker config format
+                type: string
+              reproducible:
+                description: |-
+                  Reproducible enables full build provenance: saves RPMs, AIB manifest,
+                  and task bundle ref as OCI referrers for future reproduction.
+                  Requires SecureBuild to be true for task bundle pinning.
+                type: boolean
+              restoreSourcesRef:
+                description: |-
+                  RestoreSourcesRef is the OCI image reference from a prior reproducible build.
+                  The build pod will pull the sources archive (OCI referrer) attached to this
+                  image and pre-populate the osbuild store, ensuring identical RPM inputs.
                 type: string
               runtimeClassName:
                 description: RuntimeClassName specifies the runtime class to use for
@@ -199,9 +275,30 @@ spec:
                   SecretRef is the name of the secret containing credentials for registry operations
                   The secret should contain keys like REGISTRY_AUTH_FILE for authentication
                 type: string
+              secureBuild:
+                description: |-
+                  SecureBuild enables supply chain security for this build.
+                  When true, pipeline tasks are resolved from the signed Tekton Bundle
+                  specified in TaskBundleRef instead of cluster-installed tasks.
+                type: boolean
               storageClass:
                 description: StorageClass is the name of the storage class to use
                   for the build PVC
+                type: string
+              taskBundleRef:
+                description: |-
+                  TaskBundleRef is the digest-pinned OCI reference to the Tekton Bundle
+                  used for this build. Set automatically by the Build API from the
+                  OperatorConfig at request time to prevent TOCTOU races.
+                type: string
+              ttl:
+                description: |-
+                  TTL is the time-to-live for this build. After this duration past its
+                  completion, the build transitions to the Expired phase and its resources
+                  (PipelineRuns, TaskRuns, PVCs, registry images) are cleaned up.
+                  The ImageBuild CR itself is preserved. In-progress builds never expire.
+                  Uses Go duration format (e.g. "24h", "72h", "168h").
+                  Empty uses the OperatorConfig default. Set to "0" to disable expiry.
                 type: string
               workspace:
                 description: |-
@@ -210,6 +307,19 @@ spec:
                   on completion so subsequent builds can reuse it.
                 type: string
             type: object
+            x-kubernetes-validations:
+            - message: reproducible builds require secureBuild to be true
+              rule: '!has(self.reproducible) || !self.reproducible || self.secureBuild'
+            - message: secretRef is required when export.disk.oci is set (unless useServiceAccountAuth
+                is true)
+              rule: '!(has(self.export) && has(self.export.disk) && has(self.export.disk.oci)
+                && size(self.export.disk.oci) > 0) || size(self.secretRef) > 0 ||
+                (has(self.export) && has(self.export.useServiceAccountAuth) && self.export.useServiceAccountAuth)'
+            - message: secretRef is required when export.container is set (unless
+                useServiceAccountAuth is true)
+              rule: '!(has(self.export) && has(self.export.container) && size(self.export.container)
+                > 0) || size(self.secretRef) > 0 || (has(self.export) && has(self.export.useServiceAccountAuth)
+                && self.export.useServiceAccountAuth)'
           status:
             description: ImageBuildStatus defines the observed state of ImageBuild
             properties:
@@ -217,6 +327,32 @@ spec:
                 description: AIBImageUsed is the automotive-image-builder container
                   image that was used for the build
                 type: string
+              artifacts:
+                items:
+                  description: ArtifactStatus describes an output actually published
+                    by a build stage.
+                  properties:
+                    digest:
+                      description: Digest is the OCI digest or a checksum of uploaded
+                        bytes, never an S3 ETag.
+                      pattern: ^sha256:[a-f0-9]{64}$
+                      type: string
+                    kind:
+                      enum:
+                      - container
+                      - disk
+                      - s3
+                      type: string
+                    url:
+                      maxLength: 2048
+                      minLength: 1
+                      type: string
+                  required:
+                  - kind
+                  - url
+                  type: object
+                maxItems: 64
+                type: array
               builderImageUsed:
                 description: |-
                   BuilderImageUsed is the osbuild builder container image that was used for the build
@@ -284,6 +420,38 @@ spec:
                   - type
                   type: object
                 type: array
+              expiresAt:
+                description: |-
+                  ExpiresAt is when this build will transition to the Expired phase
+                  and have its associated resources cleaned up. The ImageBuild CR itself
+                  is preserved. Nil if expiry is disabled (TTL "0", no-expire annotation,
+                  or workspace build).
+                format: date-time
+                type: string
+              flash:
+                description: FlashOutcomeStatus excludes device credentials and command
+                  configuration.
+                properties:
+                  enabled:
+                    type: boolean
+                  leaseId:
+                    maxLength: 253
+                    type: string
+                  message:
+                    maxLength: 1024
+                    type: string
+                  state:
+                    enum:
+                    - NotStarted
+                    - Running
+                    - Succeeded
+                    - Failed
+                    - Cancelled
+                    type: string
+                required:
+                - enabled
+                - state
+                type: object
               flashTaskRunName:
                 description: FlashTaskRunName is the name of the TaskRun for flashing
                   to hardware
@@ -300,8 +468,7 @@ spec:
                 format: int64
                 type: integer
               phase:
-                description: Phase represents the current phase of the build (Building,
-                  Completed, Failed)
+                description: Phase represents the current phase of the build
                 enum:
                 - Pending
                 - Uploading
@@ -310,10 +477,17 @@ spec:
                 - Flashing
                 - Completed
                 - Failed
+                - Cancelled
+                - Expired
                 type: string
               pipelineRunName:
                 description: PipelineRunName is the name of the active PipelineRun
                   for this build
+                type: string
+              previousPhase:
+                description: |-
+                  PreviousPhase is the phase the build was in before transitioning to Expired.
+                  Used to determine whether an expired build originally succeeded or failed.
                 type: string
               pushTaskRunName:
                 description: PushTaskRunName is the name of the TaskRun for pushing
@@ -323,11 +497,97 @@ spec:
                 description: PVCName is the name of the PVC where the artifact is
                   stored
                 type: string
+              resolvedExportFormat:
+                description: |-
+                  ResolvedExportFormat is the export format resolved at build creation time.
+                  Persisted so the push task uses the same format even if the
+                  aib-target-defaults ConfigMap changes between build and push.
+                type: string
               startTime:
                 description: StartTime is when the build started
                 format: date-time
                 type: string
+              terminalResult:
+                description: BuildTerminalResult remains unchanged when the display
+                  phase later becomes Expired.
+                properties:
+                  artifacts:
+                    items:
+                      description: ArtifactStatus describes an output actually published
+                        by a build stage.
+                      properties:
+                        digest:
+                          description: Digest is the OCI digest or a checksum of uploaded
+                            bytes, never an S3 ETag.
+                          pattern: ^sha256:[a-f0-9]{64}$
+                          type: string
+                        kind:
+                          enum:
+                          - container
+                          - disk
+                          - s3
+                          type: string
+                        url:
+                          maxLength: 2048
+                          minLength: 1
+                          type: string
+                      required:
+                      - kind
+                      - url
+                      type: object
+                    maxItems: 64
+                    type: array
+                  completedAt:
+                    format: date-time
+                    type: string
+                  flash:
+                    description: FlashOutcomeStatus excludes device credentials and
+                      command configuration.
+                    properties:
+                      enabled:
+                        type: boolean
+                      leaseId:
+                        maxLength: 253
+                        type: string
+                      message:
+                        maxLength: 1024
+                        type: string
+                      state:
+                        enum:
+                        - NotStarted
+                        - Running
+                        - Succeeded
+                        - Failed
+                        - Cancelled
+                        type: string
+                    required:
+                    - enabled
+                    - state
+                    type: object
+                  message:
+                    maxLength: 1024
+                    type: string
+                  phase:
+                    enum:
+                    - Completed
+                    - Failed
+                    - Cancelled
+                    type: string
+                  startedAt:
+                    format: date-time
+                    type: string
+                required:
+                - completedAt
+                - message
+                - phase
+                type: object
+                x-kubernetes-validations:
+                - message: terminal result is immutable
+                  rule: self == oldSelf
             type: object
+            x-kubernetes-validations:
+            - message: terminal result cannot be removed
+              rule: '!has(oldSelf.terminalResult) || has(self.terminalResult)'
         type: object
     served: true
     storage: true

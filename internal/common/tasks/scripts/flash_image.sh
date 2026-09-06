@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # NOTE: common.sh is prepended to this script at embed time.
 set -uo pipefail
 
@@ -14,17 +15,37 @@ if [[ ! -f "${JMP_CLIENT_CONFIG}" ]]; then
     exit 1
 fi
 
+# Copy config to writable path so jmp can persist refreshed tokens
+cp "${JMP_CLIENT_CONFIG}" /tmp/client.yaml
+export JMP_CLIENT_CONFIG=/tmp/client.yaml
+export JMP_CLIENT_CONFIG_HOME=/tmp
+
 echo "Using client config: ${JMP_CLIENT_CONFIG}"
 
 echo "refreshing jumpstarter token"
-jmp login --client-config "${JMP_CLIENT_CONFIG}"
+if ! timeout 30 jmp login --nointeractive --client-config "${JMP_CLIENT_CONFIG}" 2>&1; then
+    echo "WARNING: jmp login failed, continuing with existing credentials"
+fi
 
-FLASH_CMD="${FLASH_CMD:-j storage flash \{image_uri\}}"
+FLASH_CMD="${FLASH_CMD:-}"
+if [[ -z "${FLASH_CMD}" ]]; then
+    FLASH_CMD='j storage flash oci://{image_uri}'
+fi
 FLASH_CMD=$(echo "${FLASH_CMD}" | sed "s|{image_uri}|${IMAGE_REF}|g")
 
 
 LEASE_DURATION="${LEASE_DURATION:-03:00:00}"
 EXISTING_LEASE="${EXISTING_LEASE:-}"
+LEASE_TAGS="${LEASE_TAGS:-}"
+
+TAG_ARGS=()
+if [[ -n "${LEASE_TAGS}" ]]; then
+    IFS=',' read -ra TAG_PAIRS <<< "${LEASE_TAGS}"
+    for pair in "${TAG_PAIRS[@]}"; do
+        [[ -z "${pair}" ]] && continue
+        TAG_ARGS+=(--tag "${pair}")
+    done
+fi
 
 echo "Flash command: ${FLASH_CMD}"
 
@@ -36,10 +57,14 @@ if [[ -n "${EXISTING_LEASE}" ]]; then
     USER_PROVIDED_LEASE=true
 else
     echo "Lease duration: ${LEASE_DURATION}"
+    if [[ -n "${LEASE_TAGS}" ]]; then
+        echo "Lease tags: ${LEASE_TAGS}"
+    fi
     echo ""
     echo "Creating lease on exporter matching: ${EXPORTER_SELECTOR}"
+    echo "Running: jmp create lease --client-config ${JMP_CLIENT_CONFIG} -l ${EXPORTER_SELECTOR} --duration ${LEASE_DURATION} ${TAG_ARGS[*]} -o name"
 
-    LEASE_NAME=$(jmp create lease --client-config "${JMP_CLIENT_CONFIG}" -l "${EXPORTER_SELECTOR}" --duration "${LEASE_DURATION}" -o name)
+    LEASE_NAME=$(jmp create lease --client-config "${JMP_CLIENT_CONFIG}" -l "${EXPORTER_SELECTOR}" --duration "${LEASE_DURATION}" "${TAG_ARGS[@]}" -o name)
 
     if [[ -z "${LEASE_NAME}" ]]; then
         echo "ERROR: Failed to create lease"

@@ -1,0 +1,67 @@
+name: Post-Release Version Bump
+
+on:
+    release:
+        types: [published]
+
+permissions:
+    contents: write
+    pull-requests: write
+
+jobs:
+    bump-version:
+        runs-on: ubuntu-latest
+        if: "!github.event.release.prerelease"
+        steps:
+            - uses: actions/checkout@v7
+              with:
+                  ref: ${{ github.event.repository.default_branch }}
+                  fetch-depth: 0
+
+            - name: Compute next dev version
+              id: next
+              env:
+                  TAG_NAME: ${{ github.event.release.tag_name }}
+              run: |
+                  VERSION="${TAG_NAME#v}"
+
+                  if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                      echo "Skipping: tag '$TAG_NAME' is not a semver release"
+                      echo "skip=true" >> "$GITHUB_OUTPUT"
+                      exit 0
+                  fi
+
+                  IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION"
+                  NEXT_MINOR=$((MINOR + 1))
+                  DEV_VERSION="${MAJOR}.${NEXT_MINOR}.0-dev"
+
+                  CURRENT_VERSION=$(cat VERSION 2>/dev/null || echo "0.0.0")
+                  if [[ "$CURRENT_VERSION" == "$DEV_VERSION" || "$CURRENT_VERSION" > "$DEV_VERSION" ]]; then
+                      echo "Skipping: current VERSION ($CURRENT_VERSION) is already >= $DEV_VERSION"
+                      echo "skip=true" >> "$GITHUB_OUTPUT"
+                      exit 0
+                  fi
+
+                  echo "dev_version=${DEV_VERSION}" >> "$GITHUB_OUTPUT"
+                  echo "released_version=${VERSION}" >> "$GITHUB_OUTPUT"
+                  echo "skip=false" >> "$GITHUB_OUTPUT"
+
+            - name: Update VERSION file
+              if: steps.next.outputs.skip != 'true'
+              env:
+                  DEV_VERSION: ${{ steps.next.outputs.dev_version }}
+              run: |
+                  echo "$DEV_VERSION" > VERSION
+
+            - name: Create pull request
+              if: steps.next.outputs.skip != 'true'
+              uses: peter-evans/create-pull-request@v8
+              with:
+                  branch: chore/bump-version-${{ steps.next.outputs.dev_version }}
+                  commit-message: "chore: bump version to ${{ steps.next.outputs.dev_version }} for next development cycle"
+                  title: "chore: bump version to ${{ steps.next.outputs.dev_version }}"
+                  body: |
+                      Automated post-release version bump after v${{ steps.next.outputs.released_version }}.
+
+                      Updates `VERSION` file to `${{ steps.next.outputs.dev_version }}` for the next development cycle.
+                  labels: automated
