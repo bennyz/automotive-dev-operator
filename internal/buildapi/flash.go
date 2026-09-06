@@ -23,6 +23,7 @@ import (
 	"github.com/centos-automotive-suite/automotive-dev-operator/internal/common/labels"
 	"github.com/centos-automotive-suite/automotive-dev-operator/internal/common/tasks"
 	"github.com/centos-automotive-suite/automotive-dev-operator/internal/common/terminal"
+	"github.com/centos-automotive-suite/automotive-dev-operator/internal/notifications"
 	tektonv1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
 )
 
@@ -169,7 +170,39 @@ func (a *APIServer) createFlash(c *gin.Context) {
 		})
 	}
 
+	callbackSecret, callbackErr := createCallbackSecret(
+		ctx,
+		k8sClient,
+		namespace,
+		notifications.SubjectTaskRun,
+		req.Name,
+		"",
+		req.Callback,
+	)
+	if callbackErr != nil {
+		_ = clientset.CoreV1().Secrets(namespace).Delete(ctx, secretName, metav1.DeleteOptions{})
+		if flashOCIAuthSecretName != "" {
+			_ = clientset.CoreV1().Secrets(namespace).Delete(ctx, flashOCIAuthSecretName, metav1.DeleteOptions{})
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to persist callback configuration"})
+		return
+	}
+
 	// Create the flash TaskRun
+	traceID := extractTraceID(ctx)
+	taskAnnotations := map[string]string{
+		labels.RequestedBy: requestedBy,
+		labels.ImageRef:    req.ImageRef,
+	}
+	if traceID != "" {
+		taskAnnotations[automotivev1alpha1.AnnotationTraceID] = traceID
+	}
+	if req.ExternalID != "" {
+		taskAnnotations[notifications.AnnotationExternalID] = req.ExternalID
+	}
+	if callbackSecret != nil {
+		taskAnnotations[notifications.AnnotationCallbackSecretRef] = callbackSecret.Name
+	}
 	taskRun := &tektonv1.TaskRun{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      req.Name,
@@ -180,10 +213,7 @@ func (a *APIServer) createFlash(c *gin.Context) {
 				labels.Name:         "flash-taskrun",
 				labels.FlashTaskRun: req.Name,
 			},
-			Annotations: map[string]string{
-				labels.RequestedBy: requestedBy,
-				labels.ImageRef:    req.ImageRef,
-			},
+			Annotations: taskAnnotations,
 		},
 		Spec: tektonv1.TaskRunSpec{
 			ServiceAccountName: automotivev1alpha1.BuildServiceAccountName,
@@ -206,8 +236,21 @@ func (a *APIServer) createFlash(c *gin.Context) {
 		if flashOCIAuthSecretName != "" {
 			_ = clientset.CoreV1().Secrets(namespace).Delete(ctx, flashOCIAuthSecretName, metav1.DeleteOptions{})
 		}
+		deleteCallbackSecret(ctx, k8sClient, callbackSecret)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to create flash TaskRun: %v", err)})
 		return
+	}
+	if callbackSecret != nil {
+		if err := adoptCallbackSecret(
+			ctx,
+			k8sClient,
+			callbackSecret,
+			notifications.SubjectTaskRun,
+			taskRun.Name,
+			taskRun.UID,
+		); err != nil {
+			a.log.Error(err, "failed to adopt callback secret", "flash", taskRun.Name)
+		}
 	}
 
 	// Set owner reference on secrets for automatic cleanup
