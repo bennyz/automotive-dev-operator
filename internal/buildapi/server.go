@@ -43,6 +43,7 @@ import (
 	"github.com/centos-automotive-suite/automotive-dev-operator/internal/common/labels"
 	"github.com/centos-automotive-suite/automotive-dev-operator/internal/common/manifestschema"
 	"github.com/centos-automotive-suite/automotive-dev-operator/internal/common/tasks"
+	"github.com/centos-automotive-suite/automotive-dev-operator/internal/common/terminal"
 	tektonv1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel"
@@ -655,12 +656,12 @@ func (a *APIServer) cancelBuild(c *gin.Context, name string) {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("error fetching PipelineRun: %v", err)})
 				return
 			}
-		} else if pipelineRun.Status.CompletionTime != nil {
+		} else if pipelineRun.Status.CompletionTime != nil && build.Status.Phase != phasePushing && build.Status.Phase != phaseFlashing {
 			c.JSON(http.StatusConflict, gin.H{
 				"error": "build has already completed; refresh and retry",
 			})
 			return
-		} else {
+		} else if pipelineRun.Status.CompletionTime == nil {
 			pipelineRun.Spec.Status = tektonv1.PipelineRunSpecStatusCancelled
 			if err := k8sClient.Update(ctx, pipelineRun); err != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to cancel PipelineRun: %v", err)})
@@ -669,19 +670,12 @@ func (a *APIServer) cancelBuild(c *gin.Context, name string) {
 		}
 	}
 
-	build.Status.Phase = phaseCancelled
-	build.Status.Message = "Build cancelled by user"
-	now := metav1.Now()
-	if build.Status.CompletionTime == nil {
-		build.Status.CompletionTime = &now
+	if build.Annotations == nil {
+		build.Annotations = map[string]string{}
 	}
-	if err := k8sClient.Status().Update(ctx, build); err != nil {
-		// Controller may have already set phase to Cancelled after seeing the PipelineRun cancel
-		if k8serrors.IsConflict(err) {
-			c.JSON(http.StatusOK, gin.H{"message": fmt.Sprintf("build %q cancelled", name)})
-			return
-		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update build status: %v", err)})
+	build.Annotations[terminal.CancellationAnnotation] = "true"
+	if err := k8sClient.Update(ctx, build); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to request cancellation: %v", err)})
 		return
 	}
 
@@ -1535,6 +1529,9 @@ func listBuilds(c *gin.Context) {
 			containerImage = b.Spec.GetContainerPush()
 			diskImage = b.Spec.GetExportOCI()
 		}
+		if b.Status.TerminalResult != nil {
+			containerImage, diskImage = storedArtifactURLs(&b)
+		}
 		if b.Spec.GetUseServiceAccountAuth() && externalRoute != "" {
 			if containerImage != "" {
 				containerImage = translateToExternalURL(containerImage, externalRoute)
@@ -1545,6 +1542,7 @@ func listBuilds(c *gin.Context) {
 		}
 
 		resp = append(resp, BuildListItem{
+			ExternalID: b.Spec.ExternalID, Artifacts: storedArtifacts(&b), Flash: storedFlash(&b),
 			Name:           b.Name,
 			Phase:          b.Status.Phase,
 			Message:        b.Status.Message,
@@ -1578,6 +1576,9 @@ func (a *APIServer) getBuild(c *gin.Context, name string) {
 	if buildProducedArtifacts(build) {
 		containerImage = build.Spec.GetContainerPush()
 		diskImage = build.Spec.GetExportOCI()
+	}
+	if build.Status.TerminalResult != nil {
+		containerImage, diskImage = storedArtifactURLs(build)
 	}
 	var warning string
 
@@ -1656,6 +1657,7 @@ func (a *APIServer) getBuild(c *gin.Context, name string) {
 	}
 
 	writeJSON(c, http.StatusOK, BuildResponse{
+		ExternalID: build.Spec.ExternalID, Artifacts: storedArtifacts(build), Flash: storedFlash(build),
 		Name:        build.Name,
 		Phase:       build.Status.Phase,
 		Message:     build.Status.Message,
