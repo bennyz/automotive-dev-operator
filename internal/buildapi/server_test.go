@@ -645,9 +645,9 @@ var _ = Describe("APIServer", func() {
 			Expect(fakeClient.Get(context.Background(), types.NamespacedName{
 				Name: "my-build", Namespace: testNamespace,
 			}, updated)).To(Succeed())
-			Expect(updated.Status.Phase).To(Equal("Cancelled"))
-			Expect(updated.Status.Message).To(Equal("Build cancelled by user"))
-			Expect(updated.Status.CompletionTime).NotTo(BeNil())
+			Expect(updated.Status.Phase).To(Equal("Pending"))
+			Expect(updated.Annotations["automotive.sdv.cloud.redhat.com/cancel-requested"]).To(Equal("true"))
+			Expect(updated.Status.CompletionTime).To(BeNil())
 		})
 
 		It("should return 409 when PipelineRun already completed", func() {
@@ -714,8 +714,9 @@ var _ = Describe("APIServer", func() {
 			Expect(fakeClient.Get(context.Background(), types.NamespacedName{
 				Name: "my-build", Namespace: testNamespace,
 			}, updated)).To(Succeed())
-			Expect(updated.Status.Phase).To(Equal("Cancelled"))
-			Expect(updated.Status.CompletionTime).NotTo(BeNil())
+			Expect(updated.Status.Phase).To(Equal("Building"))
+			Expect(updated.Annotations["automotive.sdv.cloud.redhat.com/cancel-requested"]).To(Equal("true"))
+			Expect(updated.Status.CompletionTime).To(BeNil())
 		})
 	})
 
