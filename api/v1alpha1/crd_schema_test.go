@@ -36,6 +36,8 @@ type CRDSchema struct {
 	} `yaml:"spec"`
 }
 
+const aibAggregateSizeRule = "(has(self.manifest) ? bytes(self.manifest).size() : 0) + (has(self.lockfile) ? bytes(self.lockfile).size() : 0) <= 921600"
+
 // getJSONFieldNames extracts JSON field names from a struct type using reflection
 func getJSONFieldNames(t reflect.Type) []string {
 	var fields []string
@@ -139,6 +141,52 @@ func TestCRDSchemaMatchesGoTypes(t *testing.T) {
 			t.Run("Spec", func(t *testing.T) {
 				compareFields(t, tt.name+"Spec", goSpecFields, crdSpecFields)
 			})
+		})
+	}
+}
+
+func TestAIBAggregateSizeValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		crdFile string
+		path    []string
+	}{
+		{
+			name:    "ImageBuild",
+			crdFile: "automotive.sdv.cloud.redhat.com_imagebuilds.yaml",
+			path:    []string{"spec", "aib"},
+		},
+		{
+			name:    "ScheduledImageBuild",
+			crdFile: "automotive.sdv.cloud.redhat.com_scheduledimagebuilds.yaml",
+			path:    []string{"spec", "imageBuildTemplate", "spec", "aib"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data, err := os.ReadFile(filepath.Join(getCRDPath(), tt.crdFile))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			var crd map[string]any
+			if err := yaml.Unmarshal(data, &crd); err != nil {
+				t.Fatal(err)
+			}
+
+			schema := crd["spec"].(map[string]any)["versions"].([]any)[0].(map[string]any)["schema"].(map[string]any)["openAPIV3Schema"].(map[string]any)
+			for _, field := range tt.path {
+				schema = schema["properties"].(map[string]any)[field].(map[string]any)
+			}
+
+			validations := schema["x-kubernetes-validations"].([]any)
+			for _, validation := range validations {
+				if validation.(map[string]any)["rule"] == aibAggregateSizeRule {
+					return
+				}
+			}
+			t.Fatalf("aggregate AIB size validation missing from %s", tt.crdFile)
 		})
 	}
 }
