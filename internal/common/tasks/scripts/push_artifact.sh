@@ -433,6 +433,10 @@ if [ "$REPRODUCIBLE" = "true" ] && [ -n "$DISK_DIGEST" ]; then
   echo "=== Attaching reproducibility artifacts ==="
   attach_referrer "./aib-manifest.yml" \
     "$OCI_REFERRER_TYPE_AIB_MANIFEST" "AIB input manifest"
+  if [ -f "./aib.lock" ]; then
+    attach_referrer "./aib.lock" \
+      "$OCI_REFERRER_TYPE_AIB_LOCKFILE" "AIB lockfile"
+  fi
   attach_referrer "./build-sources.tar.gz" \
     "$OCI_REFERRER_TYPE_BUILD_SOURCES" "osbuild sources archive"
   echo "=== Reproducibility artifacts attached ==="

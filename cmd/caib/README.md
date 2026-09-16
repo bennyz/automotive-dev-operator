@@ -140,7 +140,7 @@ caib image build <manifest.aib.yml> [flags]
 | `--lease-duration` | `03:00:00` | Device lease duration for flash (HH:MM:SS) |
 | `--lease` | | Existing Jumpstarter lease name (mutually exclusive with `--lease-duration`) |
 | `--secure` | `false` | Resolve tasks from signed Tekton Bundle (requires OperatorConfig `taskBundleRef`) |
-| `--reproducible` | `false` | Save RPMs, manifest, and task bundle as OCI referrers for future reproduction (requires `--secure`) |
+| `--reproducible` | `false` | Save RPMs, manifest, optional lockfile, and task bundle for future reproduction (requires `--secure`) |
 | `--task-bundle-ref` | | Digest-pinned Tekton bundle ref for reproducible rebuild (e.g. `quay.io/org/tasks@sha256:abc...`) |
 | `--restore-sources` | | OCI image ref from prior build — restores archived sources for exact reproducible rebuild |
 | `--ttl` | | Time-to-live for the build (e.g. `24h`, `72h`; empty=server default, `0`=no expiry) |
@@ -283,7 +283,7 @@ caib image build-dev <manifest.aib.yml> [flags]
 | `--lease-duration` | `03:00:00` | Device lease duration for flash (HH:MM:SS) |
 | `--lease` | | Existing Jumpstarter lease name (mutually exclusive with `--lease-duration`) |
 | `--secure` | `false` | Resolve tasks from signed Tekton Bundle (requires OperatorConfig `taskBundleRef`) |
-| `--reproducible` | `false` | Save RPMs, manifest, and task bundle as OCI referrers for future reproduction (requires `--secure`) |
+| `--reproducible` | `false` | Save RPMs, manifest, optional lockfile, and task bundle for future reproduction (requires `--secure`) |
 | `--task-bundle-ref` | | Digest-pinned Tekton bundle ref for reproducible rebuild (e.g. `quay.io/org/tasks@sha256:abc...`) |
 | `--restore-sources` | | OCI image ref from prior build — restores archived sources for exact reproducible rebuild |
 | `--ttl` | | Time-to-live for the build (e.g. `24h`, `72h`) |
@@ -496,13 +496,14 @@ caib image inspect <oci-registry-reference> [flags]
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--registry-auth-file` | | Path to Docker/Podman auth file for registry authentication |
-| `-o`, `--output-dir` | | Download referrer artifacts (manifest, RPMs, osbuild manifest) to this directory |
+| `-o`, `--output-dir` | | Download referrer artifacts (manifest, lockfile, RPMs, osbuild manifest) to this directory |
 
 Discovered referrer types:
 
 | Artifact Type | Description |
 |---------------|-------------|
 | `application/vnd.automotive.manifest.v1+yaml` | Original AIB manifest used for the build |
+| `application/vnd.automotive.lockfile.v1+json` | AIB lockfile supplied to the build |
 | `application/vnd.automotive.sources.v1+tar+gzip` | Archived RPMs and build inputs |
 | `application/vnd.osbuild.manifest.v1+json` | Resolved osbuild manifest |
 
@@ -607,6 +608,7 @@ kubectl create configmap cosign-public-key \
 When `--reproducible` is set (requires `--secure`), the build archives its inputs as OCI referrer artifacts alongside the output image:
 
 - **AIB manifest** — the exact manifest used
+- **AIB lockfile** — the dependency lockfile used, when one was supplied
 - **Build sources** — RPMs and other inputs (tar.gz)
 - **osbuild manifest** — the resolved osbuild pipeline definition
 
@@ -615,12 +617,13 @@ These artifacts enable exact rebuild reproduction. Use `caib image inspect` to v
 ### Rebuilding from a previous build
 
 ```bash
-# 1. Download the manifest and metadata for local inspection
+# 1. Download the manifest, lockfile, and metadata for local inspection
 caib image inspect quay.io/org/my-os:v1 -o ./rebuild/
 
 # 2. Rebuild using the downloaded manifest; --restore-sources tells the build
 #    to fetch archived RPMs/inputs from the OCI registry at build time
 caib image build ./rebuild/manifest.aib.yml \
+  --lockfile ./rebuild/aib.lock \
   --secure \
   --reproducible \
   --task-bundle-ref quay.io/org/tasks@sha256:abc... \
@@ -629,6 +632,7 @@ caib image build ./rebuild/manifest.aib.yml \
 ```
 
 Key flags for reproduction:
+- `--lockfile` reuses the dependency versions resolved by the original build; omit it for older images without a lockfile referrer
 - `--task-bundle-ref` pins the exact Tekton bundle used in the original build
 - `--restore-sources` tells the build to fetch archived RPMs and inputs from the original build's OCI referrers at build time (the build pod pulls from the registry, not from your local download)
 

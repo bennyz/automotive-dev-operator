@@ -63,6 +63,12 @@
       "filename": "manifest.aib.yml"
     },
     {
+      "artifactType": "application/vnd.automotive.lockfile.v1+json",
+      "label": "AIB Lockfile",
+      "var": "AIB_LOCKFILE",
+      "filename": "aib.lock"
+    },
+    {
       "artifactType": "application/vnd.automotive.sources.v1+tar+gzip",
       "label": "Build Sources",
       "var": "BUILD_SOURCES",

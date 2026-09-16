@@ -96,3 +96,114 @@ log_elapsed() { :; }
 		})
 	}
 }
+
+func TestLockfileReproducibilityArtifacts(t *testing.T) {
+	buildScript, err := os.ReadFile("scripts/build_image.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`rm -f "$WORKSPACE_PATH/aib.lock"`,
+		`cp "$MANIFEST_CONFIG_PATH/aib.lock" "$WORKSPACE_PATH/aib.lock"`,
+	} {
+		if !strings.Contains(string(buildScript), want) {
+			t.Fatalf("build script missing %q", want)
+		}
+	}
+
+	pushScript, err := os.ReadFile("scripts/push_artifact.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`if [ -f "./aib.lock" ]; then`,
+		`"$OCI_REFERRER_TYPE_AIB_LOCKFILE" "AIB lockfile"`,
+	} {
+		if !strings.Contains(string(pushScript), want) {
+			t.Fatalf("push script missing %q", want)
+		}
+	}
+
+	findManifestScript, err := os.ReadFile("scripts/find_manifest.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(findManifestScript), "|aib.lock|") {
+		t.Fatal("manifest discovery does not exclude a lockfile left in the shared workspace")
+	}
+}
+
+func TestPackageReproducibleInputsReplacesStaleLockfile(t *testing.T) {
+	data, err := os.ReadFile("scripts/build_image.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, rest, ok := strings.Cut(string(data), "package_reproducible_inputs() {")
+	if !ok {
+		t.Fatal("reproducible inputs function missing")
+	}
+	functionBody, _, ok := strings.Cut(rest, "\npackage_reproducible_inputs")
+	if !ok {
+		t.Fatal("reproducible inputs function call missing")
+	}
+	script := "package_reproducible_inputs() {" + functionBody + "\npackage_reproducible_inputs\n"
+
+	for _, tt := range []struct {
+		name     string
+		lockfile string
+	}{
+		{name: "current lockfile", lockfile: `{"version":1}`},
+		{name: "no current lockfile"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			buildDir := filepath.Join(root, "build")
+			workspaceDir := filepath.Join(root, "workspace")
+			configDir := filepath.Join(root, "config")
+			for _, dir := range []string{filepath.Join(buildDir, "osbuild_store", "sources"), workspaceDir, configDir} {
+				if err := os.MkdirAll(dir, 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			manifestPath := filepath.Join(root, "manifest.aib.yml")
+			if err := os.WriteFile(manifestPath, []byte("name: test\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			lockfilePath := filepath.Join(workspaceDir, "aib.lock")
+			if err := os.WriteFile(lockfilePath, []byte("stale"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if tt.lockfile != "" {
+				if err := os.WriteFile(filepath.Join(configDir, "aib.lock"), []byte(tt.lockfile), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			cmd := exec.Command("bash", "-c", script)
+			cmd.Env = append(os.Environ(),
+				"REPRODUCIBLE=true",
+				"BUILD_DIR="+buildDir,
+				"WORKSPACE_PATH="+workspaceDir,
+				"MANIFEST_FILE="+manifestPath,
+				"MANIFEST_CONFIG_PATH="+configDir,
+			)
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("script failed: %v\n%s", err, out)
+			}
+
+			got, err := os.ReadFile(lockfilePath)
+			if tt.lockfile == "" {
+				if !os.IsNotExist(err) {
+					t.Fatalf("stale lockfile remains: contents=%q err=%v", got, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != tt.lockfile {
+				t.Fatalf("lockfile = %q, want %q", got, tt.lockfile)
+			}
+		})
+	}
+}

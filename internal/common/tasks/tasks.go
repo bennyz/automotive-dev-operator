@@ -365,7 +365,7 @@ func GeneratePushArtifactRegistryTask(namespace string, buildConfig *BuildConfig
 				{
 					Name:        "reproducible",
 					Type:        tektonv1.ParamTypeString,
-					Description: "Attach RPMs and AIB manifest as OCI referrers for reproducibility (true/false)",
+					Description: "Attach RPMs, AIB manifest, and lockfile as OCI referrers for reproducibility (true/false)",
 					Default: &tektonv1.ParamValue{
 						Type:      tektonv1.ParamTypeString,
 						StringVal: "false",
@@ -761,7 +761,7 @@ func GenerateBuildAutomotiveImageTask(namespace string, buildConfig *BuildConfig
 				{
 					Name:        "reproducible",
 					Type:        tektonv1.ParamTypeString,
-					Description: "Save RPMs and manifest as OCI referrers for reproducibility (true/false)",
+					Description: "Save RPMs, manifest, and lockfile as OCI referrers for reproducibility (true/false)",
 					Default: &tektonv1.ParamValue{
 						Type:      tektonv1.ParamTypeString,
 						StringVal: "false",
@@ -1426,7 +1426,7 @@ func GenerateTektonPipeline(name, namespace string, buildConfig *BuildConfig) *t
 				{
 					Name:        "reproducible",
 					Type:        tektonv1.ParamTypeString,
-					Description: "Save build sources and manifest as OCI referrers for reproduction (true/false)",
+					Description: "Save build sources, manifest, and lockfile as OCI referrers for reproduction (true/false)",
 					Default: &tektonv1.ParamValue{
 						Type:      tektonv1.ParamTypeString,
 						StringVal: "false",

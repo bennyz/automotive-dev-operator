@@ -858,6 +858,10 @@ package_reproducible_inputs() {
     echo "WARNING: no osbuild sources found at $sources_dir"
   fi
   cp "$MANIFEST_FILE" "$WORKSPACE_PATH/aib-manifest.yml"
+  rm -f "$WORKSPACE_PATH/aib.lock"
+  if [ -f "$MANIFEST_CONFIG_PATH/aib.lock" ]; then
+    cp "$MANIFEST_CONFIG_PATH/aib.lock" "$WORKSPACE_PATH/aib.lock"
+  fi
 }
 
 package_reproducible_inputs

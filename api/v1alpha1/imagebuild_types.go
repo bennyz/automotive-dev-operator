@@ -112,7 +112,7 @@ type ImageBuildSpec struct {
 	// +optional
 	TaskBundleRef string `json:"taskBundleRef,omitempty"`
 
-	// Reproducible enables full build provenance: saves RPMs, AIB manifest,
+	// Reproducible enables full build provenance: saves RPMs, AIB manifest and lockfile,
 	// and task bundle ref as OCI referrers for future reproduction.
 	// Requires SecureBuild to be true for task bundle pinning.
 	// +optional

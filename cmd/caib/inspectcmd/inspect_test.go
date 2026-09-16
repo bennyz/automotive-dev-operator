@@ -153,15 +153,19 @@ func TestBuildRebuildCommand_ExportFormat(t *testing.T) {
 	}
 }
 
-func TestBuildRebuildCommand_RestoreSources(t *testing.T) {
+func TestBuildRebuildCommand_LockfileAndRestoreSources(t *testing.T) {
 	annotations := fullAnnotations()
 	referrerTypes := map[string]bool{
 		"application/vnd.automotive.manifest.v1+yaml":    true,
+		"application/vnd.automotive.lockfile.v1+json":    true,
 		"application/vnd.automotive.sources.v1+tar+gzip": true,
 	}
 
 	cmd := buildRebuildCommand("quay.io/org/repo:v1", "sha256:abc123", annotations, referrerTypes)
 
+	if !strings.Contains(cmd, "--lockfile aib.lock") {
+		t.Errorf("missing --lockfile with lockfile referrer, got: %s", cmd)
+	}
 	if !strings.Contains(cmd, "--restore-sources quay.io/org/repo@sha256:abc123") {
 		t.Errorf("missing --restore-sources with image ref, got: %s", cmd)
 	}
@@ -177,6 +181,23 @@ func TestBuildRebuildCommand_NoRestoreSourcesWithoutReferrer(t *testing.T) {
 
 	if strings.Contains(cmd, "--restore-sources") {
 		t.Errorf("should not have --restore-sources without sources referrer, got: %s", cmd)
+	}
+}
+
+func TestBuildRebuildCommand_WithoutLockfile(t *testing.T) {
+	annotations := fullAnnotations()
+	referrerTypes := map[string]bool{
+		"application/vnd.automotive.manifest.v1+yaml":    true,
+		"application/vnd.automotive.sources.v1+tar+gzip": true,
+	}
+
+	cmd := buildRebuildCommand("quay.io/org/repo:v1", "sha256:abc123", annotations, referrerTypes)
+
+	if strings.Contains(cmd, "--lockfile") {
+		t.Errorf("should not have --lockfile without lockfile referrer, got: %s", cmd)
+	}
+	if !strings.Contains(cmd, "--restore-sources quay.io/org/repo@sha256:abc123") {
+		t.Errorf("missing --restore-sources for legacy image, got: %s", cmd)
 	}
 }
 
@@ -289,6 +310,7 @@ func TestPrintProvenance_Table(t *testing.T) {
 	annotations := fullAnnotations()
 	referrerTypes := map[string]bool{
 		"application/vnd.automotive.manifest.v1+yaml":    true,
+		"application/vnd.automotive.lockfile.v1+json":    true,
 		"application/vnd.automotive.sources.v1+tar+gzip": true,
 	}
 
@@ -304,6 +326,9 @@ func TestPrintProvenance_Table(t *testing.T) {
 	}
 	if !strings.Contains(out, "quay.io/builder@sha256:def") {
 		t.Error("missing builder-image value")
+	}
+	if !strings.Contains(out, "AIB Lockfile") {
+		t.Error("missing AIB lockfile artifact")
 	}
 }
 

@@ -332,7 +332,7 @@ spec:
                         type: string
                       reproducible:
                         description: |-
-                          Reproducible enables full build provenance: saves RPMs, AIB manifest,
+                          Reproducible enables full build provenance: saves RPMs, AIB manifest and lockfile,
                           and task bundle ref as OCI referrers for future reproduction.
                           Requires SecureBuild to be true for task bundle pinning.
                         type: boolean
