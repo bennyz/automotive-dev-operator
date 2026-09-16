@@ -368,8 +368,7 @@ func (r *Reconciler) ensureReferencedCallbackOwner(
 	owner client.Object,
 ) error {
 	err := r.ensureCallbackOwner(ctx, secretKey.Namespace, secretKey.Name, kind, name, subjectUID, owner)
-	var permanent *permanentPreparationError
-	if errors.As(err, &permanent) {
+	if _, ok := errors.AsType[*permanentPreparationError](err); ok {
 		r.Log.Error(err, "callback secret requires manual repair",
 			"secret", secretKey, "subjectKind", kind, "subjectName", name)
 		return nil

@@ -709,7 +709,7 @@ func gitListFiles(dir string, trackedOnly bool) ([]string, error) {
 		return nil, fmt.Errorf("git ls-files failed (is this a git repo?): %w", err)
 	}
 	var files []string
-	for _, f := range bytes.Split(bytes.TrimRight(out, "\x00"), []byte{0}) {
+	for f := range bytes.SplitSeq(bytes.TrimRight(out, "\x00"), []byte{0}) {
 		if len(f) > 0 {
 			files = append(files, string(f))
 		}

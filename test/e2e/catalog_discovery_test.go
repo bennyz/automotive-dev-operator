@@ -236,7 +236,7 @@ spec:
 			)
 			Expect(err).NotTo(HaveOccurred())
 
-			header := strings.Split(string(output), "\n")[0]
+			header, _, _ := strings.Cut(string(output), "\n")
 			Expect(header).NotTo(ContainSubstring("TAGS"),
 				"TAGS column should be hidden when filtering by tags")
 		})
@@ -251,7 +251,7 @@ spec:
 			)
 			Expect(err).NotTo(HaveOccurred())
 
-			header := strings.Split(string(output), "\n")[0]
+			header, _, _ := strings.Cut(string(output), "\n")
 			Expect(header).To(ContainSubstring("TAGS"),
 				"TAGS column should be visible without --tags filter")
 		})

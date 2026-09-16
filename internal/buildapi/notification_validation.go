@@ -98,8 +98,7 @@ func bindOperationRequest(c *gin.Context, req any) bool {
 		err = json.Unmarshal(body, req)
 	}
 	if err != nil {
-		var tooLarge *http.MaxBytesError
-		if errors.As(err, &tooLarge) {
+		if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
 			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "operation request exceeds 4 MiB", "code": "RequestTooLarge"})
 		} else {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid JSON request", "code": "InvalidRequest"})

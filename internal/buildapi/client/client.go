@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"slices"
 	"strings"
 
 	"github.com/centos-automotive-suite/automotive-dev-operator/internal/buildapi"
@@ -105,12 +106,7 @@ func WithCACertificate(caCertPath string) Option {
 // statusIn returns a doRequest status predicate that accepts an exact set of status codes.
 func statusIn(codes ...int) func(int) bool {
 	return func(code int) bool {
-		for _, c := range codes {
-			if code == c {
-				return true
-			}
-		}
-		return false
+		return slices.Contains(codes, code)
 	}
 }
 

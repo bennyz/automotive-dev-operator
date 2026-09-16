@@ -11,7 +11,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/utils/ptr"
 )
 
 // BuildConfig defines configuration options for build operations
@@ -605,8 +604,8 @@ func GeneratePushArtifactS3Task(namespace string, buildConfig *BuildConfig) *tek
 					Script:     PushArtifactS3Script,
 					WorkingDir: "/workspace/shared",
 					SecurityContext: &corev1.SecurityContext{
-						RunAsUser:  ptr.To(int64(0)), // Run as root to access files created by build task
-						RunAsGroup: ptr.To(int64(0)),
+						RunAsUser:  new(int64(0)), // Run as root to access files created by build task
+						RunAsGroup: new(int64(0)),
 					},
 					VolumeMounts: []corev1.VolumeMount{
 						{

@@ -396,10 +396,7 @@ func paginateFiltered(items []automotivev1alpha1.CatalogImage, limit int, contin
 	if offset > total {
 		offset = total
 	}
-	end := offset + limit
-	if end > total {
-		end = total
-	}
+	end := min(offset+limit, total)
 	next := ""
 	if end < total {
 		next = strconv.Itoa(end)

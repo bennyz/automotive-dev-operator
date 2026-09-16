@@ -47,7 +47,7 @@ func getJSONFieldNames(t reflect.Type) []string {
 			continue
 		}
 		// Extract the field name from the tag (before any comma)
-		jsonName := strings.Split(jsonTag, ",")[0]
+		jsonName, _, _ := strings.Cut(jsonTag, ",")
 		if jsonName != "" {
 			fields = append(fields, jsonName)
 		}

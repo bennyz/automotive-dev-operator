@@ -187,13 +187,7 @@ func (r *deliveryReconciler) finishAttempt(
 		return ctrl.Result{}, nil
 	}
 
-	delay := r.retryBackoff(attempt)
-	if result.retryAfter > delay {
-		delay = result.retryAfter
-	}
-	if delay > maxRetryAfter {
-		delay = maxRetryAfter
-	}
+	delay := min(max(result.retryAfter, r.retryBackoff(attempt)), maxRetryAfter)
 	if !finished.Add(delay).Before(deadline) {
 		if err := r.patchState(ctx, delivery, func(status *automotivev1alpha1.WebhookDeliveryStatus) {
 			status.State = automotivev1alpha1.DeliveryFailed

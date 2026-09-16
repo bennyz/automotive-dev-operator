@@ -1,6 +1,7 @@
 package tasks
 
 import (
+	"slices"
 	"strings"
 	"testing"
 
@@ -703,11 +704,8 @@ func TestPipeline_S3Task_RunAfterBuildImage(t *testing.T) {
 	}
 
 	var afterBuild bool
-	for _, dep := range s3Task.RunAfter {
-		if dep == PipelineTaskBuildImage {
-			afterBuild = true
-			break
-		}
+	if slices.Contains(s3Task.RunAfter, PipelineTaskBuildImage) {
+		afterBuild = true
 	}
 	if !afterBuild {
 		t.Error("push-disk-artifact-s3 should run after build-image")

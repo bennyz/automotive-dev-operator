@@ -83,7 +83,7 @@ func TestOpenAPIContract(t *testing.T) {
 func contractJSONFields(typ reflect.Type) []string {
 	var fields []string
 	for field := range typ.Fields() {
-		name := strings.Split(field.Tag.Get("json"), ",")[0]
+		name, _, _ := strings.Cut(field.Tag.Get("json"), ",")
 		if field.Anonymous {
 			fields = append(fields, contractJSONFields(field.Type)...)
 		} else if name != "" && name != "-" {
