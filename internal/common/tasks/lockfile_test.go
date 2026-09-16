@@ -73,7 +73,7 @@ log_elapsed() { :; }
 						t.Fatalf("script failed: %v\n%s", err, out)
 					}
 					calls := 0
-					for _, line := range strings.Split(string(out), "\n") {
+					for line := range strings.SplitSeq(string(out), "\n") {
 						if !strings.HasPrefix(line, "CALL") {
 							continue
 						}

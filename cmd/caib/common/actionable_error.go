@@ -67,8 +67,7 @@ func (e *ActionableError) FormatWithFixes() string {
 // FormatError renders err as an actionable error if it is one,
 // otherwise renders it in the standard "Error: ..." format.
 func FormatError(err error) string {
-	var ae *ActionableError
-	if errors.As(err, &ae) {
+	if ae, ok := errors.AsType[*ActionableError](err); ok {
 		return ae.FormatWithFixes()
 	}
 	return fmt.Sprintf("Error: %v", err)

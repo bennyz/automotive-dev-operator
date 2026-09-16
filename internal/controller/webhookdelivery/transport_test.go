@@ -191,8 +191,7 @@ func TestPolicyDialRejectsDNSRebinding(t *testing.T) {
 		netip.MustParseAddr("127.0.0.1"),
 	}}
 	_, err = policyDialContext(resolver, nilDialer(), policy)(context.Background(), "tcp", "receiver.test:443")
-	var rejected policyError
-	if !errors.As(err, &rejected) {
+	if _, ok := errors.AsType[policyError](err); !ok {
 		t.Fatalf("mixed public/private DNS result was not rejected: %v", err)
 	}
 }

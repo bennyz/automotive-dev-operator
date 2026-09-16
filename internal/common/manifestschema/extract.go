@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 
 	"github.com/google/go-containerregistry/pkg/authn"
@@ -46,8 +47,8 @@ func ExtractSchemaFromImage(imageRef string) ([]byte, error) {
 		return nil, fmt.Errorf("getting image layers: %w", err)
 	}
 
-	for i := len(layers) - 1; i >= 0; i-- {
-		data, err := findFileInLayer(layers[i], SchemaPathInContainer)
+	for _, layer := range slices.Backward(layers) {
+		data, err := findFileInLayer(layer, SchemaPathInContainer)
 		if err != nil {
 			continue
 		}

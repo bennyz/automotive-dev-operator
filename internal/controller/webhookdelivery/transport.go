@@ -256,8 +256,7 @@ func signature(key []byte, timestamp string, body []byte) string {
 }
 
 func classifyRequestError(err error) attemptResult {
-	var rejected policyError
-	if errors.As(err, &rejected) {
+	if rejected, ok := errors.AsType[policyError](err); ok {
 		return attemptResult{errorText: rejected.Error()}
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
