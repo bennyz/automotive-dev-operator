@@ -321,6 +321,7 @@ func buildRebuildCommand(ociRef, digest string, annotations map[string]string, r
 	}
 
 	hasManifest := referrerTypes[ociSpec.ReferrerArtifactTypeByLabel("AIB Manifest")]
+	hasLockfile := referrerTypes[ociSpec.ReferrerArtifactTypeByLabel("AIB Lockfile")]
 	if hasManifest {
 		parts = append(parts, "manifest.aib.yml")
 	} else {
@@ -361,12 +362,15 @@ func buildRebuildCommand(ociRef, digest string, annotations map[string]string, r
 			}
 		}
 	}
+	if hasLockfile {
+		parts = append(parts, "  --lockfile aib.lock")
+	}
 	hasSources := referrerTypes[ociSpec.ReferrerArtifactTypeByLabel("Build Sources")]
 	taskBundleRef := get("task-bundle-ref")
 	if taskBundleRef != "" {
 		parts = append(parts, fmt.Sprintf("  --task-bundle-ref %s", taskBundleRef))
 	}
-	if taskBundleRef != "" || hasManifest || hasSources {
+	if taskBundleRef != "" || hasManifest || hasLockfile || hasSources {
 		parts = append(parts, "  --secure")
 		parts = append(parts, "  --reproducible")
 	}

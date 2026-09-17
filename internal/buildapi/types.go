@@ -195,7 +195,7 @@ type BuildRequest struct {
 	// TaskBundleRef overrides OperatorConfig's taskBundleRef (for reproducible rebuilds)
 	TaskBundleRef string `json:"taskBundleRef,omitempty"`
 
-	// Reproducible saves RPMs, AIB manifest, and task bundle ref as OCI referrers
+	// Reproducible saves RPMs, AIB manifest and lockfile, and task bundle ref as OCI referrers
 	Reproducible bool `json:"reproducible,omitempty"`
 
 	// RestoreSourcesRef is an OCI image reference whose archived sources will be

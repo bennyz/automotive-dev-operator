@@ -188,7 +188,7 @@ func NewImageCmd(opts Options) *cobra.Command {
 	buildCmd.Flags().BoolVar(opts.SecureBuild, "secure", false, "resolve tasks from signed Tekton Bundle (requires OperatorConfig taskBundleRef)")
 	buildCmd.Flags().StringVar(opts.TTL, "ttl", "", "time-to-live for the build (e.g. 24h, 72h, 168h); empty=server default, 0=no expiry")
 	// Reproducible build
-	buildCmd.Flags().BoolVar(opts.Reproducible, "reproducible", false, "save RPMs, manifest, and task bundle for future reproduction (requires --secure)")
+	buildCmd.Flags().BoolVar(opts.Reproducible, "reproducible", false, "save RPMs, manifest, lockfile, and task bundle for future reproduction (requires --secure)")
 	buildCmd.Flags().StringVar(opts.TaskBundleRef, "task-bundle-ref", "", "digest-pinned Tekton bundle ref for reproducible rebuild (e.g. quay.io/org/tasks@sha256:abc...)")
 	buildCmd.Flags().StringVar(opts.RestoreSourcesRef, "restore-sources", "", "OCI image ref from prior build — restores archived sources for exact reproducible rebuild")
 	// Internal registry options
@@ -304,7 +304,7 @@ func NewImageCmd(opts Options) *cobra.Command {
 	buildDevCmd.Flags().BoolVar(opts.SecureBuild, "secure", false, "resolve tasks from signed Tekton Bundle (requires OperatorConfig taskBundleRef)")
 	buildDevCmd.Flags().StringVar(opts.TTL, "ttl", "", "time-to-live for the build (e.g. 24h, 72h, 168h); empty=server default, 0=no expiry")
 	// Reproducible build
-	buildDevCmd.Flags().BoolVar(opts.Reproducible, "reproducible", false, "save RPMs, manifest, and task bundle for future reproduction (requires --secure)")
+	buildDevCmd.Flags().BoolVar(opts.Reproducible, "reproducible", false, "save RPMs, manifest, lockfile, and task bundle for future reproduction (requires --secure)")
 	buildDevCmd.Flags().StringVar(opts.TaskBundleRef, "task-bundle-ref", "", "digest-pinned Tekton bundle ref for reproducible rebuild (e.g. quay.io/org/tasks@sha256:abc...)")
 	buildDevCmd.Flags().StringVar(opts.RestoreSourcesRef, "restore-sources", "", "OCI image ref from prior build — restores archived sources for exact reproducible rebuild")
 	// Internal registry options
@@ -362,7 +362,7 @@ func NewImageCmd(opts Options) *cobra.Command {
 		"",
 		"path to Docker/Podman auth file for registry authentication",
 	)
-	inspectCmd.Flags().StringVarP(opts.OutputDir, "output-dir", "o", "", "download referrer artifacts (manifest, RPMs) to this directory")
+	inspectCmd.Flags().StringVarP(opts.OutputDir, "output-dir", "o", "", "download referrer artifacts (manifest, lockfile, RPMs) to this directory")
 
 	// Sealed operation shared flags
 	addSealedFlags(prepareResealCmd, opts, defaultServer)
@@ -638,7 +638,7 @@ func newInspectCmd(opts Options) *cobra.Command {
 build provenance information: distro, target, architecture, builder versions,
 and the exact command to reproduce the build.
 
-If --output-dir is given, referrer artifacts (AIB manifest, RPM archive,
+If --output-dir is given, referrer artifacts (AIB manifest, lockfile, RPM archive,
 osbuild manifest) are downloaded to the specified directory.
 
 Examples:
