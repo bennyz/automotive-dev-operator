@@ -318,3 +318,110 @@ prepare_locked_rpms_with_hermeto "$1" "$2" "$3" "registry.example/prior-build"
 [ "$AIB_BUILD_NETWORK_DISABLED" = true ]
 `, lock, filepath.Join(dir, "build"), dir)
 }
+
+func TestHermetoSourceAndModuleArtifacts(t *testing.T) {
+	dir := t.TempDir()
+	lockPath := filepath.Join(dir, "aib.lock")
+	convertedPath := filepath.Join(dir, "rpms.lock.yaml")
+	mapPath := filepath.Join(dir, "map.json")
+	contents := map[string][]byte{
+		"packages":        []byte("binary RPM"),
+		"source":          []byte("source RPM"),
+		"module_metadata": []byte("module metadata"),
+	}
+	filenames := map[string]string{"packages": "demo.rpm", "source": "demo.src.rpm", "module_metadata": "modules.yaml.gz"}
+	depsolve := map[string]any{"request": map[string]any{"architecture": "aarch64"}}
+	checksums := map[string]string{}
+	for kind, content := range contents {
+		digest := sha256.Sum256(content)
+		checksums[kind] = "sha256:" + hex.EncodeToString(digest[:])
+		depsolve[kind] = []any{map[string]any{
+			"url": "https://repo.example/" + filenames[kind], "checksum": checksums[kind], "repoid": "appstream",
+		}}
+	}
+	writeJSONFile(t, lockPath, map[string]any{"version": 1, "depsolves": map[string]any{"one": depsolve, "duplicate": depsolve}})
+	runHermetoFunction(t, "convert_aib_lock_to_hermeto", lockPath, convertedPath, mapPath)
+	var converted struct {
+		Arches []struct {
+			Packages []map[string]any `json:"packages"`
+			Source   []map[string]any `json:"source"`
+			Modules  []map[string]any `json:"module_metadata"`
+		} `json:"arches"`
+	}
+	data, err := os.ReadFile(convertedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(data, &converted); err != nil {
+		t.Fatal(err)
+	}
+	if len(converted.Arches) != 1 {
+		t.Fatalf("unexpected architectures: %s", data)
+	}
+	arch := converted.Arches[0]
+	for kind, entries := range map[string][]map[string]any{"packages": arch.Packages, "source": arch.Source, "module_metadata": arch.Modules} {
+		if len(entries) != 1 || entries[0]["checksum"] != checksums[kind] || entries[0]["repoid"] != "appstream" {
+			t.Fatalf("%s was not preserved and deduplicated: %s", kind, data)
+		}
+	}
+	output := filepath.Join(dir, "output")
+	for kind, filename := range filenames {
+		path := filepath.Join(output, "deps/rpm/aarch64/appstream", filename)
+		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, contents[kind], 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store := filepath.Join(dir, "store")
+	runHermetoFunction(t, "map_hermeto_rpms_to_osbuild_store", mapPath, output, store)
+	for kind, checksum := range checksums {
+		data, err := os.ReadFile(filepath.Join(store, checksum))
+		if err != nil || string(data) != string(contents[kind]) {
+			t.Fatalf("%s artifact not preserved: %v", kind, err)
+		}
+	}
+}
+
+func TestHermetoSourceOnlyLock(t *testing.T) {
+	dir := t.TempDir()
+	lock := filepath.Join(dir, "aib.lock")
+	writeJSONFile(t, lock, map[string]any{"version": 1, "depsolves": map[string]any{"one": map[string]any{
+		"request": map[string]any{"architecture": "aarch64"},
+		"source":  []any{map[string]any{"url": "https://repo.example/demo.src.rpm", "checksum": "sha256:" + strings.Repeat("a", 64)}},
+	}}})
+	runHermetoFunction(t, "aib_lock_has_rpms", lock)
+	runHermetoFunction(t, "aib_lock_is_rpm_only", lock)
+	runHermetoFunction(t, "convert_aib_lock_to_hermeto", lock, filepath.Join(dir, "converted"), filepath.Join(dir, "map"))
+}
+
+func TestHermetoRejectsInvalidSupplementalArtifacts(t *testing.T) {
+	checksum := "sha256:" + strings.Repeat("a", 64)
+	for _, tc := range []struct {
+		name, kind, want string
+		entries          []any
+	}{
+		{"missing checksum", "source", "no usable checksum", []any{map[string]any{"url": "https://repo.example/demo.src.rpm"}}},
+		{"missing module repository", "module_metadata", "requires repoid", []any{map[string]any{"url": "https://repo.example/modules.yaml.gz", "checksum": checksum}}},
+		{"repository traversal", "source", "Invalid repository ID", []any{map[string]any{"url": "https://repo.example/demo.src.rpm", "checksum": checksum, "repoid": "../../escape"}}},
+		{"wrong source type", "source", "Source RPM URL must end", []any{map[string]any{"url": "https://repo.example/demo.rpm", "checksum": checksum}}},
+		{"metadata filename collision", "module_metadata", "Conflicting downloads target", []any{
+			map[string]any{"url": "https://repo.example/a/modules.yaml.gz", "checksum": checksum, "repoid": "appstream"},
+			map[string]any{"url": "https://repo.example/b/modules.yaml.gz", "checksum": "sha256:" + strings.Repeat("b", 64), "repoid": "appstream"},
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			lock := filepath.Join(dir, "aib.lock")
+			writeJSONFile(t, lock, map[string]any{"version": 1, "depsolves": map[string]any{"one": map[string]any{
+				"request":  map[string]any{"architecture": "aarch64"},
+				"packages": []any{map[string]any{"url": "https://repo.example/demo.rpm", "checksum": checksum}}, tc.kind: tc.entries,
+			}}})
+			out := runHermetoScript(t, `if convert_aib_lock_to_hermeto "$1" "$2" "$3"; then exit 99; fi`, lock, filepath.Join(dir, "converted"), filepath.Join(dir, "map"))
+			if !strings.Contains(string(out), tc.want) {
+				t.Fatalf("expected %q, got %s", tc.want, out)
+			}
+		})
+	}
+}

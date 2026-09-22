@@ -13,7 +13,7 @@ with open(sys.argv[1], encoding="utf-8") as lockfile:
 
 depsolves = lock.get("depsolves", {})
 if not isinstance(depsolves, dict) or not any(
-    isinstance(entry, dict) and entry.get("packages") for entry in depsolves.values()
+    isinstance(entry, dict) and (entry.get("packages") or entry.get("source")) for entry in depsolves.values()
 ):
     raise SystemExit(1)
 
@@ -34,7 +34,7 @@ depsolves = lock.get("depsolves", {})
 raise SystemExit(
     not isinstance(depsolves, dict)
     or not any(
-        isinstance(entry, dict) and entry.get("packages")
+        isinstance(entry, dict) and (entry.get("packages") or entry.get("source"))
         for entry in depsolves.values()
     )
 )
@@ -65,85 +65,85 @@ if not isinstance(depsolves, dict) or not depsolves:
 
 by_arch = {}
 url_checksums = {}
+paths = {}
+url_paths = {}
 for depsolve_key in sorted(depsolves):
     depsolve = depsolves[depsolve_key]
-    request = depsolve.get("request", {})
-    arch = request.get("architecture")
-    if not isinstance(arch, str) or not arch:
-        raise SystemExit(f"depsolve {depsolve_key} has no request architecture")
+    arch = depsolve.get("request", {}).get("architecture")
+    if not isinstance(arch, str) or not re.fullmatch(r"[A-Za-z0-9_+-]+", arch):
+        raise SystemExit(f"depsolve {depsolve_key} has no usable request architecture")
 
-    packages = depsolve.get("packages")
-    if not isinstance(packages, list):
-        raise SystemExit(f"depsolve {depsolve_key} has no package list")
+    arch_entries = by_arch.setdefault(arch, {})
+    for kind in ("packages", "source", "module_metadata"):
+        entries = depsolve.get(kind, [])
+        if not isinstance(entries, list):
+            raise SystemExit(f"depsolve {depsolve_key} has invalid {kind} list")
+        for entry in entries:
+            url = entry.get("url")
+            checksum = entry.get("checksum")
+            if not isinstance(url, str) or not url:
+                raise SystemExit(f"depsolve {depsolve_key} contains {kind} without a URL")
+            parsed = urllib.parse.urlsplit(url)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                raise SystemExit(f"Hermeto spike supports only HTTP(S) URLs: {url}")
+            if parsed.query or parsed.fragment:
+                raise SystemExit(f"Hermeto spike does not support URL queries or fragments: {url}")
+            if not isinstance(checksum, str) or not re.fullmatch(
+                r"[A-Za-z0-9_+-]+:[0-9a-f]+", checksum
+            ):
+                raise SystemExit(f"{kind} has no usable checksum: {url}")
+            if entry.get("secrets"):
+                raise SystemExit(f"Hermeto spike does not support secret-backed URLs: {url}")
+            previous_checksum = url_checksums.setdefault(url, checksum)
+            if previous_checksum != checksum:
+                raise SystemExit(f"URL has conflicting checksums: {url}")
 
-    arch_packages = by_arch.setdefault(arch, {})
-    for package in packages:
-        url = package.get("url")
-        checksum = package.get("checksum")
-        if not isinstance(url, str) or not url:
-            raise SystemExit(f"depsolve {depsolve_key} contains an RPM without a URL")
-        if urllib.parse.urlsplit(url).scheme not in {"http", "https"}:
-            raise SystemExit(f"Hermeto spike supports only HTTP(S) RPM URLs: {url}")
-        if not isinstance(checksum, str) or not re.fullmatch(
-            r"[A-Za-z0-9_+-]+:[0-9a-f]+", checksum
-        ):
-            raise SystemExit(f"RPM has no usable checksum: {url}")
-        if package.get("secrets"):
-            raise SystemExit(f"Hermeto spike does not support secret-backed RPM URLs: {url}")
+            filename = pathlib.Path(url).name
+            if filename in {"", ".", ".."}:
+                raise SystemExit(f"URL has no usable filename: {url}")
+            if kind != "module_metadata" and not filename.endswith(".rpm"):
+                raise SystemExit(f"RPM URL does not end in .rpm: {url}")
+            if kind == "source" and not filename.endswith((".src.rpm", ".nosrc.rpm")):
+                raise SystemExit(f"Source RPM URL must end in .src.rpm or .nosrc.rpm: {url}")
+            if kind == "packages" and filename.endswith((".src.rpm", ".nosrc.rpm")):
+                raise SystemExit(f"Source RPM must be listed in source: {url}")
 
-        previous_checksum = url_checksums.setdefault(url, checksum)
-        if previous_checksum != checksum:
-            raise SystemExit(f"RPM URL has conflicting checksums: {url}")
+            repoid = entry.get("repoid")
+            if kind == "module_metadata" and not repoid:
+                raise SystemExit(f"Module metadata requires repoid: {url}")
+            if repoid is None:
+                # Hermeto omits synthetic repository IDs from RPM PURLs.
+                repoid = "hermeto-aib-" + hashlib.sha256(checksum.encode()).hexdigest()[:12]
+            if not isinstance(repoid, str) or not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", repoid):
+                raise SystemExit(f"Invalid repository ID for {url}")
 
-        existing = arch_packages.get(checksum)
-        if existing is not None:
-            if url < existing["url"]:
-                existing["url"] = url
-                existing["filename"] = pathlib.Path(url).name
-            continue
-
-        filename = pathlib.Path(url).name
-        if not filename.endswith(".rpm"):
-            raise SystemExit(f"RPM URL does not end in .rpm: {url}")
-        # Hermeto excludes its synthetic IDs from PURLs, preserving download_url.
-        repoid = "hermeto-aib-" + hashlib.sha256(checksum.encode()).hexdigest()[:12]
-        arch_packages[checksum] = {
-            "url": url,
-            "checksum": checksum,
-            "repoid": repoid,
-            "filename": filename,
-            "name": package.get("name"),
-            "evr": package.get("evr"),
-        }
+            identity = (kind, repoid, checksum)
+            existing = arch_entries.get(identity)
+            if existing is not None:
+                if url >= existing["url"]:
+                    continue
+            item = {"url": url, "repoid": repoid, "checksum": checksum}
+            for optional in ("name", "evr", "size"):
+                if optional in entry:
+                    item[optional] = entry[optional]
+            arch_entries[identity] = item
 
 arches = []
 rpm_map = []
-for arch in sorted(by_arch):
-    packages = []
-    for checksum, package in sorted(by_arch[arch].items()):
-        lock_entry = {
-            "url": package["url"],
-            "repoid": package["repoid"],
-            "checksum": checksum,
-        }
-        for optional in ("name", "evr"):
-            if package[optional] is not None:
-                lock_entry[optional] = package[optional]
-        packages.append(lock_entry)
-        rpm_map.append(
-            {
-                "checksum": checksum,
-                "path": str(
-                    pathlib.Path("deps/rpm")
-                    / arch
-                    / package["repoid"]
-                    / package["filename"]
-                ),
-                "url": package["url"],
-            }
-        )
-    if packages:
-        arches.append({"arch": arch, "packages": packages})
+for arch, entries in sorted(by_arch.items()):
+    output = {"arch": arch}
+    for (kind, repoid, checksum), entry in sorted(entries.items()):
+        path = str(pathlib.Path("deps/rpm") / arch / repoid / pathlib.Path(entry["url"]).name)
+        if paths.setdefault(path, checksum) != checksum:
+            raise SystemExit(f"Conflicting downloads target {path}")
+        # Hermeto indexes downloads by URL within each architecture.
+        if url_paths.setdefault((arch, entry["url"]), path) != path:
+            raise SystemExit(f"URL has conflicting repository destinations: {entry['url']}")
+        output.setdefault(kind, []).append(entry)
+        rpm_map.append({"checksum": checksum, "path": path, "url": entry["url"]})
+    if not (output.get("packages") or output.get("source")):
+        raise SystemExit(f"Architecture {arch} has no binary or source RPMs")
+    arches.append(output)
 
 if not arches:
     raise SystemExit("AIB lockfile contains no RPM packages")
@@ -282,5 +282,5 @@ prepare_locked_rpms_with_hermeto() {
   cp "$output_dir/bom.json" "$restored_sbom"
   cp "$output_dir/bom.json" "$workspace_path/hermeto-rpm-bom.json"
   rm -rf "$input_dir" "$output_dir"
-  echo "Mapped $mapped_count verified RPMs into the osbuild source store"
+  echo "Mapped $mapped_count verified RPM and metadata artifacts into the osbuild source store"
 }
