@@ -160,9 +160,9 @@ PYEOF
 }
 
 map_hermeto_rpms_to_osbuild_store() {
-  local rpm_map="$1" hermeto_output="$2" store="$3"
+  local rpm_map="$1" hermeto_output="$2" store="$3" verify_only="${4:-false}"
 
-  python3 - "$rpm_map" "$hermeto_output" "$store" <<'PYEOF'
+  python3 - "$rpm_map" "$hermeto_output" "$store" "$verify_only" <<'PYEOF'
 import hashlib
 import json
 import os
@@ -170,12 +170,13 @@ import pathlib
 import shutil
 import sys
 
-rpm_map_path, output_path, store_path = map(pathlib.Path, sys.argv[1:])
+rpm_map_path, output_path, store_path = map(pathlib.Path, sys.argv[1:4])
+verify_only = sys.argv[4] == "true"
 entries = json.loads(rpm_map_path.read_text(encoding="utf-8"))
 store_path.mkdir(parents=True, exist_ok=True)
 
 for entry in entries:
-    source = output_path / entry["path"]
+    source = store_path / entry["checksum"] if verify_only else output_path / entry["path"]
     if not source.is_file():
         raise SystemExit(f"Hermeto did not fetch {entry['url']} at {source}")
 
@@ -190,6 +191,9 @@ for entry in entries:
     if digest.hexdigest() != expected:
         raise SystemExit(f"checksum mismatch while mapping {entry['url']}")
 
+    if verify_only:
+        continue
+
     destination = store_path / entry["checksum"]
     temporary = destination.with_name(destination.name + f".tmp.{os.getpid()}")
     shutil.copyfile(source, temporary)
@@ -202,6 +206,14 @@ PYEOF
 prepare_locked_rpms_with_hermeto() {
   local aib_lock="$1" build_dir="$2" workspace_path="$3" restore_sources_ref="$4"
   local restored_sbom="$build_dir/osbuild_store/hermeto-rpm-bom.json"
+  local require_locked=false
+  if [ "${SECURE_BUILD:-false}" = "true" ] || [ "${REPRODUCIBLE:-false}" = "true" ]; then
+    require_locked=true
+    [ -s "$aib_lock" ] || fail "secure/reproducible build requires a lockfile"
+    aib_lock_is_rpm_only "$aib_lock" \
+      || fail "secure dependency preparation currently requires an RPM-only lockfile; mixed or non-RPM inputs are unsupported"
+    HERMETO_PREFETCH=true
+  fi
   rm -f "$workspace_path/hermeto-rpm-bom.json"
   if [ ! -f "$aib_lock" ]; then
     if [ -n "$restore_sources_ref" ] && [ -f "$restored_sbom" ]; then
@@ -231,6 +243,16 @@ prepare_locked_rpms_with_hermeto() {
   fi
 
   if [ -n "$restore_sources_ref" ]; then
+    if [ "$require_locked" = "true" ]; then
+      local verify_dir
+      verify_dir=$(mktemp -d "$build_dir/verify-restored.XXXXXX")
+      convert_aib_lock_to_hermeto "$aib_lock" "$verify_dir/rpms.lock.yaml" "$verify_dir/map.json" \
+        || fail "failed to validate restored lockfile"
+      map_hermeto_rpms_to_osbuild_store "$verify_dir/map.json" "" "$build_dir/osbuild_store/sources/org.osbuild.files" true \
+        || fail "restored sources do not match the lockfile"
+      rm -rf "$verify_dir"
+      [ -s "$restored_sbom" ] || fail "restored Hermeto SBOM is missing"
+    fi
     if [ -f "$restored_sbom" ]; then
       cp "$restored_sbom" "$workspace_path/hermeto-rpm-bom.json"
     fi
@@ -278,7 +300,7 @@ prepare_locked_rpms_with_hermeto() {
   local mapped_count
   mapped_count=$(map_hermeto_rpms_to_osbuild_store "$rpm_map" "$output_dir" "$source_store") \
     || fail "failed to map Hermeto RPMs into the osbuild source store"
-  [ -f "$output_dir/bom.json" ] || fail "Hermeto did not produce bom.json"
+  [ -s "$output_dir/bom.json" ] || fail "Hermeto did not produce bom.json"
   cp "$output_dir/bom.json" "$restored_sbom"
   cp "$output_dir/bom.json" "$workspace_path/hermeto-rpm-bom.json"
   rm -rf "$input_dir" "$output_dir"
