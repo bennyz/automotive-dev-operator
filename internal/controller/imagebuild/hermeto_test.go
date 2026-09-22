@@ -76,7 +76,7 @@ func TestHermetoOperatorConfigReachesPipelineRun(t *testing.T) {
 				for _, p := range run.Spec.Params {
 					params[p.Name] = p.Value.StringVal
 				}
-				if params["hermeto-prefetch"] != strconv.FormatBool(tc.enabled) || params["hermeto-image"] != tc.wantImage {
+				if params["hermeto-prefetch"] != strconv.FormatBool(tc.enabled || secure) || params["hermeto-image"] != tc.wantImage {
 					t.Fatalf("Hermeto settings did not reach PipelineRun: %+v", params)
 				}
 			})

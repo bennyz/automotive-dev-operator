@@ -425,3 +425,76 @@ func TestHermetoRejectsInvalidSupplementalArtifacts(t *testing.T) {
 		})
 	}
 }
+
+func TestSecureHermetoPreparation(t *testing.T) {
+	for _, scenario := range []string{"fetch", "fetch failure", "missing SBOM", "mixed", "missing lock", "restore", "corrupt restore", "missing restore blob", "missing restore SBOM"} {
+		t.Run(scenario, func(t *testing.T) {
+			dir := t.TempDir()
+			build := filepath.Join(dir, "build")
+			store := filepath.Join(build, "osbuild_store", "sources", "org.osbuild.files")
+			if err := os.MkdirAll(store, 0700); err != nil {
+				t.Fatal(err)
+			}
+			bytes := []byte("rpm bytes")
+			hash := sha256.Sum256(bytes)
+			checksum := "sha256:" + hex.EncodeToString(hash[:])
+			lock := filepath.Join(dir, "aib.lock")
+			input := map[string]any{"version": 1, "depsolves": map[string]any{"one": map[string]any{"request": map[string]any{"architecture": "aarch64"}, "packages": []any{map[string]any{"url": "https://repo.example/demo.rpm", "repoid": "baseos", "checksum": checksum}}}}}
+			if scenario == "mixed" {
+				input["containers"] = map[string]any{"example": "sha256:abc"}
+			}
+			if scenario != "missing lock" {
+				writeJSONFile(t, lock, input)
+			}
+			restore := ""
+			if strings.Contains(scenario, "restore") {
+				restore = "registry.example/prior@sha256:abc"
+				if scenario != "missing restore blob" {
+					if scenario == "corrupt restore" {
+						bytes = []byte("tampered")
+					}
+					if err := os.WriteFile(filepath.Join(store, checksum), bytes, 0600); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if scenario != "missing restore SBOM" {
+					writeJSONFile(t, filepath.Join(build, "osbuild_store", "hermeto-rpm-bom.json"), map[string]any{"bomFormat": "CycloneDX"})
+				}
+			}
+			scriptPath, err := filepath.Abs("scripts/hermeto.sh")
+			if err != nil {
+				t.Fatal(err)
+			}
+			script := `set -e
+source "$1"
+fail() { echo "ERROR: $*"; exit 1; }
+unshare() { :; }
+podman() {
+ echo FETCH
+ [ "$SCENARIO" != 'fetch failure' ] || return 42
+ [ -z "$RESTORE" ] || exit 99
+ mkdir -p "$BUILD/hermeto-output/deps/rpm/aarch64/baseos"
+ printf 'rpm bytes' > "$BUILD/hermeto-output/deps/rpm/aarch64/baseos/demo.rpm"
+ if [ "$SCENARIO" != 'missing SBOM' ]; then printf '{"bomFormat":"CycloneDX"}' > "$BUILD/hermeto-output/bom.json"; fi
+}
+AIB_BUILD_NETWORK_DISABLED=false
+prepare_locked_rpms_with_hermeto "$LOCK" "$BUILD" "$WORKSPACE" "$RESTORE"
+[ "$AIB_BUILD_NETWORK_DISABLED" = true ]
+echo PREPARED
+`
+			cmd := exec.Command("bash", "-c", script, "bash", scriptPath)
+			cmd.Env = append(os.Environ(), "SECURE_BUILD=true", "REPRODUCIBLE=false", "HERMETO_PREFETCH=false", "HERMETO_IMAGE=example/hermeto@sha256:abc", "SCENARIO="+scenario, "LOCK="+lock, "BUILD="+build, "WORKSPACE="+dir, "RESTORE="+restore)
+			out, err := cmd.CombinedOutput()
+			wantSuccess := scenario == "fetch" || scenario == "restore"
+			if (err == nil) != wantSuccess {
+				t.Fatalf("err=%v output=%s", err, out)
+			}
+			if strings.Contains(string(out), "PREPARED") != wantSuccess {
+				t.Fatalf("unexpected continuation: %s", out)
+			}
+			if restore != "" && strings.Contains(string(out), "FETCH") {
+				t.Fatalf("restore fetched: %s", out)
+			}
+		})
+	}
+}

@@ -1210,10 +1210,14 @@ func (r *ImageBuildReconciler) createBuildTaskRun(
 			},
 		},
 		{
+			Name:  "resolve-only",
+			Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: fmt.Sprintf("%t", imageBuild.Spec.GetResolveOnly())},
+		},
+		{
 			Name: "hermeto-prefetch",
 			Value: tektonv1.ParamValue{
 				Type:      tektonv1.ParamTypeString,
-				StringVal: fmt.Sprintf("%t", buildConfig != nil && buildConfig.HermetoPrefetch),
+				StringVal: fmt.Sprintf("%t", imageBuild.Spec.SecureBuild || imageBuild.Spec.Reproducible || (buildConfig != nil && buildConfig.HermetoPrefetch)),
 			},
 		},
 		{

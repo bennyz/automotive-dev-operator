@@ -45,6 +45,15 @@ const (
 	TektonResolverBundles = "bundles"
 )
 
+func resolveOnlyParamSpec() tektonv1.ParamSpec {
+	return tektonv1.ParamSpec{
+		Name:        "resolve-only",
+		Type:        tektonv1.ParamTypeString,
+		Description: "Generate a dependency lockfile without assembling an image",
+		Default:     &tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: "false"},
+	}
+}
+
 func hermetoPrefetchParamSpec(config *BuildConfig) tektonv1.ParamSpec {
 	return tektonv1.ParamSpec{
 		Name:        "hermeto-prefetch",
@@ -808,6 +817,13 @@ func GenerateBuildAutomotiveImageTask(namespace string, buildConfig *BuildConfig
 				},
 				hermetoPrefetchParamSpec(buildConfig),
 				{
+					Name:        "secure-build",
+					Type:        tektonv1.ParamTypeString,
+					Description: "Require locked, verified dependencies without fallback",
+					Default:     &tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: "false"},
+				},
+				resolveOnlyParamSpec(),
+				{
 					Name:        "hermeto-image",
 					Type:        tektonv1.ParamTypeString,
 					Description: "Hermeto image used to fetch and verify locked RPMs",
@@ -929,9 +945,11 @@ func GenerateBuildAutomotiveImageTask(namespace string, buildConfig *BuildConfig
 						taskParamEnvVar("REBUILD_BUILDER", "rebuild-builder"),
 						taskParamEnvVar("USE_PERSISTENT_CACHE", "use-persistent-cache"),
 						taskParamEnvVar("REPRODUCIBLE", "reproducible"),
+						taskParamEnvVar("SECURE_BUILD", "secure-build"),
 						taskParamEnvVar("RESTORE_SOURCES_REF", "restore-sources-ref"),
 						taskParamEnvVar("HERMETO_IMAGE", "hermeto-image"),
 						taskParamEnvVar("HERMETO_PREFETCH", "hermeto-prefetch"),
+						taskParamEnvVar("RESOLVE_ONLY", "resolve-only"),
 						taskParamEnvVar("INSECURE_REGISTRY", "insecure-registry"),
 						{
 							Name:  "USE_MEMORY_VOLUMES",
@@ -1240,6 +1258,7 @@ func GenerateTektonPipeline(name, namespace string, buildConfig *BuildConfig) *t
 					Description: "Container image for yq helper steps",
 				},
 				hermetoPrefetchParamSpec(buildConfig),
+				resolveOnlyParamSpec(),
 				{
 					Name: "hermeto-image",
 					Type: tektonv1.ParamTypeString,
@@ -1590,7 +1609,7 @@ func GenerateTektonPipeline(name, namespace string, buildConfig *BuildConfig) *t
 								"automotive-image-builder", "container-push", "build-disk-image",
 								"export-oci", "builder-image", "cluster-registry-route",
 								"container-ref", "rebuild-builder", "use-persistent-cache",
-								"yq-helper-image", "hermeto-image", "hermeto-prefetch", "reproducible", "restore-sources-ref", "insecure-registry",
+								"yq-helper-image", "hermeto-image", "hermeto-prefetch", "resolve-only", "secure-build", "reproducible", "restore-sources-ref", "insecure-registry",
 							),
 							traceIDPipelineParam(),
 						)...,
