@@ -22,6 +22,8 @@ type BuildConfig struct {
 	RuntimeClassName            string
 	AutomotiveImageBuilderImage string
 	YQHelperImage               string
+	HermetoImage                string
+	HermetoPrefetch             bool
 	BuildTimeoutMinutes         int32
 	FlashTimeoutMinutes         int32
 	DefaultLeaseDuration        string
@@ -42,6 +44,18 @@ const (
 	// TektonResolverBundles is the Tekton-internal resolver name for OCI bundles.
 	TektonResolverBundles = "bundles"
 )
+
+func hermetoPrefetchParamSpec(config *BuildConfig) tektonv1.ParamSpec {
+	return tektonv1.ParamSpec{
+		Name:        "hermeto-prefetch",
+		Type:        tektonv1.ParamTypeString,
+		Description: "Opt into experimental Hermeto RPM prefetch and RPM-only build network isolation",
+		Default: &tektonv1.ParamValue{
+			Type:      tektonv1.ParamTypeString,
+			StringVal: fmt.Sprintf("%t", config != nil && config.HermetoPrefetch),
+		},
+	}
+}
 
 func traceIDParamSpec() tektonv1.ParamSpec {
 	return tektonv1.ParamSpec{
@@ -152,6 +166,13 @@ func (c *BuildConfig) getYQHelperImage() string {
 		return c.YQHelperImage
 	}
 	return automotivev1alpha1.DefaultYQHelperImage
+}
+
+func (c *BuildConfig) getHermetoImage() string {
+	if c != nil && c.HermetoImage != "" {
+		return c.HermetoImage
+	}
+	return automotivev1alpha1.DefaultHermetoImage
 }
 
 // getBuildTimeoutMinutes returns the build timeout from config or the default
@@ -785,6 +806,16 @@ func GenerateBuildAutomotiveImageTask(namespace string, buildConfig *BuildConfig
 						StringVal: buildConfig.getYQHelperImage(),
 					},
 				},
+				hermetoPrefetchParamSpec(buildConfig),
+				{
+					Name:        "hermeto-image",
+					Type:        tektonv1.ParamTypeString,
+					Description: "Hermeto image used to fetch and verify locked RPMs",
+					Default: &tektonv1.ParamValue{
+						Type:      tektonv1.ParamTypeString,
+						StringVal: buildConfig.getHermetoImage(),
+					},
+				},
 				{
 					Name:        "insecure-registry",
 					Type:        tektonv1.ParamTypeString,
@@ -899,6 +930,8 @@ func GenerateBuildAutomotiveImageTask(namespace string, buildConfig *BuildConfig
 						taskParamEnvVar("USE_PERSISTENT_CACHE", "use-persistent-cache"),
 						taskParamEnvVar("REPRODUCIBLE", "reproducible"),
 						taskParamEnvVar("RESTORE_SOURCES_REF", "restore-sources-ref"),
+						taskParamEnvVar("HERMETO_IMAGE", "hermeto-image"),
+						taskParamEnvVar("HERMETO_PREFETCH", "hermeto-prefetch"),
 						taskParamEnvVar("INSECURE_REGISTRY", "insecure-registry"),
 						{
 							Name:  "USE_MEMORY_VOLUMES",
@@ -1205,6 +1238,16 @@ func GenerateTektonPipeline(name, namespace string, buildConfig *BuildConfig) *t
 						StringVal: buildConfig.getYQHelperImage(),
 					},
 					Description: "Container image for yq helper steps",
+				},
+				hermetoPrefetchParamSpec(buildConfig),
+				{
+					Name: "hermeto-image",
+					Type: tektonv1.ParamTypeString,
+					Default: &tektonv1.ParamValue{
+						Type:      tektonv1.ParamTypeString,
+						StringVal: buildConfig.getHermetoImage(),
+					},
+					Description: "Hermeto image used to fetch and verify locked RPMs",
 				},
 				{
 					Name:        "secret-ref",
@@ -1547,7 +1590,7 @@ func GenerateTektonPipeline(name, namespace string, buildConfig *BuildConfig) *t
 								"automotive-image-builder", "container-push", "build-disk-image",
 								"export-oci", "builder-image", "cluster-registry-route",
 								"container-ref", "rebuild-builder", "use-persistent-cache",
-								"yq-helper-image", "reproducible", "restore-sources-ref", "insecure-registry",
+								"yq-helper-image", "hermeto-image", "hermeto-prefetch", "reproducible", "restore-sources-ref", "insecure-registry",
 							),
 							traceIDPipelineParam(),
 						)...,

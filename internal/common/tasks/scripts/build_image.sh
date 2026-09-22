@@ -20,6 +20,8 @@ BUILD_START_TIME=$(date +%s)
 : "${CONTAINER_REF:=}"
 : "${RESTORE_SOURCES_REF:=}"
 : "${EXPORT_FORMAT:=}"
+: "${HERMETO_PREFETCH:=false}"
+: "${HERMETO_IMAGE:=ghcr.io/hermetoproject/hermeto@sha256:8dc7d791fb7d874d208e145934e812e51736eea495fd2f11ad3a3acd5e831eff}"
 
 BUILD_DIR=""
 LOCAL_BUILDER_IMAGE=""
@@ -32,6 +34,7 @@ AIB_COMMAND=""
 AIB_VERSION=""
 AIB_IMAGE_PINNED=""
 FINAL_NAME=""
+AIB_BUILD_NETWORK_DISABLED=false
 
 cleanup() {
   local status=$?
@@ -83,6 +86,7 @@ validate_config() {
   validate_boolean "rebuild-builder" "$REBUILD_BUILDER"
   validate_boolean "use-persistent-cache" "$USE_PERSISTENT_CACHE"
   validate_boolean "reproducible" "$REPRODUCIBLE"
+  validate_boolean "hermeto-prefetch" "$HERMETO_PREFETCH"
   validate_boolean "insecure-registry" "$INSECURE_REGISTRY"
 
   validate_container_ref "$AIB_IMAGE_REF"
@@ -234,6 +238,8 @@ restore_sources_if_requested() {
 prepare_build_directory
 restore_sources_if_requested
 install_custom_ca_certs
+prepare_locked_rpms_with_hermeto \
+  "$MANIFEST_CONFIG_PATH/aib.lock" "$BUILD_DIR" "$WORKSPACE_PATH" "$RESTORE_SOURCES_REF"
 setup_osbuild
 
 cd "$WORKSPACE_PATH" || exit 1
@@ -497,6 +503,11 @@ run_aib_command() {
   local description="$1"
   shift
   local -a command=("$@")
+
+  if [ "$AIB_BUILD_NETWORK_DISABLED" = "true" ]; then
+    command=(unshare --net -- "${command[@]}")
+    echo "AIB build network disabled; locked RPMs must come from the osbuild source store"
+  fi
 
   AIB_COMMAND=$(printf '%q ' "${command[@]}")
   AIB_COMMAND="${AIB_COMMAND% }"
@@ -852,7 +863,11 @@ package_reproducible_inputs() {
   local sources_dir="$BUILD_DIR/osbuild_store/sources"
   local sources_archive="$WORKSPACE_PATH/build-sources.tar.gz"
   if [ -d "$sources_dir" ]; then
-    tar -czf "$sources_archive" -C "$BUILD_DIR/osbuild_store" sources
+    local -a archive_entries=(sources)
+    if [ -f "$BUILD_DIR/osbuild_store/hermeto-rpm-bom.json" ]; then
+      archive_entries+=(hermeto-rpm-bom.json)
+    fi
+    tar -czf "$sources_archive" -C "$BUILD_DIR/osbuild_store" "${archive_entries[@]}"
     echo "Sources archive: $(du -sh "$sources_archive" | cut -f1)"
   else
     echo "WARNING: no osbuild sources found at $sources_dir"

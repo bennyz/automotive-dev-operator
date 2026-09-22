@@ -165,6 +165,13 @@ func TestPackageReproducibleInputsReplacesStaleLockfile(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
+			if err := os.WriteFile(
+				filepath.Join(buildDir, "osbuild_store", "hermeto-rpm-bom.json"),
+				[]byte(`{"bomFormat":"CycloneDX"}`),
+				0600,
+			); err != nil {
+				t.Fatal(err)
+			}
 			manifestPath := filepath.Join(root, "manifest.aib.yml")
 			if err := os.WriteFile(manifestPath, []byte("name: test\n"), 0600); err != nil {
 				t.Fatal(err)
@@ -189,6 +196,15 @@ func TestPackageReproducibleInputsReplacesStaleLockfile(t *testing.T) {
 			)
 			if out, err := cmd.CombinedOutput(); err != nil {
 				t.Fatalf("script failed: %v\n%s", err, out)
+			}
+			archive := filepath.Join(workspaceDir, "build-sources.tar.gz")
+			list := exec.Command("tar", "-tzf", archive)
+			contents, err := list.CombinedOutput()
+			if err != nil {
+				t.Fatalf("listing sources archive: %v\n%s", err, contents)
+			}
+			if !strings.Contains(string(contents), "hermeto-rpm-bom.json") {
+				t.Fatalf("Hermeto SBOM missing from sources archive:\n%s", contents)
 			}
 
 			got, err := os.ReadFile(lockfilePath)
