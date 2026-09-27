@@ -44,6 +44,7 @@ func main() {
 		tasks.GeneratePushArtifactS3Task("", nil),
 		tasks.GeneratePrepareBuilderTask("", nil),
 		tasks.GenerateFlashTask("", nil),
+		tasks.GenerateGitSourceTask("", nil),
 	}
 	taskList = append(taskList, tasks.GenerateSealedTasks("")...)
 

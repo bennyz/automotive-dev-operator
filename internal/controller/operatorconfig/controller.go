@@ -579,6 +579,7 @@ func (r *OperatorConfigReconciler) deployOSBuilds(
 			YQHelperImage:               config.Spec.GetImages().GetYQHelperImage(),
 			HermetoImage:                config.Spec.GetImages().GetHermetoImage(),
 			HermetoPrefetch:             config.Spec.OSBuilds.HermetoPrefetch,
+			GitCloneImage:               config.Spec.GetImages().GetGitCloneImage(),
 			BuildTimeoutMinutes:         config.Spec.OSBuilds.GetBuildTimeoutMinutes(),
 			FlashTimeoutMinutes:         config.Spec.OSBuilds.GetFlashTimeoutMinutes(),
 			DefaultLeaseDuration:        config.Spec.Jumpstarter.GetDefaultLeaseDuration(),
@@ -607,6 +608,7 @@ func (r *OperatorConfigReconciler) deployOSBuilds(
 		tasks.GeneratePushArtifactRegistryTask(config.Namespace, buildConfig),
 		tasks.GeneratePushArtifactS3Task(config.Namespace, buildConfig),
 		tasks.GenerateFlashTask(config.Namespace, buildConfig),
+		tasks.GenerateGitSourceTask(config.Namespace, buildConfig),
 	}
 	tektonTasks = append(tektonTasks, tasks.GenerateSealedTasks(config.Namespace, buildConfig)...)
 

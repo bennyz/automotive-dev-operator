@@ -128,6 +128,32 @@ spec:
                             description: Distro specifies the distribution to build
                               for (e.g., "autosd")
                             type: string
+                          gitSource:
+                            description: GitSource supplies the manifest and files
+                              instead of inline content.
+                            properties:
+                              credentialsSecretRef:
+                                description: CredentialsSecretRef references a kubernetes.io/basic-auth
+                                  Secret.
+                                maxLength: 253
+                                type: string
+                              manifestPath:
+                                description: ManifestPath is relative to the repository
+                                  root.
+                                maxLength: 1024
+                                type: string
+                              revision:
+                                description: Revision is a branch, tag, or commit.
+                                  Empty selects the remote HEAD.
+                                maxLength: 256
+                                type: string
+                              url:
+                                maxLength: 2048
+                                type: string
+                            required:
+                            - manifestPath
+                            - url
+                            type: object
                           image:
                             description: |-
                               Image specifies the automotive-image-builder container image to use
@@ -199,6 +225,14 @@ spec:
                           rule: '(has(self.manifest) ? bytes(self.manifest).size()
                             : 0) + (has(self.lockfile) ? bytes(self.lockfile).size()
                             : 0) <= 921600'
+                        - message: Git sources cannot be combined with inline manifest/lockfile,
+                            disk mode, uploads, or OCI repository overlays
+                          rule: '!has(self.gitSource) || ((!has(self.manifest) ||
+                            bytes(self.manifest).size() == 0) && (!has(self.lockfile)
+                            || bytes(self.lockfile).size() == 0) && (!has(self.mode)
+                            || self.mode != ''disk'') && (!has(self.inputFilesServer)
+                            || !self.inputFilesServer) && (!has(self.ociRepoImages)
+                            || size(self.ociRepoImages) == 0))'
                       architecture:
                         description: Architecture specifies the target architecture
                           (e.g., "amd64", "arm64")
@@ -401,6 +435,11 @@ spec:
                       rule: '!(has(self.export) && has(self.export.container) && size(self.export.container)
                         > 0) || size(self.secretRef) > 0 || (has(self.export) && has(self.export.useServiceAccountAuth)
                         && self.export.useServiceAccountAuth)'
+                    - message: Git sources cannot be combined with workspace or build
+                        cache PVC
+                      rule: '!has(self.aib) || !has(self.aib.gitSource) || ((!has(self.workspace)
+                        || size(self.workspace) == 0) && (!has(self.buildCachePVC)
+                        || size(self.buildCachePVC) == 0))'
                 required:
                 - spec
                 type: object

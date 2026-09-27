@@ -3,6 +3,8 @@ package buildapi
 import (
 	"fmt"
 	"strings"
+
+	automotivev1alpha1 "github.com/centos-automotive-suite/automotive-dev-operator/api/v1alpha1"
 )
 
 // Distro represents the OS distribution to build (e.g., cs9, autosd10-sig).
@@ -151,13 +153,14 @@ func ParseMode(s string) (Mode, error) {
 
 // BuildRequest is the payload to create a build via the REST API
 type BuildRequest struct {
-	ExternalID       string         `json:"externalId,omitempty"`
-	Callback         *BuildCallback `json:"callback,omitempty"`
-	Name             string         `json:"name"`
-	Manifest         string         `json:"manifest,omitempty"`
-	ResolveOnly      bool           `json:"resolveOnly,omitempty"`
-	Lockfile         string         `json:"lockfile,omitempty"`
-	ManifestFileName string         `json:"manifestFileName,omitempty"`
+	GitSource        *automotivev1alpha1.GitSource `json:"gitSource,omitempty"`
+	ExternalID       string                        `json:"externalId,omitempty"`
+	Callback         *BuildCallback                `json:"callback,omitempty"`
+	Name             string                        `json:"name"`
+	Manifest         string                        `json:"manifest,omitempty"`
+	ResolveOnly      bool                          `json:"resolveOnly,omitempty"`
+	Lockfile         string                        `json:"lockfile,omitempty"`
+	ManifestFileName string                        `json:"manifestFileName,omitempty"`
 	// ContainerRef is for disk mode: existing container to convert
 	ContainerRef           string               `json:"containerRef,omitempty"`
 	Distro                 Distro               `json:"distro"`
@@ -313,25 +316,27 @@ type FlashListItem struct {
 
 // BuildResponse is returned by POST and GET build operations
 type BuildResponse struct {
-	ExternalID       string              `json:"externalId,omitempty"`
-	Artifacts        []ArtifactStatus    `json:"artifacts,omitempty"`
-	Flash            *FlashOutcomeStatus `json:"flash,omitempty"`
-	Notification     *NotificationStatus `json:"notification,omitempty"`
-	Name             string              `json:"name"`
-	Phase            string              `json:"phase"`
-	Message          string              `json:"message"`
-	RequestedBy      string              `json:"requestedBy,omitempty"`
-	StartTime        string              `json:"startTime,omitempty"`
-	CompletionTime   string              `json:"completionTime,omitempty"`
-	ContainerImage   string              `json:"containerImage,omitempty"`
-	DiskImage        string              `json:"diskImage,omitempty"`
-	LockfileArtifact string              `json:"lockfileArtifact,omitempty"`
-	RegistryToken    string              `json:"registryToken,omitempty"`
-	TraceID          string              `json:"traceId,omitempty"`
-	Warning          string              `json:"warning,omitempty"`
-	ExpiresAt        string              `json:"expiresAt,omitempty"`
-	Jumpstarter      *JumpstarterInfo    `json:"jumpstarter,omitempty"`
-	Parameters       *BuildParameters    `json:"parameters,omitempty"`
+	GitSource        *automotivev1alpha1.GitSource `json:"gitSource,omitempty"`
+	SourceCommit     string                        `json:"sourceCommit,omitempty"`
+	ExternalID       string                        `json:"externalId,omitempty"`
+	Artifacts        []ArtifactStatus              `json:"artifacts,omitempty"`
+	Flash            *FlashOutcomeStatus           `json:"flash,omitempty"`
+	Notification     *NotificationStatus           `json:"notification,omitempty"`
+	Name             string                        `json:"name"`
+	Phase            string                        `json:"phase"`
+	Message          string                        `json:"message"`
+	RequestedBy      string                        `json:"requestedBy,omitempty"`
+	StartTime        string                        `json:"startTime,omitempty"`
+	CompletionTime   string                        `json:"completionTime,omitempty"`
+	ContainerImage   string                        `json:"containerImage,omitempty"`
+	DiskImage        string                        `json:"diskImage,omitempty"`
+	LockfileArtifact string                        `json:"lockfileArtifact,omitempty"`
+	RegistryToken    string                        `json:"registryToken,omitempty"`
+	TraceID          string                        `json:"traceId,omitempty"`
+	Warning          string                        `json:"warning,omitempty"`
+	ExpiresAt        string                        `json:"expiresAt,omitempty"`
+	Jumpstarter      *JumpstarterInfo              `json:"jumpstarter,omitempty"`
+	Parameters       *BuildParameters              `json:"parameters,omitempty"`
 }
 
 // BuildParameters describes the key input parameters that produced an ImageBuild.

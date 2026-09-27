@@ -361,9 +361,27 @@ components:
       required:
         - phase
       type: object
+    GitSource:
+      type: object
+      required: [url, manifestPath]
+      properties:
+        url:
+          type: string
+          description: HTTPS Git URL without embedded credentials.
+        revision:
+          type: string
+          description: Branch, tag, or commit; defaults to remote HEAD.
+        manifestPath:
+          type: string
+          description: Repository-relative manifest path. An adjacent aib.lock is used when present.
+        credentialsSecretRef:
+          type: string
+          description: Namespace-local basic-auth Secret annotated with the requesting user's identity.
     BuildRequest:
       description: 'Operation request limit: 4 MiB before JSON binding. Correlation and callbacks apply to existing build inputs.'
       properties:
+        gitSource:
+          $ref: '#/components/schemas/GitSource'
         aibExtraArgs:
           items:
             type: string
@@ -512,6 +530,11 @@ components:
     BuildResponse:
       description: Newly accepted builds report Pending. Outcomes are populated as work completes.
       properties:
+        gitSource:
+          $ref: '#/components/schemas/GitSource'
+        sourceCommit:
+          type: string
+          description: Resolved Git commit used for this build.
         artifacts:
           items:
             $ref: '#/components/schemas/ArtifactStatus'
@@ -597,6 +620,8 @@ components:
     BuildTemplateResponse:
       allOf:
         - properties:
+            gitSource:
+              $ref: '#/components/schemas/GitSource'
             aibExtraArgs:
               items:
                 type: string

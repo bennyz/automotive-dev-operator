@@ -177,7 +177,7 @@ setup_container_config
 setup_var_tmp
 setup_cluster_auth
 
-for result in IMAGE_URL IMAGE_DIGEST ARTIFACT_INTEGRITY_DIGEST artifact-filename builder-image aib-version automotive-image-builder aib-command build-timing; do
+for result in IMAGE_URL IMAGE_DIGEST CHAINS-GIT_URL CHAINS-GIT_COMMIT ARTIFACT_INTEGRITY_DIGEST artifact-filename builder-image aib-version automotive-image-builder aib-command build-timing; do
   write_result "$result" ""
 done
 
@@ -308,6 +308,18 @@ if ! load_args_from_file "$MANIFEST_CONFIG_PATH/aib-extra-args.txt" "AIB extra a
   echo "No AIB extra args file found"
 fi
 
+export SOURCE_METADATA_PATH="$WORKSPACE_PATH/.caib-source/source.json"
+if [ -f "$SOURCE_METADATA_PATH" ]; then
+  source_url=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["url"])' "$SOURCE_METADATA_PATH")
+  source_commit=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["commit"])' "$SOURCE_METADATA_PATH")
+  write_result CHAINS-GIT_URL "$source_url"
+  write_result CHAINS-GIT_COMMIT "$source_commit"
+fi
+LOCKFILE_PATH="$MANIFEST_CONFIG_PATH/aib.lock"
+if [ -f "$MANIFEST_CONFIG_PATH/git-manifest-path" ]; then
+  LOCKFILE_PATH="$(dirname "$MANIFEST_FILE")/aib.lock"
+fi
+
 resolve_dependency_lock() {
   local resolver=aib-dev
   [ "$BUILD_MODE" != "bootc" ] || resolver=aib
@@ -328,7 +340,9 @@ resolve_dependency_lock() {
 AIB_LOCKFILE="$WORKSPACE_PATH/aib.lock"
 rm -f "$AIB_LOCKFILE"
 if [ "$RESOLVE_ONLY" = "true" ]; then
-  [ ! -f "$MANIFEST_CONFIG_PATH/aib.lock" ] || fail "resolve-only cannot consume a lockfile"
+  if [ ! -f "$MANIFEST_CONFIG_PATH/git-manifest-path" ]; then
+    [ ! -f "$LOCKFILE_PATH" ] || fail "resolve-only cannot consume a lockfile"
+  fi
   resolve_dependency_lock
   write_result artifact-filename "aib.lock"
   write_result ARTIFACT_INTEGRITY_DIGEST "$(compute_artifact_digest "" "$AIB_LOCKFILE")"
@@ -338,8 +352,8 @@ if [ "$RESOLVE_ONLY" = "true" ]; then
   exit 0
 fi
 
-if [ -f "$MANIFEST_CONFIG_PATH/aib.lock" ]; then
-  cp "$MANIFEST_CONFIG_PATH/aib.lock" "$AIB_LOCKFILE"
+if [ -f "$LOCKFILE_PATH" ]; then
+  cp "$LOCKFILE_PATH" "$AIB_LOCKFILE"
 fi
 restore_sources_if_requested
 if [ "$SECURE_BUILD" = "true" ] || [ "$REPRODUCIBLE" = "true" ]; then
@@ -641,6 +655,7 @@ annotate_oci_image() {
     "$OCI_ANN_BUILDER_IMAGE" "$OCI_ANN_AIB_VERSION" "$OCI_ANN_AUTOMOTIVE_IMAGE_BUILDER" "$OCI_ANN_AIB_COMMAND" <<'PYEOF'
 import hashlib
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -676,11 +691,18 @@ if aib_image:
     labels[key_aib_image] = aib_image
 if aib_command:
     labels[key_aib_command] = aib_command
+source_annotations = {}
+source_path = Path(os.environ.get("SOURCE_METADATA_PATH", "/nonexistent"))
+if source_path.is_file():
+    source = json.loads(source_path.read_text())
+    source_annotations = {os.environ["OCI_ANN_SOURCE"]: source["url"], os.environ["OCI_ANN_REVISION"]: source["commit"]}
+labels.update(source_annotations)
 manifest["config"]["digest"], manifest["config"]["size"] = update_blob(
     oci_dir, manifest["config"]["digest"], config
 )
 
 annotations = manifest.setdefault("annotations", {})
+annotations.update(source_annotations)
 annotations[key_builder] = builder_image
 if aib_version:
     annotations[key_aib_version] = aib_version
@@ -1006,11 +1028,14 @@ package_reproducible_inputs() {
   local sources_dir="$BUILD_DIR/osbuild_store/sources"
   local sources_archive="$WORKSPACE_PATH/build-sources.tar.gz"
   if [ -d "$sources_dir" ]; then
-    local -a archive_entries=(sources)
+    local -a source_inputs=(-C "$BUILD_DIR/osbuild_store" sources)
     if [ -f "$BUILD_DIR/osbuild_store/hermeto-rpm-bom.json" ]; then
-      archive_entries+=(hermeto-rpm-bom.json)
+      source_inputs+=(-C "$BUILD_DIR/osbuild_store" hermeto-rpm-bom.json)
     fi
-    tar -czf "$sources_archive" -C "$BUILD_DIR/osbuild_store" "${archive_entries[@]}"
+    if [ -f "$WORKSPACE_PATH/.caib-source/source.json" ]; then
+      source_inputs+=(-C "$WORKSPACE_PATH" .caib-source/source.json)
+    fi
+    tar -czf "$sources_archive" "${source_inputs[@]}"
     echo "Sources archive: $(du -sh "$sources_archive" | cut -f1)"
   else
     echo "WARNING: no osbuild sources found at $sources_dir"

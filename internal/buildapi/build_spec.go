@@ -6,6 +6,7 @@ import (
 
 func buildAIBSpec(req *BuildRequest, manifest, manifestFileName string, inputFilesServer bool) *automotivev1alpha1.AIBSpec {
 	return &automotivev1alpha1.AIBSpec{
+		GitSource:        req.GitSource,
 		Distro:           string(req.Distro),
 		Target:           string(req.Target),
 		Mode:             string(req.Mode),

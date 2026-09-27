@@ -122,6 +122,9 @@ caib image build <manifest.aib.yml> [flags]
 | `-d`, `--distro` | `autosd` | Distribution to build |
 | `-t`, `--target` | `qemu` | Target platform |
 | `-a`, `--arch` | (current system) | Architecture (`amd64`, `arm64`) |
+| `--git-url` | | HTTPS repository containing the manifest |
+| `--git-ref` | remote HEAD | Branch, tag, or full commit ID (requires `--git-url`) |
+| `--git-secret` | | Namespace-local basic-auth Secret for a private repository (requires `--git-url`) |
 | `--disk` | `false` | Also build a disk image from the container |
 | `--format` | (inferred from `-o`) | Disk image format (`qcow2`, `raw`, `simg`) |
 | `--compress` | `gzip` | Compression algorithm (`gzip`, `xz`) |
@@ -251,6 +254,8 @@ Builds a disk image (ostree or package-based) for development workflows. Creates
 ```bash
 caib image build-dev <manifest.aib.yml> [flags]
 ```
+
+`build-dev` accepts the same `--git-url`, `--git-ref`, and `--git-secret` options as `build`.
 
 **Required flags:**
 | Flag | Description |
@@ -570,6 +575,44 @@ caib image cancel <build-name> [flags]
 | Update mechanism | `bootc switch/upgrade` | Requires re-imaging |
 | Use case | OTA-updatable systems | Development/standalone disk images |
 | Mode | Always `bootc` | `image` or `package` |
+
+## Building from Git
+
+Pass a repository-relative manifest path to `build` or `build-dev` with `--git-url`. The source TaskRun fetches one commit, checks the manifest and its referenced files, and shares that checkout with the build. If `aib.lock` is committed beside the manifest, the build uses it; there is no local lockfile override. Use `--git-ref` to choose a branch, tag, or full commit ID. `caib image show` reports the resolved commit, and build templates use that commit for a repeatable run.
+
+Use `refs/tags/<name>` or `refs/heads/<name>` for a hex-only tag or branch name; an unqualified hex value shorter than a full commit ID is rejected as an abbreviated SHA. With Git sources, explicit `--extra-args` replace the target-default extra args. Omit the flag to use those defaults. The source TaskRun timeout follows `osBuilds.buildTimeoutMinutes` when configured.
+
+On clusters with topology-bound storage, pass `--arch` when the target architecture is known so the source TaskRun and build pod are scheduled on compatible nodes.
+
+```bash
+caib image build images/demo.aib.yml \
+  --git-url https://git.example.com/team/os.git \
+  --git-ref main \
+  --push quay.io/team/os:latest
+
+caib image build-dev images/dev.aib.yml \
+  --git-url https://git.example.com/team/os.git \
+  --git-ref main --mode package -o dev.raw
+```
+
+For a private repository, a cluster administrator must create a `kubernetes.io/basic-auth` Secret in the build namespace. The Secret must have `tekton.dev/git-0` set to the repository's HTTPS origin and `automotive.sdv.cloud.redhat.com/requested-by` set to the requesting identity as reported by the API. The API checks both annotations; the controller enforces the host binding for ImageBuild resources created directly. The CLI does not create this Secret.
+
+Do not link this Secret to the build ServiceAccount: Tekton may then inject it into unrelated builds. Restrict direct ImageBuild creation with RBAC, because a caller who can create ImageBuild resources can reference another user's Secret for a repository on the same allowed host.
+
+```bash
+oc -n automotive-dev-operator create secret generic team-git-auth \
+  --type=kubernetes.io/basic-auth \
+  --from-literal=username=YOUR_USERNAME \
+  --from-literal=password=YOUR_TOKEN
+oc -n automotive-dev-operator annotate secret team-git-auth \
+  tekton.dev/git-0=https://git.example.com \
+  automotive.sdv.cloud.redhat.com/requested-by=YOUR_REQUESTER_ID
+caib image build images/demo.aib.yml \
+  --git-url https://git.example.com/team/os.git \
+  --git-secret team-git-auth --push quay.io/team/os:latest
+```
+
+Git builds with `--secure` require a newly published task bundle that contains `prepare-git-source`. Bundles published before Git source support cannot resolve that task.
 
 ## Secure & Reproducible Builds
 

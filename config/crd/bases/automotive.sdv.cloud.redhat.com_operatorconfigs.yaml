@@ -593,6 +593,10 @@ spec:
                     description: AutomotiveImageBuilder is the container image for
                       automotive-image-builder
                     type: string
+                  gitClone:
+                    description: GitClone is the image used by the Git source checkout
+                      step.
+                    type: string
                   hermeto:
                     description: Hermeto is the RPM fetcher image used when osBuilds.hermetoPrefetch
                       is enabled.

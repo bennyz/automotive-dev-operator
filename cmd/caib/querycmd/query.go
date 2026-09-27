@@ -239,6 +239,7 @@ func printBuildDetails(st *buildapitypes.BuildResponse) error {
 		{"Message", st.Message},
 		{"External ID", valueOrDash(st.ExternalID)},
 		{"Requested By", valueOrDash(st.RequestedBy)},
+		{"Source Commit", valueOrDash(st.SourceCommit)},
 		{"Start Time", valueOrDash(st.StartTime)},
 		{"Completion Time", valueOrDash(st.CompletionTime)},
 		{"Container Image", valueOrDash(st.ContainerImage)},

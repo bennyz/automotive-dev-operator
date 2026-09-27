@@ -33,6 +33,9 @@ const (
 	// DefaultYQHelperImage is the default yq helper image used in Tekton task steps
 	DefaultYQHelperImage = "quay.io/konflux-ci/yq:latest"
 
+	// DefaultGitCloneImage is a multi-architecture Git-capable Tekton runner.
+	DefaultGitCloneImage = "quay.io/konflux-ci/task-runner@sha256:ba5789d2bc04146431e492083c67b86de26d5b17891dc27f67db850a397b66d3"
+
 	// DefaultHermetoImage pins the optional RPM fetcher to a multi-architecture image.
 	DefaultHermetoImage = "ghcr.io/hermetoproject/hermeto@sha256:8dc7d791fb7d874d208e145934e812e51736eea495fd2f11ad3a3acd5e831eff"
 
@@ -85,6 +88,9 @@ const (
 
 // ImagesConfig defines container image references used by the operator
 type ImagesConfig struct {
+	// GitClone is the image used by the Git source checkout step.
+	// +optional
+	GitClone string `json:"gitClone,omitempty"`
 	// AutomotiveImageBuilder is the container image for automotive-image-builder
 	// +optional
 	AutomotiveImageBuilder string `json:"automotiveImageBuilder,omitempty"`
@@ -105,6 +111,13 @@ type ImagesConfig struct {
 	// Only used when the OCIVolumes feature gate is enabled.
 	// +optional
 	Oras string `json:"oras,omitempty"`
+}
+
+func (c *ImagesConfig) GetGitCloneImage() string {
+	if c != nil && c.GitClone != "" {
+		return c.GitClone
+	}
+	return DefaultGitCloneImage
 }
 
 // GetAutomotiveImageBuilderImage returns the AIB image, falling back to the default
