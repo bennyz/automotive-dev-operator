@@ -50,6 +50,7 @@ func TestReferrerFileMap(t *testing.T) {
 	expected := map[string]string{
 		"application/vnd.automotive.manifest.v1+yaml":    "manifest.aib.yml",
 		"application/vnd.automotive.lockfile.v1+json":    "aib.lock",
+		"application/vnd.cyclonedx+json":                 "hermeto-rpm-bom.json",
 		"application/vnd.automotive.sources.v1+tar+gzip": "build-sources.tar.gz",
 		"application/vnd.osbuild.manifest.v1+json":       "image.json",
 	}
@@ -132,6 +133,7 @@ func TestShellVarsContainsExpectedAssignments(t *testing.T) {
 		`OCI_REFERRER_FILE_AIB_MANIFEST="manifest.aib.yml"`,
 		`OCI_REFERRER_TYPE_AIB_LOCKFILE="application/vnd.automotive.lockfile.v1+json"`,
 		`OCI_REFERRER_FILE_AIB_LOCKFILE="aib.lock"`,
+		`OCI_REFERRER_TYPE_HERMETO_RPM_SBOM="application/vnd.cyclonedx+json"`,
 		`OCI_REFERRER_TYPE_BUILD_SOURCES="application/vnd.automotive.sources.v1+tar+gzip"`,
 		`OCI_REFERRER_TYPE_OSBUILD_MANIFEST="application/vnd.osbuild.manifest.v1+json"`,
 	}

@@ -1607,6 +1607,7 @@ func listBuilds(c *gin.Context) {
 		if b.Status.TerminalResult != nil {
 			containerImage, diskImage = storedArtifactURLs(&b)
 		}
+		containerImage, diskImage, lockfileArtifact := classifyBuildArtifactURLs(&b, containerImage, diskImage)
 		if b.Spec.GetUseServiceAccountAuth() && externalRoute != "" {
 			if containerImage != "" {
 				containerImage = translateToExternalURL(containerImage, externalRoute)
@@ -1614,20 +1615,24 @@ func listBuilds(c *gin.Context) {
 			if diskImage != "" {
 				diskImage = translateToExternalURL(diskImage, externalRoute)
 			}
+			if lockfileArtifact != "" {
+				lockfileArtifact = translateToExternalURL(lockfileArtifact, externalRoute)
+			}
 		}
 
 		resp = append(resp, BuildListItem{
 			ExternalID: b.Spec.ExternalID, Artifacts: storedArtifacts(&b), Flash: storedFlash(&b),
-			Notification:   projectedNotification(notificationStatuses, b.UID, b.Spec.CallbackSecretRef != ""),
-			Name:           b.Name,
-			Phase:          b.Status.Phase,
-			Message:        b.Status.Message,
-			RequestedBy:    b.Annotations[labels.RequestedBy],
-			CreatedAt:      b.CreationTimestamp.Format(time.RFC3339),
-			StartTime:      startStr,
-			CompletionTime: compStr,
-			ContainerImage: containerImage,
-			DiskImage:      diskImage,
+			Notification:     projectedNotification(notificationStatuses, b.UID, b.Spec.CallbackSecretRef != ""),
+			Name:             b.Name,
+			Phase:            b.Status.Phase,
+			Message:          b.Status.Message,
+			RequestedBy:      b.Annotations[labels.RequestedBy],
+			CreatedAt:        b.CreationTimestamp.Format(time.RFC3339),
+			StartTime:        startStr,
+			CompletionTime:   compStr,
+			ContainerImage:   containerImage,
+			DiskImage:        diskImage,
+			LockfileArtifact: lockfileArtifact,
 		})
 	}
 	writeJSON(c, http.StatusOK, resp)
@@ -1661,6 +1666,7 @@ func (a *APIServer) getBuild(c *gin.Context, name string) {
 	if build.Status.TerminalResult != nil {
 		containerImage, diskImage = storedArtifactURLs(build)
 	}
+	containerImage, diskImage, lockfileArtifact := classifyBuildArtifactURLs(build, containerImage, diskImage)
 	var warning string
 
 	if build.Spec.GetUseServiceAccountAuth() {
@@ -1674,6 +1680,9 @@ func (a *APIServer) getBuild(c *gin.Context, name string) {
 			}
 			if diskImage != "" {
 				diskImage = translateToExternalURL(diskImage, externalRoute)
+			}
+			if lockfileArtifact != "" {
+				lockfileArtifact = translateToExternalURL(lockfileArtifact, externalRoute)
 			}
 		}
 	}
@@ -1757,10 +1766,11 @@ func (a *APIServer) getBuild(c *gin.Context, name string) {
 			}
 			return ""
 		}(),
-		ContainerImage: containerImage,
-		DiskImage:      diskImage,
-		RegistryToken:  registryToken,
-		Warning:        warning,
+		ContainerImage:   containerImage,
+		DiskImage:        diskImage,
+		LockfileArtifact: lockfileArtifact,
+		RegistryToken:    registryToken,
+		Warning:          warning,
 		ExpiresAt: func() string {
 			if build.Status.ExpiresAt != nil {
 				return build.Status.ExpiresAt.Format(time.RFC3339)
@@ -1814,6 +1824,7 @@ func getBuildTemplate(c *gin.Context, name string) {
 		BuildRequest: BuildRequest{
 			Name:                   build.Name,
 			Manifest:               manifest,
+			ResolveOnly:            build.Spec.GetResolveOnly(),
 			Lockfile:               build.Spec.GetLockfile(),
 			ManifestFileName:       manifestFileName,
 			Distro:                 Distro(build.Spec.GetDistro()),

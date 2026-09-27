@@ -207,7 +207,7 @@ func (h *Handler) validateBootcBuildFlags() error {
 		return err
 	}
 
-	if err := h.validateReproducibleFlags(); err != nil {
+	if err := h.validateSecurityFlags(); err != nil {
 		return err
 	}
 
@@ -221,14 +221,14 @@ func (h *Handler) validateBootcBuildFlags() error {
 	return nil
 }
 
-func (h *Handler) validateReproducibleFlags() error {
+func (h *Handler) validateSecurityFlags() error {
 	if err := common.ValidateReproducibleRequiresSecure(*h.opts.Reproducible, *h.opts.SecureBuild); err != nil {
 		return err
 	}
-	if *h.opts.Reproducible && *h.opts.UseInternalRegistry {
+	if *h.opts.SecureBuild && *h.opts.UseInternalRegistry {
 		return common.NewActionableError(
-			fmt.Errorf("--reproducible cannot be used with --internal-registry (internal registry does not support OCI referrers)"),
-			"caib image build -m <manifest> --reproducible --push-disk <registry>",
+			fmt.Errorf("--secure cannot be used with --internal-registry (the internal registry does not support required OCI referrers)"),
+			"push to a registry that supports OCI referrers with --push or --push-disk",
 		)
 	}
 	return nil
@@ -1137,7 +1137,7 @@ func (h *Handler) validateBuildDevOptions(manifestPath string) error {
 	if err := h.validateDevExportFlags(manifestPath); err != nil {
 		return err
 	}
-	return h.validateReproducibleFlags()
+	return h.validateSecurityFlags()
 }
 
 // RunBuildDev handles `caib image build-dev` (traditional ostree/package builds).

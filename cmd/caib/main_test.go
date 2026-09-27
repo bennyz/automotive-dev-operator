@@ -417,3 +417,19 @@ func TestLockfileFlag(t *testing.T) {
 		})
 	}
 }
+
+func TestResolveCommandFlags(t *testing.T) {
+	root := newRootCmd()
+	cmd, _, err := root.Find([]string{"image", "resolve"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"output", "distro", "target", "arch", "aib-image", "define", "define-file", "extra-args", "server", "token", "timeout", "ttl", "name"} {
+		if cmd.Flags().Lookup(name) == nil {
+			t.Errorf("image resolve missing --%s", name)
+		}
+	}
+	if got := cmd.Flags().Lookup("name").Shorthand; got != "n" {
+		t.Errorf("image resolve --name shorthand = %q, want n", got)
+	}
+}

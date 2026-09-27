@@ -69,6 +69,12 @@
       "filename": "aib.lock"
     },
     {
+      "artifactType": "application/vnd.cyclonedx+json",
+      "label": "Hermeto RPM SBOM",
+      "var": "HERMETO_RPM_SBOM",
+      "filename": "hermeto-rpm-bom.json"
+    },
+    {
       "artifactType": "application/vnd.automotive.sources.v1+tar+gzip",
       "label": "Build Sources",
       "var": "BUILD_SOURCES",

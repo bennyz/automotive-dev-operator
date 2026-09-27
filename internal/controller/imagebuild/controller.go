@@ -415,6 +415,31 @@ func extractImageStreamName(imageBuild *automotivev1alpha1.ImageBuild) string {
 	return name
 }
 
+func validateSecureExport(imageBuild *automotivev1alpha1.ImageBuild) error {
+	if !imageBuild.Spec.SecureBuild {
+		return nil
+	}
+	internalRegistry := tasks.DefaultInternalRegistryURL + "/"
+	if imageBuild.Spec.GetUseServiceAccountAuth() ||
+		strings.HasPrefix(imageBuild.Spec.GetContainerPush(), internalRegistry) ||
+		strings.HasPrefix(imageBuild.Spec.GetExportOCI(), internalRegistry) {
+		return fmt.Errorf("secure builds cannot use the internal registry because required OCI referrers are unsupported")
+	}
+	return nil
+}
+
+func validateSecureRegistryRoute(imageBuild *automotivev1alpha1.ImageBuild, route string) error {
+	if !imageBuild.Spec.SecureBuild || route == "" {
+		return nil
+	}
+	routePrefix := strings.TrimSuffix(route, "/") + "/"
+	if strings.HasPrefix(imageBuild.Spec.GetContainerPush(), routePrefix) ||
+		strings.HasPrefix(imageBuild.Spec.GetExportOCI(), routePrefix) {
+		return fmt.Errorf("secure builds cannot use cluster registry route %q because required OCI referrers are unsupported", route)
+	}
+	return nil
+}
+
 func (r *ImageBuildReconciler) handleInitialState(
 	ctx context.Context,
 	imageBuild *automotivev1alpha1.ImageBuild,
@@ -423,6 +448,12 @@ func (r *ImageBuildReconciler) handleInitialState(
 	defer controllerutils.EndSpanWithError(span, &err)
 
 	log := r.buildLogger(imageBuild)
+	if validationErr := validateSecureExport(imageBuild); validationErr != nil {
+		if err := r.updateStatus(ctx, imageBuild, phaseFailed, validationErr.Error()); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
+	}
 
 	if err := r.ensureImageStreamOwnerRef(ctx, imageBuild); err != nil {
 		return ctrl.Result{}, err
@@ -1099,6 +1130,8 @@ func (r *ImageBuildReconciler) createBuildTaskRun(
 			RuntimeClassName:            operatorConfig.Spec.OSBuilds.RuntimeClassName,
 			AutomotiveImageBuilderImage: operatorConfig.Spec.GetImages().GetAutomotiveImageBuilderImage(),
 			YQHelperImage:               operatorConfig.Spec.GetImages().GetYQHelperImage(),
+			HermetoImage:                operatorConfig.Spec.GetImages().GetHermetoImage(),
+			HermetoPrefetch:             operatorConfig.Spec.OSBuilds.HermetoPrefetch,
 			BuildTimeoutMinutes:         operatorConfig.Spec.OSBuilds.GetBuildTimeoutMinutes(),
 			FlashTimeoutMinutes:         operatorConfig.Spec.OSBuilds.GetFlashTimeoutMinutes(),
 			DefaultLeaseDuration:        operatorConfig.Spec.Jumpstarter.GetDefaultLeaseDuration(),
@@ -1205,6 +1238,24 @@ func (r *ImageBuildReconciler) createBuildTaskRun(
 			Value: tektonv1.ParamValue{
 				Type:      tektonv1.ParamTypeString,
 				StringVal: imageBuild.Spec.GetAIBImage(),
+			},
+		},
+		{
+			Name:  "resolve-only",
+			Value: tektonv1.ParamValue{Type: tektonv1.ParamTypeString, StringVal: fmt.Sprintf("%t", imageBuild.Spec.GetResolveOnly())},
+		},
+		{
+			Name: "hermeto-prefetch",
+			Value: tektonv1.ParamValue{
+				Type:      tektonv1.ParamTypeString,
+				StringVal: fmt.Sprintf("%t", buildConfig != nil && buildConfig.HermetoPrefetch),
+			},
+		},
+		{
+			Name: "hermeto-image",
+			Value: tektonv1.ParamValue{
+				Type:      tektonv1.ParamTypeString,
+				StringVal: operatorConfig.Spec.GetImages().GetHermetoImage(),
 			},
 		},
 		{
@@ -1374,6 +1425,9 @@ func (r *ImageBuildReconciler) createBuildTaskRun(
 			clusterRegistryRoute = route.Spec.Host
 			log.Info("Auto-detected cluster registry route", "route", clusterRegistryRoute)
 		}
+	}
+	if validationErr := validateSecureRegistryRoute(imageBuild, clusterRegistryRoute); validationErr != nil {
+		return fmt.Errorf("%v: %w", validationErr, errTerminalConfig)
 	}
 	if clusterRegistryRoute != "" {
 		params = append(params, tektonv1.Param{
@@ -2843,9 +2897,11 @@ func (r *ImageBuildReconciler) resolveBuildConfig(ctx context.Context) *tasks.Bu
 	bc := &tasks.BuildConfig{
 		AutomotiveImageBuilderImage: operatorConfig.Spec.GetImages().GetAutomotiveImageBuilderImage(),
 		YQHelperImage:               operatorConfig.Spec.GetImages().GetYQHelperImage(),
+		HermetoImage:                operatorConfig.Spec.GetImages().GetHermetoImage(),
 		DefaultLeaseDuration:        operatorConfig.Spec.Jumpstarter.GetDefaultLeaseDuration(),
 	}
 	if operatorConfig.Spec.OSBuilds != nil {
+		bc.HermetoPrefetch = operatorConfig.Spec.OSBuilds.HermetoPrefetch
 		bc.UseMemoryVolumes = operatorConfig.Spec.OSBuilds.UseMemoryVolumes
 		bc.MemoryVolumeSize = operatorConfig.Spec.OSBuilds.MemoryVolumeSize
 		bc.PVCSize = operatorConfig.Spec.OSBuilds.PVCSize

@@ -155,6 +155,7 @@ type BuildRequest struct {
 	Callback         *BuildCallback `json:"callback,omitempty"`
 	Name             string         `json:"name"`
 	Manifest         string         `json:"manifest,omitempty"`
+	ResolveOnly      bool           `json:"resolveOnly,omitempty"`
 	Lockfile         string         `json:"lockfile,omitempty"`
 	ManifestFileName string         `json:"manifestFileName,omitempty"`
 	// ContainerRef is for disk mode: existing container to convert
@@ -184,12 +185,14 @@ type BuildRequest struct {
 	RebuildBuilder bool   `json:"rebuildBuilder,omitempty"` // Force rebuild of bootc builder image
 	HasLocalFiles  bool   `json:"hasLocalFiles,omitempty"`  // Client has local files to upload (source_path/source_glob)
 
-	// Internal registry push configuration
+	// Internal registry push configuration (not supported by secure builds because
+	// the registry cannot publish their required OCI referrers).
 	UseInternalRegistry       bool   `json:"useInternalRegistry,omitempty"`       // Push to OpenShift internal registry
 	InternalRegistryImageName string `json:"internalRegistryImageName,omitempty"` // Override image name (default: build name)
 	InternalRegistryTag       string `json:"internalRegistryTag,omitempty"`       // Tag for internal registry image (default: "bootc" for bootc mode, "disk" for disk/traditional mode)
 
-	// Secure build: resolve tasks from signed Tekton Bundle
+	// Secure build: pin Tekton tasks and locked inputs, then assemble without network.
+	// Task bundle signature verification depends on OperatorConfig.taskBundleVerify.
 	SecureBuild bool `json:"secureBuild,omitempty"`
 
 	// TaskBundleRef overrides OperatorConfig's taskBundleRef (for reproducible rebuilds)
@@ -310,24 +313,25 @@ type FlashListItem struct {
 
 // BuildResponse is returned by POST and GET build operations
 type BuildResponse struct {
-	ExternalID     string              `json:"externalId,omitempty"`
-	Artifacts      []ArtifactStatus    `json:"artifacts,omitempty"`
-	Flash          *FlashOutcomeStatus `json:"flash,omitempty"`
-	Notification   *NotificationStatus `json:"notification,omitempty"`
-	Name           string              `json:"name"`
-	Phase          string              `json:"phase"`
-	Message        string              `json:"message"`
-	RequestedBy    string              `json:"requestedBy,omitempty"`
-	StartTime      string              `json:"startTime,omitempty"`
-	CompletionTime string              `json:"completionTime,omitempty"`
-	ContainerImage string              `json:"containerImage,omitempty"`
-	DiskImage      string              `json:"diskImage,omitempty"`
-	RegistryToken  string              `json:"registryToken,omitempty"`
-	TraceID        string              `json:"traceId,omitempty"`
-	Warning        string              `json:"warning,omitempty"`
-	ExpiresAt      string              `json:"expiresAt,omitempty"`
-	Jumpstarter    *JumpstarterInfo    `json:"jumpstarter,omitempty"`
-	Parameters     *BuildParameters    `json:"parameters,omitempty"`
+	ExternalID       string              `json:"externalId,omitempty"`
+	Artifacts        []ArtifactStatus    `json:"artifacts,omitempty"`
+	Flash            *FlashOutcomeStatus `json:"flash,omitempty"`
+	Notification     *NotificationStatus `json:"notification,omitempty"`
+	Name             string              `json:"name"`
+	Phase            string              `json:"phase"`
+	Message          string              `json:"message"`
+	RequestedBy      string              `json:"requestedBy,omitempty"`
+	StartTime        string              `json:"startTime,omitempty"`
+	CompletionTime   string              `json:"completionTime,omitempty"`
+	ContainerImage   string              `json:"containerImage,omitempty"`
+	DiskImage        string              `json:"diskImage,omitempty"`
+	LockfileArtifact string              `json:"lockfileArtifact,omitempty"`
+	RegistryToken    string              `json:"registryToken,omitempty"`
+	TraceID          string              `json:"traceId,omitempty"`
+	Warning          string              `json:"warning,omitempty"`
+	ExpiresAt        string              `json:"expiresAt,omitempty"`
+	Jumpstarter      *JumpstarterInfo    `json:"jumpstarter,omitempty"`
+	Parameters       *BuildParameters    `json:"parameters,omitempty"`
 }
 
 // BuildParameters describes the key input parameters that produced an ImageBuild.
@@ -360,19 +364,20 @@ type TokenResponse struct {
 
 // BuildListItem represents a build in the list API
 type BuildListItem struct {
-	ExternalID     string              `json:"externalId,omitempty"`
-	Artifacts      []ArtifactStatus    `json:"artifacts,omitempty"`
-	Flash          *FlashOutcomeStatus `json:"flash,omitempty"`
-	Notification   *NotificationStatus `json:"notification,omitempty"`
-	Name           string              `json:"name"`
-	Phase          string              `json:"phase"`
-	Message        string              `json:"message"`
-	RequestedBy    string              `json:"requestedBy,omitempty"`
-	CreatedAt      string              `json:"createdAt"`
-	StartTime      string              `json:"startTime,omitempty"`
-	CompletionTime string              `json:"completionTime,omitempty"`
-	ContainerImage string              `json:"containerImage,omitempty"`
-	DiskImage      string              `json:"diskImage,omitempty"`
+	ExternalID       string              `json:"externalId,omitempty"`
+	Artifacts        []ArtifactStatus    `json:"artifacts,omitempty"`
+	Flash            *FlashOutcomeStatus `json:"flash,omitempty"`
+	Notification     *NotificationStatus `json:"notification,omitempty"`
+	Name             string              `json:"name"`
+	Phase            string              `json:"phase"`
+	Message          string              `json:"message"`
+	RequestedBy      string              `json:"requestedBy,omitempty"`
+	CreatedAt        string              `json:"createdAt"`
+	StartTime        string              `json:"startTime,omitempty"`
+	CompletionTime   string              `json:"completionTime,omitempty"`
+	ContainerImage   string              `json:"containerImage,omitempty"`
+	DiskImage        string              `json:"diskImage,omitempty"`
+	LockfileArtifact string              `json:"lockfileArtifact,omitempty"`
 }
 
 // JumpstarterTarget contains flash-specific config for a target (from CRD)

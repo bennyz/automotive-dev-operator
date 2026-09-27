@@ -13,6 +13,7 @@ BUILD_START_TIME=$(date +%s)
 : "${REBUILD_BUILDER:=false}"
 : "${USE_PERSISTENT_CACHE:=false}"
 : "${REPRODUCIBLE:=false}"
+: "${SECURE_BUILD:=false}"
 : "${INSECURE_REGISTRY:=false}"
 : "${BUILDER_IMAGE:=}"
 : "${CLUSTER_REGISTRY_ROUTE:=}"
@@ -20,6 +21,9 @@ BUILD_START_TIME=$(date +%s)
 : "${CONTAINER_REF:=}"
 : "${RESTORE_SOURCES_REF:=}"
 : "${EXPORT_FORMAT:=}"
+: "${HERMETO_PREFETCH:=false}"
+: "${RESOLVE_ONLY:=false}"
+: "${HERMETO_IMAGE:=}"
 
 BUILD_DIR=""
 LOCAL_BUILDER_IMAGE=""
@@ -32,6 +36,8 @@ AIB_COMMAND=""
 AIB_VERSION=""
 AIB_IMAGE_PINNED=""
 FINAL_NAME=""
+AIB_BUILD_NETWORK_DISABLED=false
+AIB_SOURCE_PREFETCH_REQUIRED=false
 
 cleanup() {
   local status=$?
@@ -69,6 +75,7 @@ validate_config() {
   [ -n "$TARGET" ] || fail "target is required"
   [ -n "$TARGET_ARCH" ] || fail "target architecture is required"
   [ -n "$AIB_IMAGE_REF" ] || fail "automotive-image-builder is required"
+  [ -n "$HERMETO_IMAGE" ] || fail "hermeto-image is required"
 
   case "$BUILD_MODE" in
     bootc|image|package|disk) ;;
@@ -83,6 +90,16 @@ validate_config() {
   validate_boolean "rebuild-builder" "$REBUILD_BUILDER"
   validate_boolean "use-persistent-cache" "$USE_PERSISTENT_CACHE"
   validate_boolean "reproducible" "$REPRODUCIBLE"
+  validate_boolean "secure-build" "$SECURE_BUILD"
+  if [ "$SECURE_BUILD" = "true" ] || [ "$REPRODUCIBLE" = "true" ]; then
+    [ "$BUILD_MODE" != "disk" ] || fail "secure/reproducible dependency locking is not supported for disk-only builds"
+  fi
+  validate_boolean "resolve-only" "$RESOLVE_ONLY"
+  if [ "$RESOLVE_ONLY" = "true" ]; then
+    [ "$BUILD_MODE" = "package" ] || fail "resolve-only requires package mode"
+    [ "$SECURE_BUILD" = "false" ] && [ "$REPRODUCIBLE" = "false" ] && [ -z "$RESTORE_SOURCES_REF" ] || fail "resolve-only cannot consume restored or reproducible inputs"
+  fi
+  validate_boolean "hermeto-prefetch" "$HERMETO_PREFETCH"
   validate_boolean "insecure-registry" "$INSECURE_REGISTRY"
 
   validate_container_ref "$AIB_IMAGE_REF"
@@ -201,6 +218,10 @@ prepare_build_directory() {
   fi
 }
 
+select_single_referrer_digest() {
+  python3 -c 'import json,sys; data=json.load(sys.stdin); refs=data.get("referrers", data.get("manifests", [])); len(refs) == 1 or sys.exit(f"restore requires exactly one {sys.argv[1]} referrer, found {len(refs)}"); print(refs[0]["digest"])' "$1"
+}
+
 restore_sources_if_requested() {
   [ -n "$RESTORE_SOURCES_REF" ] || return 0
 
@@ -212,15 +233,42 @@ restore_sources_if_requested() {
     auth_flags=(--registry-config "$REGISTRY_AUTH_FILE")
   fi
 
+  local restore_subject="$RESTORE_SOURCES_REF"
+  if [ "$SECURE_BUILD" = "true" ] || [ "$REPRODUCIBLE" = "true" ]; then
+    local subject_digest
+    subject_digest=$(oras resolve "${auth_flags[@]}" "$RESTORE_SOURCES_REF") \
+      || fail "failed to pin restore artifact"
+    [[ "$subject_digest" =~ ^sha256:[a-f0-9]{64}$ ]] || fail "invalid restore artifact digest"
+    restore_subject="${RESTORE_SOURCES_REF%%@*}@${subject_digest}"
+  fi
   local sources_digest sources_repo sources_archive
-  sources_digest=$(oras discover "${auth_flags[@]}" "$RESTORE_SOURCES_REF" \
+  sources_digest=$(oras discover "${auth_flags[@]}" "$restore_subject" \
     --artifact-type "$OCI_REFERRER_TYPE_BUILD_SOURCES" --format json \
-    | grep -o 'sha256:[a-f0-9]\{64\}' | sed -n '1p' || true)
-  [ -n "$sources_digest" ] || fail "no sources referrer found for $RESTORE_SOURCES_REF"
+    | select_single_referrer_digest sources) \
+    || fail "restore requires exactly one sources referrer for $RESTORE_SOURCES_REF"
 
+  # Referrers belong to a digest subject. Drop a tag before constructing digest refs.
   sources_repo="${RESTORE_SOURCES_REF%%@*}"
+  local last_component="${sources_repo##*/}"
+  sources_repo="${sources_repo%/*}/${last_component%%:*}"
   RESTORE_TMPDIR=$(mktemp -d)
   oras pull "${auth_flags[@]}" "${sources_repo}@${sources_digest}" -o "$RESTORE_TMPDIR"
+  if [ "$SECURE_BUILD" = "true" ] || [ "$REPRODUCIBLE" = "true" ]; then
+    local lock_digest
+    lock_digest=$(oras discover "${auth_flags[@]}" "$restore_subject" \
+      --artifact-type "$OCI_REFERRER_TYPE_AIB_LOCKFILE" --format json \
+      | select_single_referrer_digest lockfile) \
+      || fail "restore requires the recorded lockfile; refusing to resolve new dependencies"
+    mkdir -p "$RESTORE_TMPDIR/lock"
+    oras pull "${auth_flags[@]}" "${sources_repo}@${lock_digest}" -o "$RESTORE_TMPDIR/lock" \
+      || fail "failed to restore dependency lockfile"
+    [ -s "$RESTORE_TMPDIR/lock/aib.lock" ] || fail "restored lockfile is missing or empty"
+    if [ -f "$AIB_LOCKFILE" ]; then
+      cmp -s "$AIB_LOCKFILE" "$RESTORE_TMPDIR/lock/aib.lock" \
+        || fail "supplied lockfile differs from the recorded restore lockfile"
+    fi
+    cp "$RESTORE_TMPDIR/lock/aib.lock" "$AIB_LOCKFILE"
+  fi
   sources_archive=$(find "$RESTORE_TMPDIR" -name '*.tar.gz' -print -quit)
   [ -n "$sources_archive" ] || fail "no archive found after pulling sources referrer"
 
@@ -232,9 +280,7 @@ restore_sources_if_requested() {
 }
 
 prepare_build_directory
-restore_sources_if_requested
 install_custom_ca_certs
-setup_osbuild
 
 cd "$WORKSPACE_PATH" || exit 1
 
@@ -262,9 +308,55 @@ if ! load_args_from_file "$MANIFEST_CONFIG_PATH/aib-extra-args.txt" "AIB extra a
   echo "No AIB extra args file found"
 fi
 
-declare -a LOCKFILE_ARGS=()
+resolve_dependency_lock() {
+  local resolver=aib-dev
+  [ "$BUILD_MODE" != "bootc" ] || resolver=aib
+  local -a reproducible_args=()
+  if [ "$USE_PERSISTENT_CACHE" = "true" ] || [ "$REPRODUCIBLE" = "true" ]; then
+    reproducible_args=(--define "reproducible_image=true")
+  fi
+  local -a resolve_command=("$resolver" resolve --distro "$DISTRO" --target "$TARGET" --arch "$ARCH"
+    "${reproducible_args[@]}" "${CUSTOM_DEFS_ARGS[@]}" "${AIB_EXTRA_ARGS[@]}"
+    --output "$AIB_LOCKFILE" "$MANIFEST_FILE")
+  local resolve_command_text
+  printf -v resolve_command_text '%q ' "${resolve_command[@]}"
+  write_result aib-command "$resolve_command_text"
+  "${resolve_command[@]}" || fail "AIB dependency resolution failed"
+  [ -s "$AIB_LOCKFILE" ] || fail "AIB did not produce a lockfile"
+}
+
+AIB_LOCKFILE="$WORKSPACE_PATH/aib.lock"
+rm -f "$AIB_LOCKFILE"
+if [ "$RESOLVE_ONLY" = "true" ]; then
+  [ ! -f "$MANIFEST_CONFIG_PATH/aib.lock" ] || fail "resolve-only cannot consume a lockfile"
+  resolve_dependency_lock
+  write_result artifact-filename "aib.lock"
+  write_result ARTIFACT_INTEGRITY_DIGEST "$(compute_artifact_digest "" "$AIB_LOCKFILE")"
+  write_result automotive-image-builder "$AIB_IMAGE_REF"
+  write_result aib-version "$(aib --version)"
+  echo "Dependency lockfile generated successfully"
+  exit 0
+fi
+
 if [ -f "$MANIFEST_CONFIG_PATH/aib.lock" ]; then
-  LOCKFILE_ARGS=(--lockfile "$MANIFEST_CONFIG_PATH/aib.lock")
+  cp "$MANIFEST_CONFIG_PATH/aib.lock" "$AIB_LOCKFILE"
+fi
+restore_sources_if_requested
+if [ "$SECURE_BUILD" = "true" ] || [ "$REPRODUCIBLE" = "true" ]; then
+  if [ ! -f "$AIB_LOCKFILE" ]; then
+    [ -z "$RESTORE_SOURCES_REF" ] || fail "restore requires a recorded lockfile"
+    resolve_dependency_lock
+  fi
+  [ -s "$AIB_LOCKFILE" ] || fail "secure/reproducible build requires a nonempty lockfile"
+  HERMETO_PREFETCH=true
+fi
+prepare_locked_rpms_with_hermeto \
+  "$AIB_LOCKFILE" "$BUILD_DIR" "$WORKSPACE_PATH" "$RESTORE_SOURCES_REF"
+setup_osbuild
+
+declare -a LOCKFILE_ARGS=()
+if [ -f "$AIB_LOCKFILE" ]; then
+  LOCKFILE_ARGS=(--lockfile "$AIB_LOCKFILE")
 fi
 
 declare -a ROOT_PASSWORD_ARGS=()
@@ -395,6 +487,9 @@ prepare_builder_if_needed() {
     fi
 
     if [ "$builder_cached" = "false" ]; then
+      if [ "$SECURE_BUILD" = "true" ]; then
+        echo "WARNING: bootc helper builder preparation is online and is not covered by the application lockfile; only final AIB assembly is network-isolated"
+      fi
       echo "Building builder image $LOCAL_BUILDER_IMAGE"
       aib --verbose build-builder --build-dir "$BUILD_DIR" --cache "$BUILD_DIR/dnf-cache" \
         --distro "$DISTRO" "${CUSTOM_DEFS_ARGS[@]}" "$LOCAL_BUILDER_IMAGE"
@@ -494,13 +589,47 @@ elif [ "$REPRODUCIBLE" = "true" ]; then
 fi
 
 run_aib_command() {
+  run_aib_command_impl true "$@"
+}
+
+run_aib_followup_command() {
+  run_aib_command_impl false "$@"
+}
+
+prefetch_locked_sources() {
+  [ "$AIB_SOURCE_PREFETCH_REQUIRED" = "true" ] || return 0
+
+  local binary="$1"
+  shift
+  local -a command=("$binary" --verbose build --dry-run "$@")
+  if [ -n "$RESTORE_SOURCES_REF" ]; then
+    command=(unshare --net -- "${command[@]}")
+    echo "Checking restored locked sources without network access"
+  else
+    echo "Prefetching non-RPM locked sources with AIB before offline assembly"
+  fi
+  "${command[@]}" || fail "AIB locked source prefetch failed"
+  verify_locked_non_rpm_sources "$AIB_LOCKFILE" "$BUILD_DIR/osbuild_store/sources" \
+    || fail "locked non-RPM source verification failed"
+}
+
+run_aib_command_impl() {
+  local record_result="$1"
+  shift
   local description="$1"
   shift
   local -a command=("$@")
 
-  AIB_COMMAND=$(printf '%q ' "${command[@]}")
-  AIB_COMMAND="${AIB_COMMAND% }"
-  write_result aib-command "$AIB_COMMAND"
+  if [ "$AIB_BUILD_NETWORK_DISABLED" = "true" ]; then
+    command=(unshare --net -- "${command[@]}")
+    echo "AIB build network disabled; locked RPMs must come from the osbuild source store"
+  fi
+
+  if [ "$record_result" = "true" ]; then
+    AIB_COMMAND=$(printf '%q ' "${command[@]}")
+    AIB_COMMAND="${AIB_COMMAND% }"
+    write_result aib-command "$AIB_COMMAND"
+  fi
   echo "$description"
   emit_progress "Building image" "$STEP_BUILD" "$PROGRESS_TOTAL"
   "${command[@]}"
@@ -602,17 +731,16 @@ run_bootc() {
     disk_output_args=("/output/${EXPORT_FILE}")
   fi
 
-  local -a command=(
-    aib --verbose build
+  local -a build_args=(
     --distro "$DISTRO"
     --target "$TARGET"
     --arch="$ARCH"
     "${COMMON_BUILD_ARGS[@]}"
   )
   if [ "$SPLIT_BUILD" = "false" ]; then
-    command+=("${FORMAT_ARGS[@]}")
+    build_args+=("${FORMAT_ARGS[@]}")
   fi
-  command+=(
+  build_args+=(
     "${BUILD_CONTAINER_ARGS[@]}"
     "${CUSTOM_DEFS_ARGS[@]}"
     "${AIB_EXTRA_ARGS[@]}"
@@ -623,13 +751,17 @@ run_bootc() {
     "${disk_output_args[@]}"
   )
 
+  local -a command=(aib --verbose build "${build_args[@]}")
+  prefetch_locked_sources aib "${build_args[@]}"
   run_aib_command "Running bootc build" "${command[@]}"
   start_container_push
 
   if [ "$SPLIT_BUILD" = "true" ]; then
     local disk_start
     disk_start=$(date +%s)
-    aib --verbose to-disk-image \
+    # Conversion consumes the local bootc image and remains network-isolated,
+    # but the primary build command is the provenance-bearing operation.
+    run_aib_followup_command "Creating disk image" aib --verbose to-disk-image \
       "${FORMAT_ARGS[@]}" \
       "${BUILD_CONTAINER_ARGS[@]}" \
       "${AIB_EXTRA_ARGS[@]}" \
@@ -640,8 +772,7 @@ run_bootc() {
 }
 
 run_traditional() {
-  local -a command=(
-    aib-dev --verbose build
+  local -a build_args=(
     "${CUSTOM_DEFS_ARGS[@]}"
     --distro "$DISTRO"
     --target "$TARGET"
@@ -654,6 +785,8 @@ run_traditional() {
     "$MANIFEST_FILE"
     "/output/${EXPORT_FILE}"
   )
+  local -a command=(aib-dev --verbose build "${build_args[@]}")
+  prefetch_locked_sources aib-dev "${build_args[@]}"
   run_aib_command "Running $BUILD_MODE build" "${command[@]}"
 }
 
@@ -835,6 +968,27 @@ write_container_results() {
   pushed_digest=$(cat /tmp/container-push-digest.txt 2>/dev/null || true)
   [ -n "$pushed_digest" ] || fail "container push completed without a digest"
 
+  if [ "$SECURE_BUILD" = "true" ] || [ "$REPRODUCIBLE" = "true" ]; then
+    install_oras || fail "failed to install oras for lockfile publication"
+    local -a attach_args=()
+    if [ -n "$REGISTRY_AUTH_FILE" ] && [ -f "$REGISTRY_AUTH_FILE" ]; then
+      attach_args+=(--registry-config "$REGISTRY_AUTH_FILE")
+    fi
+    [ -s "$AIB_LOCKFILE" ] || fail "missing build lockfile"
+    oras attach --disable-path-validation "${attach_args[@]}" \
+      --artifact-type "$OCI_REFERRER_TYPE_AIB_LOCKFILE" \
+      "${CONTAINER_PUSH}@${pushed_digest}" "$AIB_LOCKFILE:$OCI_REFERRER_TYPE_AIB_LOCKFILE" \
+      || fail "failed to attach container lockfile"
+    if aib_lock_has_rpms "$AIB_LOCKFILE"; then
+      [ -s "$WORKSPACE_PATH/hermeto-rpm-bom.json" ] \
+        || fail "Hermeto RPM SBOM is missing for locked RPM inputs"
+      oras attach --disable-path-validation "${attach_args[@]}" \
+        --artifact-type "$OCI_REFERRER_TYPE_HERMETO_RPM_SBOM" \
+        "${CONTAINER_PUSH}@${pushed_digest}" \
+        "$WORKSPACE_PATH/hermeto-rpm-bom.json:$OCI_REFERRER_TYPE_HERMETO_RPM_SBOM" \
+        || fail "failed to attach Hermeto RPM SBOM"
+    fi
+  fi
   write_result IMAGE_URL "$CONTAINER_PUSH"
   write_result IMAGE_DIGEST "$pushed_digest"
   result_path="$WORKSPACE_PATH/.chains/container"
@@ -852,16 +1006,16 @@ package_reproducible_inputs() {
   local sources_dir="$BUILD_DIR/osbuild_store/sources"
   local sources_archive="$WORKSPACE_PATH/build-sources.tar.gz"
   if [ -d "$sources_dir" ]; then
-    tar -czf "$sources_archive" -C "$BUILD_DIR/osbuild_store" sources
+    local -a archive_entries=(sources)
+    if [ -f "$BUILD_DIR/osbuild_store/hermeto-rpm-bom.json" ]; then
+      archive_entries+=(hermeto-rpm-bom.json)
+    fi
+    tar -czf "$sources_archive" -C "$BUILD_DIR/osbuild_store" "${archive_entries[@]}"
     echo "Sources archive: $(du -sh "$sources_archive" | cut -f1)"
   else
     echo "WARNING: no osbuild sources found at $sources_dir"
   fi
   cp "$MANIFEST_FILE" "$WORKSPACE_PATH/aib-manifest.yml"
-  rm -f "$WORKSPACE_PATH/aib.lock"
-  if [ -f "$MANIFEST_CONFIG_PATH/aib.lock" ]; then
-    cp "$MANIFEST_CONFIG_PATH/aib.lock" "$WORKSPACE_PATH/aib.lock"
-  fi
 }
 
 package_reproducible_inputs

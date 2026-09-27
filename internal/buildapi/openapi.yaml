@@ -285,6 +285,9 @@ components:
           type: string
         diskImage:
           type: string
+        lockfileArtifact:
+          description: Published lockfile artifact reference for resolve-only operations
+          type: string
         externalId:
           $ref: '#/components/schemas/ExternalID'
         flash:
@@ -430,6 +433,9 @@ components:
           description: Inline AIB YAML. Maximum 900 KiB UTF-8 bytes.
           maxLength: 921600
           type: string
+        resolveOnly:
+          type: boolean
+          description: Generate a lockfile on the cluster without assembling an image; requires package mode.
         lockfile:
           type: string
           maxLength: 921600
@@ -484,6 +490,7 @@ components:
         s3Region:
           type: string
         secureBuild:
+          description: Use digest-pinned Tekton tasks and locked inputs for network-isolated AIB assembly. OCI output requires a registry that supports referrers.
           type: boolean
         storageClass:
           type: string
@@ -495,7 +502,7 @@ components:
           description: Time-to-live for the build (e.g. "24h", "72h"). Empty uses server default, "0" disables expiry.
           type: string
         useInternalRegistry:
-          description: Push disk images to OpenShift internal registry (mutually exclusive with exportOci; can be combined with containerPush for hybrid builds)
+          description: Push disk images to OpenShift internal registry (mutually exclusive with exportOci; not supported for secure builds because required OCI referrers cannot be published)
           type: boolean
         workspace:
           type: string
@@ -519,6 +526,9 @@ components:
           type: string
         diskImage:
           description: Disk image artifact reference
+          type: string
+        lockfileArtifact:
+          description: Published lockfile artifact reference for resolve-only operations
           type: string
         expiresAt:
           description: When terminal build resources expire. The ImageBuild and its terminal result remain.
@@ -647,6 +657,9 @@ components:
               description: Inline AIB YAML. Maximum 900 KiB UTF-8 bytes.
               maxLength: 921600
               type: string
+            resolveOnly:
+              type: boolean
+              description: Generate a lockfile on the cluster without assembling an image; requires package mode.
             lockfile:
               type: string
               maxLength: 921600
@@ -689,6 +702,7 @@ components:
             s3Region:
               type: string
             secureBuild:
+              description: Use digest-pinned Tekton tasks and locked inputs for network-isolated AIB assembly. OCI output requires a registry that supports referrers.
               type: boolean
             storageClass:
               type: string
@@ -700,7 +714,7 @@ components:
               description: Time-to-live for the build (e.g. "24h", "72h"). Empty uses server default, "0" disables expiry.
               type: string
             useInternalRegistry:
-              description: Push disk images to OpenShift internal registry (mutually exclusive with exportOci; can be combined with containerPush for hybrid builds)
+              description: Push disk images to OpenShift internal registry (mutually exclusive with exportOci; not supported for secure builds because required OCI referrers cannot be published)
               type: boolean
             workspace:
               type: string

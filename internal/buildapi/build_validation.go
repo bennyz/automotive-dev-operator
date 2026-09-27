@@ -39,7 +39,19 @@ func validateBuildRequest(req *BuildRequest) error {
 		return fmt.Errorf("manifest and lockfile exceed %d byte limit", maxManifestSize)
 	}
 
+	if req.ResolveOnly {
+		if req.Mode != ModePackage {
+			return fmt.Errorf("resolveOnly requires package mode")
+		}
+		if req.Lockfile != "" || req.RestoreSourcesRef != "" || req.Reproducible || req.SecureBuild || req.BuildDiskImage || req.FlashEnabled || req.ContainerRef != "" || req.ContainerPush != "" {
+			return fmt.Errorf("resolveOnly cannot be combined with a lockfile, restored sources, secure/reproducible builds, flashing, or container operations")
+		}
+	}
+
 	if req.Mode == ModeDisk {
+		if req.SecureBuild || req.Reproducible {
+			return fmt.Errorf("secure/reproducible dependency locking is not supported for disk-only builds")
+		}
 		if req.Lockfile != "" {
 			return fmt.Errorf("lockfile is not supported for disk mode")
 		}
@@ -61,6 +73,9 @@ func validateBuildRequest(req *BuildRequest) error {
 
 	if req.Reproducible && !req.SecureBuild {
 		return fmt.Errorf("reproducible builds require secureBuild to be true")
+	}
+	if req.SecureBuild && req.UseInternalRegistry {
+		return fmt.Errorf("secure builds cannot use the internal registry because required OCI referrers are unsupported; use an external referrer-capable registry")
 	}
 
 	return nil

@@ -13,6 +13,7 @@ import (
 // Options wires the image command tree to caller-owned state and handlers.
 type Options struct {
 	RunBuild             func(*cobra.Command, []string)
+	RunResolve           func(*cobra.Command, []string)
 	RunDisk              func(*cobra.Command, []string)
 	RunBuildDev          func(*cobra.Command, []string)
 	RunList              func(*cobra.Command, []string)
@@ -119,6 +120,7 @@ func NewImageCmd(opts Options) *cobra.Command {
 	}
 
 	buildCmd := newBuildCmd(opts)
+	resolveCmd := newResolveCmd(opts)
 	diskCmd := newDiskCmd(opts)
 	buildDevCmd := newBuildDevCmd(opts)
 	listCmd := newListCmd(opts)
@@ -185,7 +187,7 @@ func NewImageCmd(opts Options) *cobra.Command {
 	buildCmd.Flags().StringVar(opts.ExporterSelector, "exporter", "", "direct exporter selector for flash (alternative to --target lookup)")
 	buildCmd.Flags().StringArrayVar(opts.LeaseTags, "lease-tag", []string{}, "tag for Jumpstarter lease (key=value, can be repeated)")
 	// Secure build
-	buildCmd.Flags().BoolVar(opts.SecureBuild, "secure", false, "resolve tasks from signed Tekton Bundle (requires OperatorConfig taskBundleRef)")
+	buildCmd.Flags().BoolVar(opts.SecureBuild, "secure", false, "use digest-pinned tasks and locked inputs for network-isolated AIB assembly (requires taskBundleRef; OCI output requires referrer support)")
 	buildCmd.Flags().StringVar(opts.TTL, "ttl", "", "time-to-live for the build (e.g. 24h, 72h, 168h); empty=server default, 0=no expiry")
 	// Reproducible build
 	buildCmd.Flags().BoolVar(opts.Reproducible, "reproducible", false, "save RPMs, manifest, lockfile, and task bundle for future reproduction (requires --secure)")
@@ -196,6 +198,23 @@ func NewImageCmd(opts Options) *cobra.Command {
 	buildCmd.Flags().StringVar(opts.InternalRegistryImageName, "image-name", "", "override image name for internal registry (default: build name)")
 	buildCmd.Flags().StringVar(opts.InternalRegistryTag, "image-tag", "", "tag for internal registry image (default: bootc)")
 	addS3Flags(buildCmd, opts)
+
+	resolveCmd.Flags().StringVar(opts.ServerURL, "server", defaultServer, "REST API server base URL")
+	resolveCmd.Flags().StringVar(opts.AuthToken, "token", os.Getenv("CAIB_TOKEN"), "Bearer token for authentication")
+	resolveCmd.Flags().StringVarP(opts.BuildName, "name", "n", "", "cluster operation name (default: manifest name with -resolve suffix)")
+	resolveCmd.Flags().IntVar(opts.Timeout, "timeout", 30, "resolution timeout in minutes")
+	resolveCmd.Flags().StringVar(opts.TTL, "ttl", "", "retention after completion (0 keeps the operation)")
+	resolveCmd.Flags().StringVarP(opts.Distro, "distro", "d", "autosd", "distribution to resolve")
+	resolveCmd.Flags().StringVarP(opts.Target, "target", "t", "", "target platform (default: from manifest, or qemu)")
+	resolveCmd.Flags().StringVarP(opts.Architecture, "arch", "a", opts.GetDefaultArch(), "architecture (amd64, arm64)")
+	resolveCmd.Flags().StringVarP(opts.OutputDir, "output", "o", "", "output lockfile path (default: <manifest>.lock)")
+	resolveCmd.Flags().StringVar(
+		opts.AutomotiveImageBuilder, "aib-image",
+		automotivev1alpha1.DefaultAutomotiveImageBuilderImage, "AIB container image",
+	)
+	resolveCmd.Flags().StringArrayVarP(opts.CustomDefs, "define", "D", []string{}, "custom definition KEY=VALUE")
+	resolveCmd.Flags().StringArrayVar(opts.DefineFiles, "define-file", []string{}, "load defines from YAML dictionary file (can be repeated)")
+	resolveCmd.Flags().StringArrayVar(opts.AIBExtraArgs, "extra-args", []string{}, "extra argument passed to AIB (can be repeated)")
 
 	listCmd.Flags().StringVar(
 		opts.ServerURL, "server", defaultServer, "REST API server base URL (e.g. https://api.example)",
@@ -249,7 +268,7 @@ func NewImageCmd(opts Options) *cobra.Command {
 	diskCmd.Flags().StringVar(opts.ExporterSelector, "exporter", "", "direct exporter selector for flash (alternative to --target lookup)")
 	diskCmd.Flags().StringArrayVar(opts.LeaseTags, "lease-tag", []string{}, "tag for Jumpstarter lease (key=value, can be repeated)")
 	// Secure build
-	diskCmd.Flags().BoolVar(opts.SecureBuild, "secure", false, "resolve tasks from signed Tekton Bundle (requires OperatorConfig taskBundleRef)")
+	diskCmd.Flags().BoolVar(opts.SecureBuild, "secure", false, "not supported for disk-only conversion; use image build or build-dev for secure builds")
 	diskCmd.Flags().StringVar(opts.TTL, "ttl", "", "time-to-live for the build (e.g. 24h, 72h, 168h); empty=server default, 0=no expiry")
 	diskCmd.Flags().StringVar(opts.TaskBundleRef, "task-bundle-ref", "", "digest-pinned Tekton bundle ref for reproducible rebuild (e.g. quay.io/org/tasks@sha256:abc...)")
 	// Internal registry options
@@ -301,7 +320,7 @@ func NewImageCmd(opts Options) *cobra.Command {
 	buildDevCmd.Flags().StringVar(opts.ExporterSelector, "exporter", "", "direct exporter selector for flash (alternative to --target lookup)")
 	buildDevCmd.Flags().StringArrayVar(opts.LeaseTags, "lease-tag", []string{}, "tag for Jumpstarter lease (key=value, can be repeated)")
 	// Secure build
-	buildDevCmd.Flags().BoolVar(opts.SecureBuild, "secure", false, "resolve tasks from signed Tekton Bundle (requires OperatorConfig taskBundleRef)")
+	buildDevCmd.Flags().BoolVar(opts.SecureBuild, "secure", false, "use digest-pinned tasks and locked inputs for network-isolated AIB assembly (requires taskBundleRef; OCI output requires referrer support)")
 	buildDevCmd.Flags().StringVar(opts.TTL, "ttl", "", "time-to-live for the build (e.g. 24h, 72h, 168h); empty=server default, 0=no expiry")
 	// Reproducible build
 	buildDevCmd.Flags().BoolVar(opts.Reproducible, "reproducible", false, "save RPMs, manifest, lockfile, and task bundle for future reproduction (requires --secure)")
@@ -373,6 +392,7 @@ func NewImageCmd(opts Options) *cobra.Command {
 
 	cmd.AddCommand(
 		buildCmd,
+		resolveCmd,
 		diskCmd,
 		buildDevCmd,
 		listCmd,
@@ -391,6 +411,21 @@ func NewImageCmd(opts Options) *cobra.Command {
 	)
 
 	return cmd
+}
+
+func newResolveCmd(opts Options) *cobra.Command {
+	return &cobra.Command{
+		Use:   "resolve <manifest.aib.yml>",
+		Short: "Resolve manifest dependencies into an AIB lockfile",
+		Long: `Resolve manifest dependencies on the cluster with the selected AIB container image.
+
+The generated lockfile records exact RPM URLs and checksums and can be passed
+to caib image build-dev with --lockfile. The CLI downloads the resulting lockfile.`,
+		Example: `  caib image resolve manifest.aib.yml --arch arm64 -o manifest.aib.lock
+  caib image build-dev manifest.aib.yml --arch arm64 --lockfile manifest.aib.lock`,
+		Args: cobra.ExactArgs(1),
+		Run:  opts.RunResolve,
+	}
 }
 
 func addNotificationFlags(cmd *cobra.Command, opts Options) {
