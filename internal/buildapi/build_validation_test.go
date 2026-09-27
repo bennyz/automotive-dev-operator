@@ -84,6 +84,29 @@ var _ = Describe("validateBuildRequest", func() {
 		Expect(validateBuildRequest(req)).To(Succeed())
 	})
 
+	It("rejects secure builds using the internal registry", func() {
+		req := &BuildRequest{
+			Name:                "my-build",
+			Manifest:            "name: test\n",
+			Mode:                ModeBootc,
+			SecureBuild:         true,
+			UseInternalRegistry: true,
+		}
+		err := validateBuildRequest(req)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("required OCI referrers are unsupported"))
+	})
+
+	It("accepts plain builds using the internal registry", func() {
+		req := &BuildRequest{
+			Name:                "my-build",
+			Manifest:            "name: test\n",
+			Mode:                ModeBootc,
+			UseInternalRegistry: true,
+		}
+		Expect(validateBuildRequest(req)).To(Succeed())
+	})
+
 	It("rejects container-push ref with shell metacharacters", func() {
 		req := &BuildRequest{
 			Name:          "my-build",

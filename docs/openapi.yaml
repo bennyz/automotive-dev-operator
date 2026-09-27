@@ -490,6 +490,7 @@ components:
         s3Region:
           type: string
         secureBuild:
+          description: Use digest-pinned Tekton tasks and locked inputs for network-isolated AIB assembly. OCI output requires a registry that supports referrers.
           type: boolean
         storageClass:
           type: string
@@ -501,7 +502,7 @@ components:
           description: Time-to-live for the build (e.g. "24h", "72h"). Empty uses server default, "0" disables expiry.
           type: string
         useInternalRegistry:
-          description: Push disk images to OpenShift internal registry (mutually exclusive with exportOci; can be combined with containerPush for hybrid builds)
+          description: Push disk images to OpenShift internal registry (mutually exclusive with exportOci; not supported for secure builds because required OCI referrers cannot be published)
           type: boolean
         workspace:
           type: string
@@ -701,6 +702,7 @@ components:
             s3Region:
               type: string
             secureBuild:
+              description: Use digest-pinned Tekton tasks and locked inputs for network-isolated AIB assembly. OCI output requires a registry that supports referrers.
               type: boolean
             storageClass:
               type: string
@@ -712,7 +714,7 @@ components:
               description: Time-to-live for the build (e.g. "24h", "72h"). Empty uses server default, "0" disables expiry.
               type: string
             useInternalRegistry:
-              description: Push disk images to OpenShift internal registry (mutually exclusive with exportOci; can be combined with containerPush for hybrid builds)
+              description: Push disk images to OpenShift internal registry (mutually exclusive with exportOci; not supported for secure builds because required OCI referrers cannot be published)
               type: boolean
             workspace:
               type: string

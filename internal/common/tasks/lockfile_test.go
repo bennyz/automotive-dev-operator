@@ -60,6 +60,8 @@ EXPORT_FILE=output.qcow2
 CONTAINER_REF=quay.io/test/image
 LOCAL_BUILDER_IMAGE=builder
 run_aib_command() { shift; "$@"; }
+run_aib_followup_command() { shift; "$@"; }
+prefetch_locked_sources() { :; }
 aib() { printf 'CALL'; printf ' <%s>' "$@"; printf '\n'; }
 aib-dev() { aib "$@"; }
 start_container_push() { :; }
@@ -239,6 +241,9 @@ func TestRequiredLockfilePublication(t *testing.T) {
 		{name: "reproducible", repro: "true"},
 		{name: "missing lock", secure: "true", missing: true},
 		{name: "attachment fails", secure: "true", attachFailure: true},
+		{name: "secure SBOM", secure: "true"},
+		{name: "missing SBOM", secure: "true"},
+		{name: "invalid lock", secure: "true"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
@@ -246,7 +251,22 @@ func TestRequiredLockfilePublication(t *testing.T) {
 				if f == "aib.lock" && tc.missing {
 					continue
 				}
-				if err := os.WriteFile(filepath.Join(dir, f), []byte("fixture"), 0600); err != nil {
+				contents := []byte("fixture")
+				if f == "aib.lock" {
+					contents = []byte(`{"version":1,"depsolves":{}}`)
+					if tc.name == "secure SBOM" || tc.name == "missing SBOM" {
+						contents = []byte(`{"version":1,"depsolves":{"rpm":{"packages":[{"name":"example"}]}}}`)
+					}
+					if tc.name == "invalid lock" {
+						contents = []byte("not-json")
+					}
+				}
+				if err := os.WriteFile(filepath.Join(dir, f), contents, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.name == "secure SBOM" {
+				if err := os.WriteFile(filepath.Join(dir, "hermeto-rpm-bom.json"), []byte(`{"bomFormat":"CycloneDX"}`), 0600); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -265,9 +285,9 @@ ORAS_EXTRA_ARGS=()
 			if tc.attachFailure {
 				fail = "true"
 			}
-			cmd.Env = append(os.Environ(), "SECURE_BUILD="+tc.secure, "REPRODUCIBLE="+tc.repro, "WORKSPACE="+dir, "ATTACH_FAILURE="+fail, "DISK_DIGEST=sha256:abc", "repo_url=registry.example/output", "OCI_REFERRER_TYPE_AIB_LOCKFILE=lock-type", "OCI_REFERRER_TYPE_AIB_MANIFEST=manifest-type", "OCI_REFERRER_TYPE_BUILD_SOURCES=sources-type")
+			cmd.Env = append(os.Environ(), "SECURE_BUILD="+tc.secure, "REPRODUCIBLE="+tc.repro, "WORKSPACE="+dir, "ATTACH_FAILURE="+fail, "DISK_DIGEST=sha256:abc", "repo_url=registry.example/output", "OCI_REFERRER_TYPE_AIB_LOCKFILE=lock-type", "OCI_REFERRER_TYPE_HERMETO_RPM_SBOM=sbom-type", "OCI_REFERRER_TYPE_AIB_MANIFEST=manifest-type", "OCI_REFERRER_TYPE_BUILD_SOURCES=sources-type")
 			output, err := cmd.CombinedOutput()
-			wantFailure := tc.missing || tc.attachFailure
+			wantFailure := tc.missing || tc.attachFailure || tc.name == "missing SBOM" || tc.name == "invalid lock"
 			if (err != nil) != wantFailure {
 				t.Fatalf("err=%v output=%s", err, output)
 			}
@@ -276,6 +296,9 @@ ORAS_EXTRA_ARGS=()
 			}
 			if !wantFailure && tc.name != "ordinary" && strings.Count(string(output), "<./aib.lock:lock-type>") != 1 {
 				t.Fatalf("lock not published exactly once: %s", output)
+			}
+			if tc.name == "secure SBOM" && strings.Count(string(output), "<./hermeto-rpm-bom.json:sbom-type>") != 1 {
+				t.Fatalf("SBOM not published exactly once: %s", output)
 			}
 		})
 	}
@@ -294,7 +317,7 @@ func TestSecureContainerLockfilePublication(t *testing.T) {
 	if !ok {
 		t.Fatal("container results boundary missing")
 	}
-	for _, scenario := range []string{"success", "missing lock", "attach failure"} {
+	for _, scenario := range []string{"success", "missing lock", "attach failure", "SBOM attach failure"} {
 		t.Run(scenario, func(t *testing.T) {
 			dir := t.TempDir()
 			lock := filepath.Join(dir, "aib.lock")
@@ -303,15 +326,21 @@ func TestSecureContainerLockfilePublication(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
+			if scenario == "success" || scenario == "SBOM attach failure" {
+				if err := os.WriteFile(filepath.Join(dir, "hermeto-rpm-bom.json"), []byte(`{"bomFormat":"CycloneDX"}`), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
 			script := `set -e
 fail() { echo "ERROR: $*"; exit 1; }
 cat() { echo sha256:example; }
 install_oras() { :; }
-oras() { printf 'ATTACH'; printf ' <%s>' "$@"; printf '\n'; [ "$SCENARIO" != 'attach failure' ]; }
+aib_lock_has_rpms() { [ "$SCENARIO" = success ] || [ "$SCENARIO" = 'SBOM attach failure' ]; }
+oras() { printf 'ATTACH'; printf ' <%s>' "$@"; printf '\n'; [ "$SCENARIO" != 'attach failure' ] && { [ "$SCENARIO" != 'SBOM attach failure' ] || [[ " $* " != *sbom-type* ]]; }; }
 write_result() { echo "RESULT $1"; }
 ` + "write_container_results() {" + body + "\nwrite_container_results"
 			cmd := exec.Command("bash", "-c", script)
-			cmd.Env = append(os.Environ(), "SCENARIO="+scenario, "NEEDS_PUSH=true", "SECURE_BUILD=true", "REPRODUCIBLE=false", "AIB_LOCKFILE="+lock, "WORKSPACE_PATH="+dir, "CONTAINER_PUSH=registry.example/image:latest", "REGISTRY_AUTH_FILE=", "OCI_REFERRER_TYPE_AIB_LOCKFILE=lock-type")
+			cmd.Env = append(os.Environ(), "SCENARIO="+scenario, "NEEDS_PUSH=true", "SECURE_BUILD=true", "REPRODUCIBLE=false", "AIB_LOCKFILE="+lock, "WORKSPACE_PATH="+dir, "CONTAINER_PUSH=registry.example/image:latest", "REGISTRY_AUTH_FILE=", "OCI_REFERRER_TYPE_AIB_LOCKFILE=lock-type", "OCI_REFERRER_TYPE_HERMETO_RPM_SBOM=sbom-type")
 			out, err := cmd.CombinedOutput()
 			if (err == nil) != (scenario == "success") {
 				t.Fatalf("err=%v output=%s", err, out)
@@ -321,6 +350,9 @@ write_result() { echo "RESULT $1"; }
 			}
 			if scenario == "success" && !strings.Contains(string(out), "<"+lock+":lock-type>") {
 				t.Fatalf("lock attachment missing: %s", out)
+			}
+			if scenario == "success" && !strings.Contains(string(out), "<"+filepath.Join(dir, "hermeto-rpm-bom.json")+":sbom-type>") {
+				t.Fatalf("SBOM attachment missing: %s", out)
 			}
 		})
 	}

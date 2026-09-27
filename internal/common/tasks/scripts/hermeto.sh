@@ -3,41 +3,127 @@
 # Adapter between AIB's JSON lockfile and Hermeto's best-effort RPM backend.
 # Keep this isolated from the build orchestration so another fetcher can replace it.
 
-aib_lock_is_rpm_only() {
-  python3 - "$1" <<'PYEOF'
+aib_lock_check() {
+  python3 - "$1" "$2" <<'PYEOF'
 import json
 import sys
 
 with open(sys.argv[1], encoding="utf-8") as lockfile:
     lock = json.load(lockfile)
 
+mode = sys.argv[2]
 depsolves = lock.get("depsolves", {})
-if not isinstance(depsolves, dict) or not any(
+has_rpms = isinstance(depsolves, dict) and any(
     isinstance(entry, dict) and (entry.get("packages") or entry.get("source")) for entry in depsolves.values()
-):
+)
+if mode == "has-rpms":
+    raise SystemExit(not has_rpms)
+if mode not in {"rpm-only", "supported-sources"}:
+    raise SystemExit(f"unknown AIB lockfile check: {mode}")
+
+if lock.get("version") != 1 or not isinstance(depsolves, dict):
+    raise SystemExit("AIB lockfile must have version 1 and object depsolves")
+
+allowed_top_level = {"version", "depsolves"}
+if mode == "supported-sources":
+    allowed_top_level.update({"containers", "embedded_files", "ostree_commits"})
+unknown_top_level = sorted(set(lock) - allowed_top_level)
+if unknown_top_level:
+    print(
+        "unsupported top-level AIB lockfile sections: " + ", ".join(unknown_top_level),
+        file=sys.stderr,
+    )
     raise SystemExit(1)
 
-non_rpm_sections = ("containers", "embedded_files", "ostree_commits")
-raise SystemExit(any(lock.get(section) for section in non_rpm_sections))
+allowed_depsolve_keys = {"request", "packages", "source", "module_metadata"}
+for key, entry in depsolves.items() if isinstance(depsolves, dict) else ():
+    if not isinstance(entry, dict):
+        print(f"depsolve {key} must be an object", file=sys.stderr)
+        raise SystemExit(1)
+    unknown = sorted(set(entry) - allowed_depsolve_keys)
+    if unknown:
+        print(
+            f"depsolve {key} contains unsupported sections: " + ", ".join(unknown),
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+raise SystemExit(0)
 PYEOF
 }
 
+aib_lock_is_rpm_only() {
+  aib_lock_check "$1" rpm-only
+}
+
 aib_lock_has_rpms() {
-  python3 - "$1" <<'PYEOF'
+  aib_lock_check "$1" has-rpms
+}
+
+aib_lock_has_supported_sources() {
+  aib_lock_check "$1" supported-sources
+}
+
+verify_locked_non_rpm_sources() {
+  local aib_lock="$1" source_store="$2"
+
+  python3 - "$aib_lock" "$source_store" <<'PYEOF'
+import hashlib
 import json
+import pathlib
+import re
+import subprocess
 import sys
 
-with open(sys.argv[1], encoding="utf-8") as lockfile:
-    lock = json.load(lockfile)
+lock_path, store = map(pathlib.Path, sys.argv[1:])
+lock = json.loads(lock_path.read_text(encoding="utf-8"))
 
-depsolves = lock.get("depsolves", {})
-raise SystemExit(
-    not isinstance(depsolves, dict)
-    or not any(
-        isinstance(entry, dict) and (entry.get("packages") or entry.get("source"))
-        for entry in depsolves.values()
-    )
-)
+
+def verify_sha256(path, expected):
+    if not re.fullmatch(r"[0-9a-f]{64}", expected):
+        raise SystemExit(f"invalid sha256 checksum: {expected}")
+    if not path.is_file():
+        raise SystemExit(f"locked source is missing: {path}")
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    if digest.hexdigest() != expected:
+        raise SystemExit(f"locked source checksum mismatch: {path}")
+
+
+for entry in lock.get("embedded_files", {}).values():
+    checksum = entry["checksum"]
+    verify_sha256(store / "org.osbuild.files" / f"sha256:{checksum}", checksum)
+
+for entry in lock.get("containers", {}).values():
+    config_digest = entry["config_digest"]
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", config_digest):
+        raise SystemExit(f"invalid container config digest: {config_digest}")
+    image_dir = store / "org.osbuild.containers" / config_digest / "image"
+    if not image_dir.is_dir():
+        raise SystemExit(f"locked container is missing: {image_dir}")
+    manifest_digest = entry["manifest_digest"]
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", manifest_digest):
+        raise SystemExit(f"invalid container manifest digest: {manifest_digest}")
+    verify_sha256(image_dir / "manifest.json", manifest_digest.removeprefix("sha256:"))
+    config = subprocess.check_output(["skopeo", "inspect", "--raw", "--config", f"dir:{image_dir}"])
+    if hashlib.sha256(config).hexdigest() != config_digest.removeprefix("sha256:"):
+        raise SystemExit(f"locked container config digest mismatch: {image_dir}")
+    if entry.get("request", {}).get("index"):
+        index_digest = entry["index_digest"]
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", index_digest):
+            raise SystemExit(f"invalid container index digest: {index_digest}")
+        verify_sha256(store / "org.osbuild.files" / index_digest, index_digest.removeprefix("sha256:"))
+
+if lock.get("ostree_commits"):
+    repo = store / "org.osbuild.ostree" / "repo"
+    subprocess.run(["ostree", f"--repo={repo}", "fsck"], check=True)
+    for entry in lock["ostree_commits"].values():
+        checksum = entry["checksum"]
+        if not re.fullmatch(r"[0-9a-f]{64}", checksum):
+            raise SystemExit(f"invalid OSTree commit checksum: {checksum}")
+        subprocess.run(["ostree", f"--repo={repo}", "show", checksum],
+                       check=True, stdout=subprocess.DEVNULL)
 PYEOF
 }
 
@@ -67,6 +153,7 @@ by_arch = {}
 url_checksums = {}
 paths = {}
 url_paths = {}
+supported_hashes = {"sha256", "sha384", "sha512"}
 for depsolve_key in sorted(depsolves):
     depsolve = depsolves[depsolve_key]
     arch = depsolve.get("request", {}).get("architecture")
@@ -92,6 +179,9 @@ for depsolve_key in sorted(depsolves):
                 r"[A-Za-z0-9_+-]+:[0-9a-f]+", checksum
             ):
                 raise SystemExit(f"{kind} has no usable checksum: {url}")
+            algorithm = checksum.split(":", 1)[0]
+            if algorithm not in supported_hashes:
+                raise SystemExit(f"unsupported checksum algorithm {algorithm} for {url}")
             if entry.get("secrets"):
                 raise SystemExit(f"Hermeto spike does not support secret-backed URLs: {url}")
             previous_checksum = url_checksums.setdefault(url, checksum)
@@ -113,7 +203,9 @@ for depsolve_key in sorted(depsolves):
                 raise SystemExit(f"Module metadata requires repoid: {url}")
             if repoid is None:
                 # Hermeto omits synthetic repository IDs from RPM PURLs.
-                repoid = "hermeto-aib-" + hashlib.sha256(checksum.encode()).hexdigest()[:12]
+                repo_path = parsed.path.rsplit("/", 1)[0] + "/"
+                repo_url = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, repo_path, "", ""))
+                repoid = "hermeto-aib-" + hashlib.sha256(repo_url.encode()).hexdigest()[:12]
             if not isinstance(repoid, str) or not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", repoid):
                 raise SystemExit(f"Invalid repository ID for {url}")
 
@@ -181,10 +273,9 @@ for entry in entries:
         raise SystemExit(f"Hermeto did not fetch {entry['url']} at {source}")
 
     algorithm, expected = entry["checksum"].split(":", 1)
-    try:
-        digest = hashlib.new(algorithm)
-    except ValueError as error:
-        raise SystemExit(f"unsupported checksum algorithm {algorithm}: {error}") from error
+    if algorithm not in {"sha256", "sha384", "sha512"}:
+        raise SystemExit(f"unsupported checksum algorithm {algorithm}")
+    digest = hashlib.new(algorithm)
     with source.open("rb") as rpm:
         for chunk in iter(lambda: rpm.read(1024 * 1024), b""):
             digest.update(chunk)
@@ -196,7 +287,10 @@ for entry in entries:
 
     destination = store_path / entry["checksum"]
     temporary = destination.with_name(destination.name + f".tmp.{os.getpid()}")
-    shutil.copyfile(source, temporary)
+    try:
+        os.link(source, temporary)
+    except OSError:
+        shutil.copyfile(source, temporary)
     os.replace(temporary, destination)
 
 print(len({entry["checksum"] for entry in entries}))
@@ -210,9 +304,8 @@ prepare_locked_rpms_with_hermeto() {
   if [ "${SECURE_BUILD:-false}" = "true" ] || [ "${REPRODUCIBLE:-false}" = "true" ]; then
     require_locked=true
     [ -s "$aib_lock" ] || fail "secure/reproducible build requires a lockfile"
-    aib_lock_is_rpm_only "$aib_lock" \
-      || fail "secure dependency preparation currently requires an RPM-only lockfile; mixed or non-RPM inputs are unsupported"
-    HERMETO_PREFETCH=true
+    aib_lock_has_supported_sources "$aib_lock" \
+      || fail "secure dependency preparation found unsupported AIB lockfile sections"
   fi
   rm -f "$workspace_path/hermeto-rpm-bom.json"
   if [ ! -f "$aib_lock" ]; then
@@ -234,16 +327,24 @@ prepare_locked_rpms_with_hermeto() {
     return 0
   fi
 
-  if aib_lock_is_rpm_only "$aib_lock"; then
+  aib_lock_has_supported_sources "$aib_lock" \
+    || fail "Hermeto prefetch found an invalid or unsupported AIB lockfile"
+  if aib_lock_is_rpm_only "$aib_lock" 2>/dev/null; then
     command -v unshare >/dev/null 2>&1 || fail "RPM-only locked builds require unshare for network isolation"
     # shellcheck disable=SC2034 # Consumed by the concatenated build_image.sh.
     AIB_BUILD_NETWORK_DISABLED=true
+  elif [ "$require_locked" = "true" ]; then
+    command -v unshare >/dev/null 2>&1 || fail "secure locked builds require unshare for network isolation"
+    # shellcheck disable=SC2034 # Consumed by the concatenated build_image.sh.
+    AIB_BUILD_NETWORK_DISABLED=true
+    # shellcheck disable=SC2034 # Consumed by the concatenated build_image.sh.
+    AIB_SOURCE_PREFETCH_REQUIRED=true
   else
     echo "WARNING: AIB lockfile contains non-RPM dependencies; AIB build network remains enabled"
   fi
 
   if [ -n "$restore_sources_ref" ]; then
-    if [ "$require_locked" = "true" ]; then
+    if [ "$require_locked" = "true" ] && aib_lock_has_rpms "$aib_lock"; then
       local verify_dir
       verify_dir=$(mktemp -d "$build_dir/verify-restored.XXXXXX")
       convert_aib_lock_to_hermeto "$aib_lock" "$verify_dir/rpms.lock.yaml" "$verify_dir/map.json" \
@@ -276,7 +377,8 @@ prepare_locked_rpms_with_hermeto() {
   local source_store="$build_dir/osbuild_store/sources/org.osbuild.files"
   rm -rf "$input_dir" "$output_dir"
   mkdir -p "$input_dir" "$output_dir"
-  chmod 0777 "$input_dir" "$output_dir"
+  chmod 0755 "$input_dir"
+  chmod 0777 "$output_dir"
 
   convert_aib_lock_to_hermeto "$aib_lock" "$hermeto_lock" "$rpm_map" \
     || fail "failed to convert AIB lockfile for Hermeto"

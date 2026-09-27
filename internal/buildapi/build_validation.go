@@ -74,6 +74,9 @@ func validateBuildRequest(req *BuildRequest) error {
 	if req.Reproducible && !req.SecureBuild {
 		return fmt.Errorf("reproducible builds require secureBuild to be true")
 	}
+	if req.SecureBuild && req.UseInternalRegistry {
+		return fmt.Errorf("secure builds cannot use the internal registry because required OCI referrers are unsupported; use an external referrer-capable registry")
+	}
 
 	return nil
 }

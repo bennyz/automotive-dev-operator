@@ -1,12 +1,70 @@
 package buildcmd
 
 import (
+	"strings"
 	"testing"
 
 	automotivev1alpha1 "github.com/centos-automotive-suite/automotive-dev-operator/api/v1alpha1"
 	buildapitypes "github.com/centos-automotive-suite/automotive-dev-operator/internal/buildapi"
 	"github.com/centos-automotive-suite/automotive-dev-operator/internal/common/manifestschema"
 )
+
+func TestValidateSecurityFlagsInternalRegistry(t *testing.T) {
+	tests := []struct {
+		name         string
+		secure       bool
+		reproducible bool
+		internal     bool
+		wantError    string
+	}{
+		{name: "plain internal build", internal: true},
+		{name: "secure external build", secure: true},
+		{name: "reproducible external build", secure: true, reproducible: true},
+		{name: "secure internal build", secure: true, internal: true, wantError: "--secure cannot be used with --internal-registry"},
+		{name: "reproducible internal build", secure: true, reproducible: true, internal: true, wantError: "--secure cannot be used with --internal-registry"},
+		{name: "reproducible without secure", reproducible: true, wantError: "--reproducible requires --secure"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := newTestDiskOpts()
+			*opts.SecureBuild = tc.secure
+			*opts.Reproducible = tc.reproducible
+			*opts.UseInternalRegistry = tc.internal
+
+			err := NewHandler(opts).validateSecurityFlags()
+			if tc.wantError == "" {
+				if err != nil {
+					t.Fatalf("validateSecurityFlags() error = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantError) {
+				t.Fatalf("validateSecurityFlags() error = %v, want substring %q", err, tc.wantError)
+			}
+		})
+	}
+}
+
+func TestSecureBuildCommandsRejectInternalRegistry(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		validate func(*Handler) error
+	}{
+		{name: "bootc", validate: (*Handler).validateBootcBuildFlags},
+		{name: "build-dev", validate: func(h *Handler) error { return h.validateBuildDevOptions("example.aib.yml") }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := newTestDiskOpts()
+			*opts.SecureBuild = true
+			*opts.UseInternalRegistry = true
+			err := tc.validate(NewHandler(opts))
+			if err == nil || !strings.Contains(err.Error(), "--secure cannot be used with --internal-registry") {
+				t.Fatalf("validation error = %v, want secure internal-registry rejection", err)
+			}
+		})
+	}
+}
 
 func TestValidateManifestSchemaImagePriority(t *testing.T) {
 	const (

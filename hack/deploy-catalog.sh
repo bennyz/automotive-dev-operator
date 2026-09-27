@@ -187,11 +187,11 @@ uninstall_operator() {
     echo "Deleting subscription (if exists)..."
     oc delete subscriptions.operators.coreos.com automotive-dev-operator -n ${NAMESPACE} --ignore-not-found=true
 
-    echo "Deleting all CSVs in namespace..."
-    oc delete csv --all -n ${NAMESPACE} --ignore-not-found=true 2>/dev/null || true
-
-    echo "Deleting InstallPlans (if exist)..."
-    oc delete installplan -n ${NAMESPACE} --all --ignore-not-found=true 2>/dev/null || true
+    echo "Deleting automotive-dev-operator CSVs only..."
+    for csv_name in $(oc get csv -n "${NAMESPACE}" -o name 2>/dev/null | grep '^clusterserviceversion\.operators\.coreos\.com/automotive-dev-operator\.' || true); do
+        oc delete "$csv_name" -n "${NAMESPACE}" --ignore-not-found=true
+    done
+    # Leave InstallPlans in place: plans for other operators may share this namespace.
 
     echo "Deleting operator-managed resources..."
     oc delete deployment ado-build-api ado-operator -n ${NAMESPACE} --ignore-not-found=true 2>/dev/null || true
@@ -434,13 +434,19 @@ if [ "$COMMAND" = "redeploy" ]; then
 
     echo ""
     echo "Waiting for catalog pod to be ready..."
+    CATALOG_READY=false
     for _ in {1..60}; do
-        CATALOG_POD=$(oc get pods -n ${CATALOG_NAMESPACE} -l olm.catalogSource=${CATALOG_NAME} -o name 2>/dev/null || echo "")
-        if [ -n "$CATALOG_POD" ]; then
-            oc wait --for=condition=Ready ${CATALOG_POD} -n ${CATALOG_NAMESPACE} --timeout=120s && break
+        # A terminating pod from the previous CatalogSource can still be listed.
+        CATALOG_POD=$(oc get pods -n "${CATALOG_NAMESPACE}" -l "olm.catalogSource=${CATALOG_NAME}" \
+            --sort-by=.metadata.creationTimestamp -o name 2>/dev/null | tail -n 1)
+        if [ -n "$CATALOG_POD" ] && oc wait --for=condition=Ready "$CATALOG_POD" \
+            -n "${CATALOG_NAMESPACE}" --timeout=5s; then
+            CATALOG_READY=true
+            break
         fi
         sleep 2
     done
+    [ "$CATALOG_READY" = true ] || { echo "ERROR: CatalogSource pod did not become ready"; exit 1; }
 
     echo ""
     echo "Creating OperatorGroup..."

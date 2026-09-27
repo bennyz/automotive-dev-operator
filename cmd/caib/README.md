@@ -574,7 +574,13 @@ The `--secure` and `--reproducible` flags enable supply-chain security and build
 
 ### Secure builds (`--secure`)
 
-When `--secure` is set, the build resolves Tekton tasks from a digest-pinned, cosign-signed bundle instead of using the operator's default tasks. This ensures the build pipeline itself is verified and tamper-proof.
+When `--secure` is set, the build resolves Tekton tasks from a digest-pinned bundle instead of using the operator's default tasks. The bundle is also cosign-verified when `taskBundleVerify` is enabled. The build resolves an AIB lockfile if none was supplied, uses Hermeto to fetch the locked RPMs, and runs the final AIB build without network access. Secure OCI outputs require a registry that supports OCI referrers; neither `--internal-registry` nor the cluster registry's external route is supported because the lockfile and other required metadata cannot be attached there.
+
+For lockfiles with containers, URL-based embedded files, or OSTree commits, AIB first runs `build --dry-run` with the same lockfile and build directory. This downloads the pinned sources into osbuild's store without assembling an image. Package builds use `aib-dev build --dry-run`; bootc builds use `aib build --dry-run`. Cached files, container configurations, and OSTree objects are checked before the final build reuses that store with network access disabled. Unknown lockfile sections fail before assembly. Disk-only builds cannot use `--secure` or `--reproducible`.
+
+This network-enabled dry-run is a stopgap for mixed-source builds, not a Konflux-compatible prefetch/build split. A Konflux build task has no network, so non-RPM sources must eventually be fetched in its separate prefetch task. Bootc builds may also run `aib build-builder` online to create a helper container before the final AIB assembly; that helper build does not consume the application lockfile. The network-isolation guarantee here applies to the final AIB assembly, not to every preparatory step in the Tekton task.
+
+For a plain locked build, enabling `osBuilds.hermetoPrefetch` fetches the RPMs through Hermeto even when the lockfile has other input types. AIB keeps network access for those inputs and verifies their recorded checksums or digests. RPM-only locks run without network access.
 
 **Requirements:**
 - OperatorConfig must have `osBuilds.taskBundleRef` set to a digest-pinned bundle (e.g. `quay.io/org/tasks@sha256:...`)
@@ -608,11 +614,12 @@ kubectl create configmap cosign-public-key \
 When `--reproducible` is set (requires `--secure`), the build archives its inputs as OCI referrer artifacts alongside the output image:
 
 - **AIB manifest** — the exact manifest used
-- **AIB lockfile** — the dependency lockfile used, when one was supplied
-- **Build sources** — RPMs and other inputs (tar.gz)
+- **AIB lockfile** — the supplied or generated dependency lockfile
+- **Build sources** — prefetched RPMs, metadata, and other locked sources (tar.gz)
 - **osbuild manifest** — the resolved osbuild pipeline definition
+- **Hermeto RPM BOM** — a CycloneDX 1.6 inventory of locked RPM inputs, when the lockfile contains RPMs; it is not an SBOM of the final image contents
 
-These artifacts enable exact rebuild reproduction. Use `caib image inspect` to view them and get a rebuild command.
+These artifacts enable rebuilding from the archived inputs. Use `caib image inspect` to view them and get a rebuild command.
 
 ### Rebuilding from a previous build
 
@@ -632,9 +639,9 @@ caib image build ./rebuild/manifest.aib.yml \
 ```
 
 Key flags for reproduction:
-- `--lockfile` reuses the dependency versions resolved by the original build; omit it for older images without a lockfile referrer
+- `--lockfile` reuses the dependency versions resolved by the original build; secure restores require the recorded lockfile referrer
 - `--task-bundle-ref` pins the exact Tekton bundle used in the original build
-- `--restore-sources` tells the build to fetch archived RPMs and inputs from the original build's OCI referrers at build time (the build pod pulls from the registry, not from your local download)
+- `--restore-sources` tells the build to fetch archived locked sources from the original build's OCI referrers at build time (the build pod pulls from the registry, not from your local download)
 
 ## Authentication
 

@@ -185,12 +185,14 @@ type BuildRequest struct {
 	RebuildBuilder bool   `json:"rebuildBuilder,omitempty"` // Force rebuild of bootc builder image
 	HasLocalFiles  bool   `json:"hasLocalFiles,omitempty"`  // Client has local files to upload (source_path/source_glob)
 
-	// Internal registry push configuration
+	// Internal registry push configuration (not supported by secure builds because
+	// the registry cannot publish their required OCI referrers).
 	UseInternalRegistry       bool   `json:"useInternalRegistry,omitempty"`       // Push to OpenShift internal registry
 	InternalRegistryImageName string `json:"internalRegistryImageName,omitempty"` // Override image name (default: build name)
 	InternalRegistryTag       string `json:"internalRegistryTag,omitempty"`       // Tag for internal registry image (default: "bootc" for bootc mode, "disk" for disk/traditional mode)
 
-	// Secure build: resolve tasks from signed Tekton Bundle
+	// Secure build: pin Tekton tasks and locked inputs, then assemble without network.
+	// Task bundle signature verification depends on OperatorConfig.taskBundleVerify.
 	SecureBuild bool `json:"secureBuild,omitempty"`
 
 	// TaskBundleRef overrides OperatorConfig's taskBundleRef (for reproducible rebuilds)

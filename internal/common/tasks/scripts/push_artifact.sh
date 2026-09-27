@@ -445,4 +445,18 @@ if [ "$SECURE_BUILD" = "true" ] || [ "$REPRODUCIBLE" = "true" ]; then
   cd /workspace/shared || exit 1
   attach_referrer "./aib.lock" \
     "$OCI_REFERRER_TYPE_AIB_LOCKFILE" "AIB lockfile"
+  locked_rpm_count=$(python3 - "./aib.lock" <<'PYEOF'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as source:
+    lock = json.load(source)
+depsolves = lock.get("depsolves", {})
+print(int(any(entry.get("packages") or entry.get("source") for entry in depsolves.values())))
+PYEOF
+  ) || { echo "ERROR: failed to inspect AIB lockfile for RPM inputs"; exit 1; }
+  if [ "$locked_rpm_count" = 1 ]; then
+    [ -s "./hermeto-rpm-bom.json" ] || { echo "ERROR: Hermeto RPM SBOM is missing for locked RPM inputs"; exit 1; }
+    attach_referrer "./hermeto-rpm-bom.json" \
+      "$OCI_REFERRER_TYPE_HERMETO_RPM_SBOM" "Hermeto RPM SBOM"
+  fi
 fi

@@ -187,7 +187,7 @@ func NewImageCmd(opts Options) *cobra.Command {
 	buildCmd.Flags().StringVar(opts.ExporterSelector, "exporter", "", "direct exporter selector for flash (alternative to --target lookup)")
 	buildCmd.Flags().StringArrayVar(opts.LeaseTags, "lease-tag", []string{}, "tag for Jumpstarter lease (key=value, can be repeated)")
 	// Secure build
-	buildCmd.Flags().BoolVar(opts.SecureBuild, "secure", false, "resolve tasks from signed Tekton Bundle (requires OperatorConfig taskBundleRef)")
+	buildCmd.Flags().BoolVar(opts.SecureBuild, "secure", false, "use digest-pinned tasks and locked inputs for network-isolated AIB assembly (requires taskBundleRef; OCI output requires referrer support)")
 	buildCmd.Flags().StringVar(opts.TTL, "ttl", "", "time-to-live for the build (e.g. 24h, 72h, 168h); empty=server default, 0=no expiry")
 	// Reproducible build
 	buildCmd.Flags().BoolVar(opts.Reproducible, "reproducible", false, "save RPMs, manifest, lockfile, and task bundle for future reproduction (requires --secure)")
@@ -268,7 +268,7 @@ func NewImageCmd(opts Options) *cobra.Command {
 	diskCmd.Flags().StringVar(opts.ExporterSelector, "exporter", "", "direct exporter selector for flash (alternative to --target lookup)")
 	diskCmd.Flags().StringArrayVar(opts.LeaseTags, "lease-tag", []string{}, "tag for Jumpstarter lease (key=value, can be repeated)")
 	// Secure build
-	diskCmd.Flags().BoolVar(opts.SecureBuild, "secure", false, "resolve tasks from signed Tekton Bundle (requires OperatorConfig taskBundleRef)")
+	diskCmd.Flags().BoolVar(opts.SecureBuild, "secure", false, "not supported for disk-only conversion; use image build or build-dev for secure builds")
 	diskCmd.Flags().StringVar(opts.TTL, "ttl", "", "time-to-live for the build (e.g. 24h, 72h, 168h); empty=server default, 0=no expiry")
 	diskCmd.Flags().StringVar(opts.TaskBundleRef, "task-bundle-ref", "", "digest-pinned Tekton bundle ref for reproducible rebuild (e.g. quay.io/org/tasks@sha256:abc...)")
 	// Internal registry options
@@ -320,7 +320,7 @@ func NewImageCmd(opts Options) *cobra.Command {
 	buildDevCmd.Flags().StringVar(opts.ExporterSelector, "exporter", "", "direct exporter selector for flash (alternative to --target lookup)")
 	buildDevCmd.Flags().StringArrayVar(opts.LeaseTags, "lease-tag", []string{}, "tag for Jumpstarter lease (key=value, can be repeated)")
 	// Secure build
-	buildDevCmd.Flags().BoolVar(opts.SecureBuild, "secure", false, "resolve tasks from signed Tekton Bundle (requires OperatorConfig taskBundleRef)")
+	buildDevCmd.Flags().BoolVar(opts.SecureBuild, "secure", false, "use digest-pinned tasks and locked inputs for network-isolated AIB assembly (requires taskBundleRef; OCI output requires referrer support)")
 	buildDevCmd.Flags().StringVar(opts.TTL, "ttl", "", "time-to-live for the build (e.g. 24h, 72h, 168h); empty=server default, 0=no expiry")
 	// Reproducible build
 	buildDevCmd.Flags().BoolVar(opts.Reproducible, "reproducible", false, "save RPMs, manifest, lockfile, and task bundle for future reproduction (requires --secure)")

@@ -253,15 +253,15 @@ func TestRestoreRecordedLock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, rest, ok := strings.Cut(string(data), "restore_sources_if_requested() {")
+	_, rest, ok := strings.Cut(string(data), "select_single_referrer_digest() {")
 	if !ok {
-		t.Fatal("restore function missing")
+		t.Fatal("restore helpers missing")
 	}
 	body, _, ok := strings.Cut(rest, "\nprepare_build_directory\n")
 	if !ok {
 		t.Fatal("restore boundary missing")
 	}
-	for _, scenario := range []string{"restore", "oras 1.2", "matching", "mismatch", "missing", "ambiguous", "pull failure"} {
+	for _, scenario := range []string{"restore", "oras 1.2", "matching", "mismatch", "missing", "ambiguous", "missing sources", "ambiguous sources", "pull failure"} {
 		t.Run(scenario, func(t *testing.T) {
 			dir := t.TempDir()
 			lock := filepath.Join(dir, "aib.lock")
@@ -283,6 +283,8 @@ oras() {
  if [ "$operation" = discover ]; then
    [[ "$1" = *@sha256:* ]] || exit 90
    if [ "$3" = sources ]; then
+     if [ "$SCENARIO" = 'missing sources' ]; then printf '{"referrers":[]}\n'; return; fi
+     if [ "$SCENARIO" = 'ambiguous sources' ]; then printf '{"referrers":[{},{}]}\n'; return; fi
      if [ "$SCENARIO" = 'oras 1.2' ]; then printf '{"manifests":[{"digest":"sha256:%064d"}]}\n' 2;
      else printf '{"reference":"image@sha256:%064d","digest":"sha256:%064d","referrers":[{"digest":"sha256:%064d"}]}\n' 1 1 2; fi
      return
@@ -305,7 +307,7 @@ oras() {
    fi
  fi
 }
-` + "restore_sources_if_requested() {" + body + "\nrestore_sources_if_requested\necho RESTORED\n"
+` + "select_single_referrer_digest() {" + body + "\nrestore_sources_if_requested\necho RESTORED\n"
 			cmd := exec.Command("bash", "-c", script)
 			cmd.Env = append(os.Environ(), "SECURE_BUILD=true", "REPRODUCIBLE=false", "RESTORE_SOURCES_REF=registry.example:5000/test/image:old", "REGISTRY_AUTH_FILE=", "AIB_LOCKFILE="+lock, "BUILD_DIR="+filepath.Join(dir, "build"), "FIXTURE="+filepath.Join(dir, "fixture"), "SCENARIO="+scenario, "OCI_REFERRER_TYPE_BUILD_SOURCES=sources", "OCI_REFERRER_TYPE_AIB_LOCKFILE=lock")
 			output, err := cmd.CombinedOutput()

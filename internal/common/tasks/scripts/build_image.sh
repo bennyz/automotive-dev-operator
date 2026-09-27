@@ -23,7 +23,7 @@ BUILD_START_TIME=$(date +%s)
 : "${EXPORT_FORMAT:=}"
 : "${HERMETO_PREFETCH:=false}"
 : "${RESOLVE_ONLY:=false}"
-: "${HERMETO_IMAGE:=ghcr.io/hermetoproject/hermeto@sha256:8dc7d791fb7d874d208e145934e812e51736eea495fd2f11ad3a3acd5e831eff}"
+: "${HERMETO_IMAGE:=}"
 
 BUILD_DIR=""
 LOCAL_BUILDER_IMAGE=""
@@ -37,6 +37,7 @@ AIB_VERSION=""
 AIB_IMAGE_PINNED=""
 FINAL_NAME=""
 AIB_BUILD_NETWORK_DISABLED=false
+AIB_SOURCE_PREFETCH_REQUIRED=false
 
 cleanup() {
   local status=$?
@@ -74,6 +75,7 @@ validate_config() {
   [ -n "$TARGET" ] || fail "target is required"
   [ -n "$TARGET_ARCH" ] || fail "target architecture is required"
   [ -n "$AIB_IMAGE_REF" ] || fail "automotive-image-builder is required"
+  [ -n "$HERMETO_IMAGE" ] || fail "hermeto-image is required"
 
   case "$BUILD_MODE" in
     bootc|image|package|disk) ;;
@@ -216,6 +218,10 @@ prepare_build_directory() {
   fi
 }
 
+select_single_referrer_digest() {
+  python3 -c 'import json,sys; data=json.load(sys.stdin); refs=data.get("referrers", data.get("manifests", [])); len(refs) == 1 or sys.exit(f"restore requires exactly one {sys.argv[1]} referrer, found {len(refs)}"); print(refs[0]["digest"])' "$1"
+}
+
 restore_sources_if_requested() {
   [ -n "$RESTORE_SOURCES_REF" ] || return 0
 
@@ -238,8 +244,8 @@ restore_sources_if_requested() {
   local sources_digest sources_repo sources_archive
   sources_digest=$(oras discover "${auth_flags[@]}" "$restore_subject" \
     --artifact-type "$OCI_REFERRER_TYPE_BUILD_SOURCES" --format json \
-    | python3 -c 'import json,sys; data=json.load(sys.stdin); refs=data.get("referrers", data.get("manifests", [])); print(refs[0]["digest"] if refs else "")' || true)
-  [ -n "$sources_digest" ] || fail "no sources referrer found for $RESTORE_SOURCES_REF"
+    | select_single_referrer_digest sources) \
+    || fail "restore requires exactly one sources referrer for $RESTORE_SOURCES_REF"
 
   # Referrers belong to a digest subject. Drop a tag before constructing digest refs.
   sources_repo="${RESTORE_SOURCES_REF%%@*}"
@@ -251,7 +257,7 @@ restore_sources_if_requested() {
     local lock_digest
     lock_digest=$(oras discover "${auth_flags[@]}" "$restore_subject" \
       --artifact-type "$OCI_REFERRER_TYPE_AIB_LOCKFILE" --format json \
-      | python3 -c 'import json,sys; data=json.load(sys.stdin); refs=data.get("referrers", data.get("manifests", [])); assert len(refs) == 1, "restore requires exactly one lockfile referrer"; print(refs[0]["digest"])') \
+      | select_single_referrer_digest lockfile) \
       || fail "restore requires the recorded lockfile; refusing to resolve new dependencies"
     mkdir -p "$RESTORE_TMPDIR/lock"
     oras pull "${auth_flags[@]}" "${sources_repo}@${lock_digest}" -o "$RESTORE_TMPDIR/lock" \
@@ -481,6 +487,9 @@ prepare_builder_if_needed() {
     fi
 
     if [ "$builder_cached" = "false" ]; then
+      if [ "$SECURE_BUILD" = "true" ]; then
+        echo "WARNING: bootc helper builder preparation is online and is not covered by the application lockfile; only final AIB assembly is network-isolated"
+      fi
       echo "Building builder image $LOCAL_BUILDER_IMAGE"
       aib --verbose build-builder --build-dir "$BUILD_DIR" --cache "$BUILD_DIR/dnf-cache" \
         --distro "$DISTRO" "${CUSTOM_DEFS_ARGS[@]}" "$LOCAL_BUILDER_IMAGE"
@@ -580,6 +589,33 @@ elif [ "$REPRODUCIBLE" = "true" ]; then
 fi
 
 run_aib_command() {
+  run_aib_command_impl true "$@"
+}
+
+run_aib_followup_command() {
+  run_aib_command_impl false "$@"
+}
+
+prefetch_locked_sources() {
+  [ "$AIB_SOURCE_PREFETCH_REQUIRED" = "true" ] || return 0
+
+  local binary="$1"
+  shift
+  local -a command=("$binary" --verbose build --dry-run "$@")
+  if [ -n "$RESTORE_SOURCES_REF" ]; then
+    command=(unshare --net -- "${command[@]}")
+    echo "Checking restored locked sources without network access"
+  else
+    echo "Prefetching non-RPM locked sources with AIB before offline assembly"
+  fi
+  "${command[@]}" || fail "AIB locked source prefetch failed"
+  verify_locked_non_rpm_sources "$AIB_LOCKFILE" "$BUILD_DIR/osbuild_store/sources" \
+    || fail "locked non-RPM source verification failed"
+}
+
+run_aib_command_impl() {
+  local record_result="$1"
+  shift
   local description="$1"
   shift
   local -a command=("$@")
@@ -589,9 +625,11 @@ run_aib_command() {
     echo "AIB build network disabled; locked RPMs must come from the osbuild source store"
   fi
 
-  AIB_COMMAND=$(printf '%q ' "${command[@]}")
-  AIB_COMMAND="${AIB_COMMAND% }"
-  write_result aib-command "$AIB_COMMAND"
+  if [ "$record_result" = "true" ]; then
+    AIB_COMMAND=$(printf '%q ' "${command[@]}")
+    AIB_COMMAND="${AIB_COMMAND% }"
+    write_result aib-command "$AIB_COMMAND"
+  fi
   echo "$description"
   emit_progress "Building image" "$STEP_BUILD" "$PROGRESS_TOTAL"
   "${command[@]}"
@@ -693,17 +731,16 @@ run_bootc() {
     disk_output_args=("/output/${EXPORT_FILE}")
   fi
 
-  local -a command=(
-    aib --verbose build
+  local -a build_args=(
     --distro "$DISTRO"
     --target "$TARGET"
     --arch="$ARCH"
     "${COMMON_BUILD_ARGS[@]}"
   )
   if [ "$SPLIT_BUILD" = "false" ]; then
-    command+=("${FORMAT_ARGS[@]}")
+    build_args+=("${FORMAT_ARGS[@]}")
   fi
-  command+=(
+  build_args+=(
     "${BUILD_CONTAINER_ARGS[@]}"
     "${CUSTOM_DEFS_ARGS[@]}"
     "${AIB_EXTRA_ARGS[@]}"
@@ -714,13 +751,17 @@ run_bootc() {
     "${disk_output_args[@]}"
   )
 
+  local -a command=(aib --verbose build "${build_args[@]}")
+  prefetch_locked_sources aib "${build_args[@]}"
   run_aib_command "Running bootc build" "${command[@]}"
   start_container_push
 
   if [ "$SPLIT_BUILD" = "true" ]; then
     local disk_start
     disk_start=$(date +%s)
-    run_aib_command "Creating disk image" aib --verbose to-disk-image \
+    # Conversion consumes the local bootc image and remains network-isolated,
+    # but the primary build command is the provenance-bearing operation.
+    run_aib_followup_command "Creating disk image" aib --verbose to-disk-image \
       "${FORMAT_ARGS[@]}" \
       "${BUILD_CONTAINER_ARGS[@]}" \
       "${AIB_EXTRA_ARGS[@]}" \
@@ -731,8 +772,7 @@ run_bootc() {
 }
 
 run_traditional() {
-  local -a command=(
-    aib-dev --verbose build
+  local -a build_args=(
     "${CUSTOM_DEFS_ARGS[@]}"
     --distro "$DISTRO"
     --target "$TARGET"
@@ -745,6 +785,8 @@ run_traditional() {
     "$MANIFEST_FILE"
     "/output/${EXPORT_FILE}"
   )
+  local -a command=(aib-dev --verbose build "${build_args[@]}")
+  prefetch_locked_sources aib-dev "${build_args[@]}"
   run_aib_command "Running $BUILD_MODE build" "${command[@]}"
 }
 
@@ -937,6 +979,15 @@ write_container_results() {
       --artifact-type "$OCI_REFERRER_TYPE_AIB_LOCKFILE" \
       "${CONTAINER_PUSH}@${pushed_digest}" "$AIB_LOCKFILE:$OCI_REFERRER_TYPE_AIB_LOCKFILE" \
       || fail "failed to attach container lockfile"
+    if aib_lock_has_rpms "$AIB_LOCKFILE"; then
+      [ -s "$WORKSPACE_PATH/hermeto-rpm-bom.json" ] \
+        || fail "Hermeto RPM SBOM is missing for locked RPM inputs"
+      oras attach --disable-path-validation "${attach_args[@]}" \
+        --artifact-type "$OCI_REFERRER_TYPE_HERMETO_RPM_SBOM" \
+        "${CONTAINER_PUSH}@${pushed_digest}" \
+        "$WORKSPACE_PATH/hermeto-rpm-bom.json:$OCI_REFERRER_TYPE_HERMETO_RPM_SBOM" \
+        || fail "failed to attach Hermeto RPM SBOM"
+    fi
   fi
   write_result IMAGE_URL "$CONTAINER_PUSH"
   write_result IMAGE_DIGEST "$pushed_digest"
