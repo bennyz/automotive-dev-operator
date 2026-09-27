@@ -44,6 +44,51 @@ func TestDefaultLockfilePath(t *testing.T) {
 	}
 }
 
+func TestResolveTimeoutUsesCommandDefaultUnlessChanged(t *testing.T) {
+	timeout := 120
+	cmd := &cobra.Command{}
+	cmd.Flags().IntVar(&timeout, "timeout", defaultResolveTimeoutMinutes, "")
+	// Other commands share and overwrite this pointer during registration.
+	timeout = 120
+	if got := resolveTimeoutMinutes(cmd, timeout); got != defaultResolveTimeoutMinutes {
+		t.Fatalf("resolve timeout = %d, want %d", got, defaultResolveTimeoutMinutes)
+	}
+	if err := cmd.Flags().Set("timeout", "7"); err != nil {
+		t.Fatal(err)
+	}
+	if got := resolveTimeoutMinutes(cmd, timeout); got != 7 {
+		t.Fatalf("explicit resolve timeout = %d, want 7", got)
+	}
+}
+
+func TestResolveOperationBuildName(t *testing.T) {
+	for _, tc := range []struct {
+		name, configured, want string
+	}{
+		{name: "default", want: "example-resolve"},
+		{name: "explicit", configured: "custom", want: "custom"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := newTestOpts()
+			opts.BuildName = new(tc.configured)
+			if err := NewHandler(opts).resolveOperationBuildName("example.aib.yml"); err != nil {
+				t.Fatal(err)
+			}
+			if *opts.BuildName != tc.want {
+				t.Fatalf("resolve name = %q, want %q", *opts.BuildName, tc.want)
+			}
+		})
+	}
+	t.Run("default name exceeds limit after suffix", func(t *testing.T) {
+		opts := newTestOpts()
+		opts.BuildName = new(string)
+		manifest := strings.Repeat("a", 57) + ".aib.yml"
+		if err := NewHandler(opts).resolveOperationBuildName(manifest); err == nil {
+			t.Fatal("expected generated resolve name to be rejected")
+		}
+	})
+}
+
 func TestResolveSubmitsClusterOperation(t *testing.T) {
 	for _, tc := range []struct {
 		name         string
@@ -100,7 +145,7 @@ func TestResolveSubmitsClusterOperation(t *testing.T) {
 					if tc.name == "delayed token" && polls > 1 {
 						token = "registry-token"
 					}
-					if err := json.NewEncoder(w).Encode(buildapi.BuildResponse{Name: "resolve-test", Phase: "Completed", DiskImage: "registry.example/lock:latest", RegistryToken: token}); err != nil {
+					if err := json.NewEncoder(w).Encode(buildapi.BuildResponse{Name: "resolve-test", Phase: "Completed", LockfileArtifact: "registry.example/lock:latest", RegistryToken: token}); err != nil {
 						t.Error(err)
 					}
 					return

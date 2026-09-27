@@ -285,6 +285,9 @@ components:
           type: string
         diskImage:
           type: string
+        lockfileArtifact:
+          description: Published lockfile artifact reference for resolve-only operations
+          type: string
         externalId:
           $ref: '#/components/schemas/ExternalID'
         flash:
@@ -522,6 +525,9 @@ components:
           type: string
         diskImage:
           description: Disk image artifact reference
+          type: string
+        lockfileArtifact:
+          description: Published lockfile artifact reference for resolve-only operations
           type: string
         expiresAt:
           description: When terminal build resources expire. The ImageBuild and its terminal result remain.

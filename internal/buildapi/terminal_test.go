@@ -19,6 +19,46 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
+func TestClassifyBuildArtifactURLs(t *testing.T) {
+	for _, tc := range []struct {
+		name               string
+		resolveOnly        bool
+		wantDisk, wantLock string
+	}{
+		{name: "image build", wantDisk: "registry.example/disk"},
+		{name: "resolve", resolveOnly: true, wantLock: "registry.example/disk"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			build := &api.ImageBuild{Spec: api.ImageBuildSpec{AIB: &api.AIBSpec{ResolveOnly: tc.resolveOnly}}}
+			container, disk, lockfile := classifyBuildArtifactURLs(build, "registry.example/container", "registry.example/disk")
+			if container != "registry.example/container" || disk != tc.wantDisk || lockfile != tc.wantLock {
+				t.Fatalf("classified URLs = %q, %q, %q", container, disk, lockfile)
+			}
+		})
+	}
+}
+
+func TestStoredResolveArtifacts(t *testing.T) {
+	build := &api.ImageBuild{Spec: api.ImageBuildSpec{AIB: &api.AIBSpec{ResolveOnly: true}}, Status: api.ImageBuildStatus{
+		Artifacts: []api.ArtifactStatus{{Kind: "disk", URL: "registry.example/lock"}},
+	}}
+	artifacts := storedArtifacts(build)
+	if len(artifacts) != 1 || artifacts[0].Kind != "lockfile" || artifacts[0].URL != "registry.example/lock" {
+		t.Fatalf("projected artifacts = %#v", artifacts)
+	}
+	if build.Status.Artifacts[0].Kind != "disk" {
+		t.Fatal("stored status was mutated")
+	}
+	_, disk := storedArtifactURLs(build)
+	if disk != "registry.example/lock" {
+		t.Fatalf("stored artifact URL = %q", disk)
+	}
+	build.Status.TerminalResult = &api.BuildTerminalResult{Artifacts: []api.ArtifactStatus{{Kind: "disk", URL: "registry.example/terminal-lock"}}}
+	if got := storedArtifacts(build); len(got) != 1 || got[0].Kind != "lockfile" || got[0].URL != "registry.example/terminal-lock" {
+		t.Fatalf("projected terminal artifacts = %#v", got)
+	}
+}
+
 func TestStoredTerminalAPIProjection(t *testing.T) {
 	t.Setenv("BUILD_API_NAMESPACE", "test-ns")
 	scheme := runtime.NewScheme()

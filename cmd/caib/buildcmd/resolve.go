@@ -18,6 +18,8 @@ import (
 	"github.com/spf13/cobra"
 )
 
+const defaultResolveTimeoutMinutes = 30
+
 func resolveArchitecture(architecture string) (string, error) {
 	switch architecture {
 	case "amd64", "x86_64":
@@ -31,6 +33,24 @@ func resolveArchitecture(architecture string) (string, error) {
 
 func defaultLockfilePath(manifestPath string) string {
 	return strings.TrimSuffix(manifestPath, filepath.Ext(manifestPath)) + ".lock"
+}
+
+func resolveTimeoutMinutes(cmd *cobra.Command, configured int) int {
+	if cmd.Flags().Changed("timeout") {
+		return configured
+	}
+	return defaultResolveTimeoutMinutes
+}
+
+func (h *Handler) resolveOperationBuildName(manifestPath string) error {
+	explicitName := *h.opts.BuildName != ""
+	if err := h.resolveManifestBuildName(manifestPath); err != nil {
+		return err
+	}
+	if !explicitName {
+		*h.opts.BuildName += "-resolve"
+	}
+	return common.ValidateBuildName(*h.opts.BuildName)
 }
 
 // RunResolve submits dependency resolution to the cluster and downloads its lockfile.
@@ -53,7 +73,7 @@ func (h *Handler) resolveLockfile(ctx context.Context, cmd *cobra.Command, manif
 		return fmt.Errorf("read manifest: %w", err)
 	}
 	h.resolveTarget(cmd, common.ManifestTarget(manifest))
-	if err := h.resolveManifestBuildName(manifestPath); err != nil {
+	if err := h.resolveOperationBuildName(manifestPath); err != nil {
 		return err
 	}
 	architecture, err := resolveArchitecture(*h.opts.Architecture)
@@ -64,10 +84,11 @@ func (h *Handler) resolveLockfile(ctx context.Context, cmd *cobra.Command, manif
 	if err != nil {
 		return err
 	}
-	if *h.opts.Timeout <= 0 {
+	timeoutMinutes := resolveTimeoutMinutes(cmd, *h.opts.Timeout)
+	if timeoutMinutes <= 0 {
 		return fmt.Errorf("--timeout must be positive")
 	}
-	ctx, cancel := context.WithTimeout(ctx, time.Duration(*h.opts.Timeout)*time.Minute)
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(timeoutMinutes)*time.Minute)
 	defer cancel()
 	api, err := common.CreateBuildAPIClient(*h.opts.ServerURL, h.opts.AuthToken, *h.opts.InsecureSkipTLS)
 	if err != nil {
@@ -126,7 +147,7 @@ func (h *Handler) resolveLockfile(ctx context.Context, cmd *cobra.Command, manif
 		} else {
 			switch st.Phase {
 			case "Completed":
-				if st.DiskImage == "" {
+				if st.LockfileArtifact == "" {
 					return fmt.Errorf("resolution %s completed without a lockfile artifact", resp.Name)
 				}
 				if st.RegistryToken == "" {
@@ -137,7 +158,7 @@ func (h *Handler) resolveLockfile(ctx context.Context, cmd *cobra.Command, manif
 				if outputPath == "" {
 					outputPath = defaultLockfilePath(manifestPath)
 				}
-				return downloadResolvedLockfile(ctx, st.DiskImage, st.RegistryToken, outputPath, *h.opts.InsecureSkipTLS, common.PullOCIArtifactWithContext)
+				return downloadResolvedLockfile(ctx, st.LockfileArtifact, st.RegistryToken, outputPath, *h.opts.InsecureSkipTLS, common.PullOCIArtifactWithContext)
 			case "Failed", "Cancelled", "Expired":
 				return fmt.Errorf("resolution %s %s: %s", resp.Name, st.Phase, st.Message)
 			}

@@ -429,4 +429,7 @@ func TestResolveCommandFlags(t *testing.T) {
 			t.Errorf("image resolve missing --%s", name)
 		}
 	}
+	if got := cmd.Flags().Lookup("name").Shorthand; got != "n" {
+		t.Errorf("image resolve --name shorthand = %q, want n", got)
+	}
 }

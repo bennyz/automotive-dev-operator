@@ -201,7 +201,7 @@ func NewImageCmd(opts Options) *cobra.Command {
 
 	resolveCmd.Flags().StringVar(opts.ServerURL, "server", defaultServer, "REST API server base URL")
 	resolveCmd.Flags().StringVar(opts.AuthToken, "token", os.Getenv("CAIB_TOKEN"), "Bearer token for authentication")
-	resolveCmd.Flags().StringVar(opts.BuildName, "name", "", "cluster operation name (default: manifest name)")
+	resolveCmd.Flags().StringVarP(opts.BuildName, "name", "n", "", "cluster operation name (default: manifest name with -resolve suffix)")
 	resolveCmd.Flags().IntVar(opts.Timeout, "timeout", 30, "resolution timeout in minutes")
 	resolveCmd.Flags().StringVar(opts.TTL, "ttl", "", "retention after completion (0 keeps the operation)")
 	resolveCmd.Flags().StringVarP(opts.Distro, "distro", "d", "autosd", "distribution to resolve")
