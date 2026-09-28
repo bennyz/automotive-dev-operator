@@ -291,6 +291,19 @@ func TestPrintBuildDetails_TraceID(t *testing.T) {
 	}
 }
 
+func TestPrintBuildDetails_ArchitectureSource(t *testing.T) {
+	resp := &buildapitypes.BuildResponse{
+		Name: "git-build", Phase: "Completed", ArchitectureSource: "client-fallback",
+		Parameters: &buildapitypes.BuildParameters{Architecture: "amd64"},
+	}
+	out := captureStdout(t, func() { _ = printBuildDetails(resp) })
+	for _, want := range []string{"Architecture", "amd64", "Architecture Source", "client-fallback"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing %q in show output: %s", want, out)
+		}
+	}
+}
+
 func TestPrintBuildDetails_NotificationFailure(t *testing.T) {
 	resp := &buildapitypes.BuildResponse{
 		Name: "test-build", Phase: "Completed", ExternalID: "pipeline-42",

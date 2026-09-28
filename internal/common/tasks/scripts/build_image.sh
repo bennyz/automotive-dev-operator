@@ -317,7 +317,7 @@ if [ -f "$SOURCE_METADATA_PATH" ]; then
 fi
 LOCKFILE_PATH="$MANIFEST_CONFIG_PATH/aib.lock"
 if [ -f "$MANIFEST_CONFIG_PATH/git-manifest-path" ]; then
-  LOCKFILE_PATH="$(dirname "$MANIFEST_FILE")/aib.lock"
+  LOCKFILE_PATH="$WORKSPACE_PATH/.caib-source/repository/$(cat "$WORKSPACE_PATH/.caib-source/lockfile-path")"
 fi
 
 resolve_dependency_lock() {

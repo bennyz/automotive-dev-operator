@@ -27,6 +27,8 @@ const (
 	Distro                   = "automotive.sdv.cloud.redhat.com/distro"
 	Target                   = "automotive.sdv.cloud.redhat.com/target"
 	Architecture             = "automotive.sdv.cloud.redhat.com/architecture"
+	DefaultArchitecture      = "automotive.sdv.cloud.redhat.com/default-architecture"
+	ArchitectureSource       = "automotive.sdv.cloud.redhat.com/architecture-source"
 )
 
 // ManagedBy and related constants are standard Kubernetes label keys.

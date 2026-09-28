@@ -137,6 +137,12 @@ spec:
                                   Secret.
                                 maxLength: 253
                                 type: string
+                              lockfilePath:
+                                description: |-
+                                  LockfilePath optionally selects a repository-relative lockfile. When set,
+                                  the file must exist in the selected commit.
+                                maxLength: 1024
+                                type: string
                               manifestPath:
                                 description: ManifestPath is relative to the repository
                                   root.

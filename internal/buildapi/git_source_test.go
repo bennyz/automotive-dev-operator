@@ -46,15 +46,45 @@ func TestGitSourceRequest(t *testing.T) {
 }
 
 func TestGitSourceDefaultsDeferred(t *testing.T) {
-	r := BuildRequest{GitSource: &api.GitSource{URL: "https://git.example.com/os.git", ManifestPath: "demo.aib.yml"}}
+	r := BuildRequest{GitSource: &api.GitSource{URL: "https://git.example.com/os.git", ManifestPath: "demo.aib.yml"}, ArchitectureFallback: "x86_64"}
 	if err := applyBuildDefaults(&r); err != nil {
 		t.Fatal(err)
 	}
-	if r.Target != "" || r.Architecture != "" || r.ExportFormat != "" {
+	if r.Target != "" || r.Architecture != "" || r.ArchitectureFallback != "amd64" || r.ExportFormat != "" {
 		t.Fatalf("premature defaults: %+v", r)
 	}
 	r.Target = " "
 	if err := applyBuildDefaults(&r); err == nil {
 		t.Fatal("explicit whitespace target accepted")
+	}
+}
+
+func TestGitArchitectureFallbackValidation(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		git      bool
+		arch     Architecture
+		fallback Architecture
+		invalid  bool
+	}{
+		{name: "git fallback", git: true, fallback: "amd64"},
+		{name: "non-git fallback", fallback: "amd64", invalid: true},
+		{name: "explicit and fallback", git: true, arch: "arm64", fallback: "amd64", invalid: true},
+		{name: "invalid fallback", git: true, fallback: "ppc64le", invalid: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			req := BuildRequest{Name: "test", Manifest: "name: test", Architecture: tt.arch, ArchitectureFallback: tt.fallback}
+			if tt.git {
+				req.GitSource = &api.GitSource{URL: "https://git.example.com/os.git", ManifestPath: "demo.aib.yml"}
+				req.Manifest = ""
+			}
+			err := validateBuildRequest(&req)
+			if err == nil {
+				err = applyBuildDefaults(&req)
+			}
+			if (err != nil) != tt.invalid {
+				t.Fatalf("validation error = %v, request = %+v", err, req)
+			}
+		})
 	}
 }

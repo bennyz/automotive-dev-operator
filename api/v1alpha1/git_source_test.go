@@ -31,6 +31,47 @@ func TestValidateGitSource(t *testing.T) {
 	}
 }
 
+func TestNormalizeGitArchitectureFallback(t *testing.T) {
+	for _, tt := range []struct {
+		value, want string
+		invalid     bool
+	}{
+		{value: "", want: ""},
+		{value: "x86_64", want: "amd64"},
+		{value: "aarch64", want: "arm64"},
+		{value: "amd64", want: "amd64"},
+		{value: " ", invalid: true},
+		{value: "ppc64le", invalid: true},
+	} {
+		got, err := NormalizeGitArchitectureFallback(tt.value)
+		if (err != nil) != tt.invalid || got != tt.want {
+			t.Fatalf("fallback %q: got %q, error %v", tt.value, got, err)
+		}
+	}
+}
+
+func TestValidateGitLockfilePath(t *testing.T) {
+	for _, tt := range []struct {
+		path    string
+		invalid bool
+	}{
+		{"", false},
+		{"images/demo.aib.lock", false},
+		{"locks/release.json", false},
+		{"../outside.lock", true},
+		{"/absolute.lock", true},
+		{"locks/../release.lock", true},
+		{"locks\\release.lock", true},
+		{".", true},
+		{"..", true},
+	} {
+		source := &GitSource{URL: "https://git.example.com/os.git", ManifestPath: "demo.aib.yml", LockfilePath: tt.path}
+		if err := ValidateGitSource(source); (err != nil) != tt.invalid {
+			t.Fatalf("path %q: error=%v, invalid=%v", tt.path, err, tt.invalid)
+		}
+	}
+}
+
 func TestValidateGitCredentialsSecret(t *testing.T) {
 	source := &GitSource{URL: "https://git.example.com/team/os.git"}
 	secret := &corev1.Secret{

@@ -267,6 +267,9 @@ func printBuildDetails(st *buildapitypes.BuildResponse) error {
 			[2]string{"AIB Image", valueOrDash(st.Parameters.AutomotiveImageBuilder)},
 			[2]string{"Builder Image", valueOrDash(st.Parameters.BuilderImage)},
 		)
+		if st.ArchitectureSource != "" {
+			rows = append(rows, [2]string{"Architecture Source", st.ArchitectureSource})
+		}
 	}
 
 	if st.Jumpstarter != nil {

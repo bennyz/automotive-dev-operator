@@ -60,6 +60,7 @@ type Options struct {
 	GitURL                 *string
 	GitRef                 *string
 	GitSecret              *string
+	GitLockfile            *string
 	Lockfile               *string
 	RootPassword           *string
 	ExtraRepos             *[]string

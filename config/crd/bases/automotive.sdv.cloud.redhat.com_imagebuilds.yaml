@@ -76,6 +76,12 @@ spec:
                           Secret.
                         maxLength: 253
                         type: string
+                      lockfilePath:
+                        description: |-
+                          LockfilePath optionally selects a repository-relative lockfile. When set,
+                          the file must exist in the selected commit.
+                        maxLength: 1024
+                        type: string
                       manifestPath:
                         description: ManifestPath is relative to the repository root.
                         maxLength: 1024
@@ -470,6 +476,13 @@ spec:
                   - type
                   type: object
                 type: array
+              discoveredCommit:
+                description: DiscoveredCommit pins the revision found before the workspace
+                  PVC is used.
+                type: string
+              discoveredTarget:
+                description: DiscoveredTarget is the manifest target found at DiscoveredCommit.
+                type: string
               expiresAt:
                 description: |-
                   ExpiresAt is when this build will transition to the Expired phase
@@ -646,6 +659,12 @@ spec:
             - message: terminal result cannot be removed
               rule: '!has(oldSelf.terminalResult) || has(self.terminalResult)'
         type: object
+        x-kubernetes-validations:
+        - message: gitSource is immutable
+          rule: (has(self.spec) && has(self.spec.aib) && has(self.spec.aib.gitSource))
+            == (has(oldSelf.spec) && has(oldSelf.spec.aib) && has(oldSelf.spec.aib.gitSource))
+            && (!(has(self.spec) && has(self.spec.aib) && has(self.spec.aib.gitSource))
+            || self.spec.aib.gitSource == oldSelf.spec.aib.gitSource)
     served: true
     storage: true
     subresources:

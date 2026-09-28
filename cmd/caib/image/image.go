@@ -53,6 +53,7 @@ type Options struct {
 	GitURL                 *string
 	GitRef                 *string
 	GitSecret              *string
+	GitLockfile            *string
 	Lockfile               *string
 	RootPassword           *string
 	ExtraRepos             *[]string
@@ -456,7 +457,7 @@ Examples:
   # Build container + create disk image
   caib image build manifest.aib.yml --push quay.io/org/my-os:v1 --disk -o disk.qcow2
 
-  # Build a manifest from a Git commit (an adjacent aib.lock is used when present)
+  # Build a manifest from a Git commit (its adjacent <manifest>.lock is used when present)
   caib image build images/my-os.aib.yml --git-url https://git.example.com/team/os.git --git-ref main --push quay.io/org/my-os:v1`,
 		Args: cobra.ExactArgs(1),
 		Run:  opts.RunBuild,

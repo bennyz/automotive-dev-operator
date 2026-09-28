@@ -1487,6 +1487,12 @@ func (a *APIServer) createBuild(c *gin.Context) {
 		automotivev1alpha1.AnnotationRequestedBy: requestedBy,
 		automotivev1alpha1.AnnotationTraceID:     traceID,
 	}
+	if req.ArchitectureFallback != "" {
+		annotations[labels.DefaultArchitecture] = string(req.ArchitectureFallback)
+	}
+	if req.GitSource != nil && req.Architecture != "" {
+		annotations[labels.ArchitectureSource] = "explicit"
+	}
 	callbackSecretRef := ""
 	if req.Callback != nil {
 		callbackSecretRef = notifications.CallbackSecretName(notifications.SubjectImageBuild, req.Name, uuid.NewString())
@@ -1756,14 +1762,15 @@ func (a *APIServer) getBuild(c *gin.Context, name string) {
 
 	writeJSON(c, http.StatusOK, BuildResponse{
 		ExternalID: build.Spec.ExternalID, Artifacts: storedArtifacts(build), Flash: storedFlash(build),
-		Notification: notificationStatus,
-		GitSource:    build.Spec.GetGitSource(),
-		SourceCommit: build.Status.SourceCommit,
-		Name:         build.Name,
-		Phase:        build.Status.Phase,
-		Message:      build.Status.Message,
-		RequestedBy:  build.Annotations[labels.RequestedBy],
-		TraceID:      build.Annotations[automotivev1alpha1.AnnotationTraceID],
+		Notification:       notificationStatus,
+		GitSource:          build.Spec.GetGitSource(),
+		SourceCommit:       build.Status.SourceCommit,
+		ArchitectureSource: build.Annotations[labels.ArchitectureSource],
+		Name:               build.Name,
+		Phase:              build.Status.Phase,
+		Message:            build.Status.Message,
+		RequestedBy:        build.Annotations[labels.RequestedBy],
+		TraceID:            build.Annotations[automotivev1alpha1.AnnotationTraceID],
 		StartTime: func() string {
 			if build.Status.StartTime != nil {
 				return build.Status.StartTime.Format(time.RFC3339)

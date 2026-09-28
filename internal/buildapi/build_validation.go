@@ -82,7 +82,13 @@ func validateBuildRequest(req *BuildRequest) error {
 
 func validateGitSourceRequest(req *BuildRequest) error {
 	if req.GitSource == nil {
+		if req.ArchitectureFallback != "" {
+			return fmt.Errorf("architectureFallback requires gitSource")
+		}
 		return nil
+	}
+	if req.ArchitectureFallback != "" && req.Architecture != "" {
+		return fmt.Errorf("architectureFallback cannot be combined with an explicit architecture")
 	}
 	spec := &automotivev1alpha1.ImageBuildSpec{
 		AIB: &automotivev1alpha1.AIBSpec{
@@ -154,6 +160,11 @@ func resolveAndClampTTL(ctx context.Context, k8sClient client.Client, namespace,
 
 // applyBuildDefaults sets default values for build request fields
 func applyBuildDefaults(req *BuildRequest) error {
+	fallback, err := automotivev1alpha1.NormalizeGitArchitectureFallback(string(req.ArchitectureFallback))
+	if err != nil {
+		return err
+	}
+	req.ArchitectureFallback = Architecture(fallback)
 	if req.Distro == "" {
 		req.Distro = "autosd"
 	}

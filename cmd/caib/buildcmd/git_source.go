@@ -11,21 +11,24 @@ import (
 )
 
 func (h *Handler) readBuildSource(manifestPath string) ([]byte, *api.GitSource, error) {
-	url, ref, secret := ptrStr(h.opts.GitURL), ptrStr(h.opts.GitRef), ptrStr(h.opts.GitSecret)
+	url, ref, secret, gitLockfile := ptrStr(h.opts.GitURL), ptrStr(h.opts.GitRef), ptrStr(h.opts.GitSecret), ptrStr(h.opts.GitLockfile)
 	if url == "" {
-		if ref != "" || secret != "" {
-			return nil, nil, fmt.Errorf("--git-ref and --git-secret require --git-url")
+		if ref != "" || secret != "" || gitLockfile != "" {
+			return nil, nil, fmt.Errorf("--git-ref, --git-secret, and --git-lockfile require --git-url")
 		}
 		data, err := os.ReadFile(manifestPath)
 		return data, nil, err
 	}
 	if ptrStr(h.opts.Lockfile) != "" {
-		return nil, nil, fmt.Errorf("--lockfile cannot be used with --git-url; commit aib.lock beside the manifest")
+		return nil, nil, fmt.Errorf("--lockfile cannot be used with --git-url; commit %s beside the manifest or use --git-lockfile for another committed file", path.Base(defaultLockfilePath(manifestPath)))
 	}
 	if ptrStr(h.opts.Workspace) != "" || ptrStr(h.opts.LocalRepo) != "" || (h.opts.ExtraRepos != nil && len(*h.opts.ExtraRepos) != 0) {
 		return nil, nil, fmt.Errorf("git builds do not support workspace or extra repository overlays")
 	}
-	source := &api.GitSource{URL: url, Revision: ref, ManifestPath: path.Clean(manifestPath), CredentialsSecretRef: secret}
+	if gitLockfile != "" {
+		gitLockfile = path.Clean(gitLockfile)
+	}
+	source := &api.GitSource{URL: url, Revision: ref, ManifestPath: path.Clean(manifestPath), LockfilePath: gitLockfile, CredentialsSecretRef: secret}
 	if err := api.ValidateGitSource(source); err != nil {
 		return nil, nil, err
 	}
@@ -41,6 +44,7 @@ func deferGitDefaults(cmd *cobra.Command, req *buildapi.BuildRequest) {
 		req.Target = ""
 	}
 	if !cmd.Flags().Changed("arch") {
+		req.ArchitectureFallback = req.Architecture
 		req.Architecture = ""
 	}
 	if !cmd.Flags().Changed("format") && !cmd.Flags().Changed("disk-format") {

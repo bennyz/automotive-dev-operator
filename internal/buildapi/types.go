@@ -166,6 +166,7 @@ type BuildRequest struct {
 	Distro                 Distro               `json:"distro"`
 	Target                 Target               `json:"target"`
 	Architecture           Architecture         `json:"architecture"`
+	ArchitectureFallback   Architecture         `json:"architectureFallback,omitempty"`
 	ExportFormat           ExportFormat         `json:"exportFormat"`
 	Mode                   Mode                 `json:"mode"`
 	AutomotiveImageBuilder string               `json:"automotiveImageBuilder"`
@@ -316,27 +317,28 @@ type FlashListItem struct {
 
 // BuildResponse is returned by POST and GET build operations
 type BuildResponse struct {
-	GitSource        *automotivev1alpha1.GitSource `json:"gitSource,omitempty"`
-	SourceCommit     string                        `json:"sourceCommit,omitempty"`
-	ExternalID       string                        `json:"externalId,omitempty"`
-	Artifacts        []ArtifactStatus              `json:"artifacts,omitempty"`
-	Flash            *FlashOutcomeStatus           `json:"flash,omitempty"`
-	Notification     *NotificationStatus           `json:"notification,omitempty"`
-	Name             string                        `json:"name"`
-	Phase            string                        `json:"phase"`
-	Message          string                        `json:"message"`
-	RequestedBy      string                        `json:"requestedBy,omitempty"`
-	StartTime        string                        `json:"startTime,omitempty"`
-	CompletionTime   string                        `json:"completionTime,omitempty"`
-	ContainerImage   string                        `json:"containerImage,omitempty"`
-	DiskImage        string                        `json:"diskImage,omitempty"`
-	LockfileArtifact string                        `json:"lockfileArtifact,omitempty"`
-	RegistryToken    string                        `json:"registryToken,omitempty"`
-	TraceID          string                        `json:"traceId,omitempty"`
-	Warning          string                        `json:"warning,omitempty"`
-	ExpiresAt        string                        `json:"expiresAt,omitempty"`
-	Jumpstarter      *JumpstarterInfo              `json:"jumpstarter,omitempty"`
-	Parameters       *BuildParameters              `json:"parameters,omitempty"`
+	GitSource          *automotivev1alpha1.GitSource `json:"gitSource,omitempty"`
+	SourceCommit       string                        `json:"sourceCommit,omitempty"`
+	ArchitectureSource string                        `json:"architectureSource,omitempty"`
+	ExternalID         string                        `json:"externalId,omitempty"`
+	Artifacts          []ArtifactStatus              `json:"artifacts,omitempty"`
+	Flash              *FlashOutcomeStatus           `json:"flash,omitempty"`
+	Notification       *NotificationStatus           `json:"notification,omitempty"`
+	Name               string                        `json:"name"`
+	Phase              string                        `json:"phase"`
+	Message            string                        `json:"message"`
+	RequestedBy        string                        `json:"requestedBy,omitempty"`
+	StartTime          string                        `json:"startTime,omitempty"`
+	CompletionTime     string                        `json:"completionTime,omitempty"`
+	ContainerImage     string                        `json:"containerImage,omitempty"`
+	DiskImage          string                        `json:"diskImage,omitempty"`
+	LockfileArtifact   string                        `json:"lockfileArtifact,omitempty"`
+	RegistryToken      string                        `json:"registryToken,omitempty"`
+	TraceID            string                        `json:"traceId,omitempty"`
+	Warning            string                        `json:"warning,omitempty"`
+	ExpiresAt          string                        `json:"expiresAt,omitempty"`
+	Jumpstarter        *JumpstarterInfo              `json:"jumpstarter,omitempty"`
+	Parameters         *BuildParameters              `json:"parameters,omitempty"`
 }
 
 // BuildParameters describes the key input parameters that produced an ImageBuild.

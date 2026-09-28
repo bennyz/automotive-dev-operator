@@ -125,6 +125,7 @@ caib image build <manifest.aib.yml> [flags]
 | `--git-url` | | HTTPS repository containing the manifest |
 | `--git-ref` | remote HEAD | Branch, tag, or full commit ID (requires `--git-url`) |
 | `--git-secret` | | Namespace-local basic-auth Secret for a private repository (requires `--git-url`) |
+| `--git-lockfile` | adjacent `<manifest>.lock` | Repository-relative path to a committed lockfile (requires `--git-url`) |
 | `--disk` | `false` | Also build a disk image from the container |
 | `--format` | (inferred from `-o`) | Disk image format (`qcow2`, `raw`, `simg`) |
 | `--compress` | `gzip` | Compression algorithm (`gzip`, `xz`) |
@@ -255,7 +256,7 @@ Builds a disk image (ostree or package-based) for development workflows. Creates
 caib image build-dev <manifest.aib.yml> [flags]
 ```
 
-`build-dev` accepts the same `--git-url`, `--git-ref`, and `--git-secret` options as `build`.
+`build-dev` accepts the same `--git-url`, `--git-ref`, `--git-secret`, and `--git-lockfile` options as `build`.
 
 **Required flags:**
 | Flag | Description |
@@ -578,11 +579,13 @@ caib image cancel <build-name> [flags]
 
 ## Building from Git
 
-Pass a repository-relative manifest path to `build` or `build-dev` with `--git-url`. The source TaskRun fetches one commit, checks the manifest and its referenced files, and shares that checkout with the build. If `aib.lock` is committed beside the manifest, the build uses it; there is no local lockfile override. Use `--git-ref` to choose a branch, tag, or full commit ID. `caib image show` reports the resolved commit, and build templates use that commit for a repeatable run.
+Pass a repository-relative manifest path to `build` or `build-dev` with `--git-url`. When the architecture is unknown, a PVC-free discovery TaskRun reads the manifest target before the source TaskRun checks out and validates the repository onto the build PVC. If the lockfile produced by `caib image resolve` is committed beside the manifest (for example, `simple.aib.lock` for `simple.aib.yml`), the build uses it. Use `--git-lockfile locks/release.json` to select a different committed file; an explicit selection must exist in the same commit. Local `--lockfile` overrides are not supported with Git sources. Use `--git-ref` to choose a branch, tag, or full commit ID. `caib image show` reports the resolved commit, and build templates use that commit for a repeatable run.
+
+A lockfile covers one architecture; when building the same manifest for both arm64 and amd64, commit separate locks and select the right one with `--git-lockfile`.
 
 Use `refs/tags/<name>` or `refs/heads/<name>` for a hex-only tag or branch name; an unqualified hex value shorter than a full commit ID is rejected as an abbreviated SHA. With Git sources, explicit `--extra-args` replace the target-default extra args. Omit the flag to use those defaults. The source TaskRun timeout follows `osBuilds.buildTimeoutMinutes` when configured.
 
-On clusters with topology-bound storage, pass `--arch` when the target architecture is known so the source TaskRun and build pod are scheduled on compatible nodes.
+An explicit `--arch` skips discovery. An explicit `--target` also skips it. The controller chooses the architecture from `--arch`, the target defaults, then the CLI host architecture; direct API and CR builds without a fallback use `arm64`. `caib image show` reports where the chosen architecture came from. On topology-bound or node-local storage, the checkout and build pods are then scheduled with the same architecture constraint. If the Git revision changes between discovery and checkout, the build fails rather than using a different commit; retry the build to discover the new target.
 
 ```bash
 caib image build images/demo.aib.yml \
@@ -612,7 +615,7 @@ caib image build images/demo.aib.yml \
   --git-secret team-git-auth --push quay.io/team/os:latest
 ```
 
-Git builds with `--secure` require a newly published task bundle that contains `prepare-git-source`. Bundles published before Git source support cannot resolve that task.
+Git builds with `--secure` require a newly published task bundle containing `prepare-git-source` and `discover-git-source`. Older bundles cannot resolve these tasks.
 
 ## Secure & Reproducible Builds
 

@@ -322,6 +322,12 @@ type ImageBuildStatus struct {
 	// SourceTaskRunName identifies the source preparation execution.
 	// +optional
 	SourceTaskRunName string `json:"sourceTaskRunName,omitempty"`
+	// DiscoveredCommit pins the revision found before the workspace PVC is used.
+	// +optional
+	DiscoveredCommit string `json:"discoveredCommit,omitempty"`
+	// DiscoveredTarget is the manifest target found at DiscoveredCommit.
+	// +optional
+	DiscoveredTarget string `json:"discoveredTarget,omitempty"`
 	// SourceCommit pins the checkout for this build and any execution retries.
 	// +optional
 	SourceCommit string `json:"sourceCommit,omitempty"`
@@ -402,6 +408,9 @@ type ImageBuildStatus struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
+// Keep this rule on ImageBuild: optional spec/aib removal must not bypass it,
+// while ScheduledImageBuild templates that reuse ImageBuildSpec stay editable.
+// +kubebuilder:validation:XValidation:rule="(has(self.spec) && has(self.spec.aib) && has(self.spec.aib.gitSource)) == (has(oldSelf.spec) && has(oldSelf.spec.aib) && has(oldSelf.spec.aib.gitSource)) && (!(has(self.spec) && has(self.spec.aib) && has(self.spec.aib.gitSource)) || self.spec.aib.gitSource == oldSelf.spec.aib.gitSource)",message="gitSource is immutable"
 
 // ImageBuild is the Schema for the imagebuilds API
 type ImageBuild struct {

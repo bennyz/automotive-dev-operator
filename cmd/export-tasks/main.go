@@ -45,6 +45,7 @@ func main() {
 		tasks.GeneratePrepareBuilderTask("", nil),
 		tasks.GenerateFlashTask("", nil),
 		tasks.GenerateGitSourceTask("", nil),
+		tasks.GenerateGitSourceDiscoveryTask("", nil),
 	}
 	taskList = append(taskList, tasks.GenerateSealedTasks("")...)
 

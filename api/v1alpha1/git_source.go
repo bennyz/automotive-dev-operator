@@ -13,8 +13,30 @@ import (
 
 const GitCredentialsHostAnnotation = "tekton.dev/git-0"
 
-// GitSource selects build inputs from one repository commit. An adjacent
-// aib.lock is used when present; local lockfile overrides are not supported.
+const (
+	gitArchAMD64 = "amd64"
+	gitArchARM64 = "arm64"
+)
+
+// NormalizeGitArchitectureFallback validates an optional architecture supplied
+// before the Git manifest target is known.
+func NormalizeGitArchitectureFallback(arch string) (string, error) {
+	if arch == "" {
+		return "", nil
+	}
+	switch strings.ToLower(strings.TrimSpace(arch)) {
+	case gitArchAMD64, "x86_64":
+		return gitArchAMD64, nil
+	case gitArchARM64, "aarch64":
+		return gitArchARM64, nil
+	default:
+		return "", fmt.Errorf("invalid architecture fallback %q: must be amd64, arm64, x86_64, or aarch64", arch)
+	}
+}
+
+// GitSource selects build inputs from one repository commit. A lockfile named
+// after the manifest (for example, simple.aib.lock for simple.aib.yml) is used
+// when present, unless LockfilePath selects another file in the same commit.
 type GitSource struct {
 	// +kubebuilder:validation:MaxLength=2048
 	URL string `json:"url"`
@@ -25,6 +47,11 @@ type GitSource struct {
 	// ManifestPath is relative to the repository root.
 	// +kubebuilder:validation:MaxLength=1024
 	ManifestPath string `json:"manifestPath"`
+	// LockfilePath optionally selects a repository-relative lockfile. When set,
+	// the file must exist in the selected commit.
+	// +kubebuilder:validation:MaxLength=1024
+	// +optional
+	LockfilePath string `json:"lockfilePath,omitempty"`
 	// CredentialsSecretRef references a kubernetes.io/basic-auth Secret.
 	// +kubebuilder:validation:MaxLength=253
 	// +optional
@@ -50,13 +77,20 @@ func ValidateGitSource(source *GitSource) error {
 		return fmt.Errorf("git revision must use a full commit ID; qualify a hex-only branch or tag as refs/heads/<name> or refs/tags/<name>")
 	}
 	p := source.ManifestPath
-	if p == "" || len(p) > 1024 || path.IsAbs(p) || path.Clean(p) != p || strings.HasPrefix(p, "../") || strings.ContainsAny(p, "\\\r\n\x00") || (!strings.HasSuffix(p, ".aib.yml") && !strings.HasSuffix(p, ".mpp.yml")) {
+	if !cleanGitRepositoryPath(p) || (!strings.HasSuffix(p, ".aib.yml") && !strings.HasSuffix(p, ".mpp.yml")) {
 		return fmt.Errorf("git manifest path must be a clean repository-relative .aib.yml or .mpp.yml path")
+	}
+	if p := source.LockfilePath; p != "" && !cleanGitRepositoryPath(p) {
+		return fmt.Errorf("git lockfile path must be clean and repository-relative")
 	}
 	if name := source.CredentialsSecretRef; name != "" && len(validation.IsDNS1123Subdomain(name)) != 0 {
 		return fmt.Errorf("invalid git credentials Secret name")
 	}
 	return nil
+}
+
+func cleanGitRepositoryPath(p string) bool {
+	return p != "" && p != "." && p != ".." && len(p) <= 1024 && !path.IsAbs(p) && path.Clean(p) == p && !strings.HasPrefix(p, "../") && !strings.ContainsAny(p, "\\\r\n\x00")
 }
 
 // ValidateGitSourceSpec checks Git input combinations for API and controller paths.

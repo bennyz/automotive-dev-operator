@@ -373,7 +373,10 @@ components:
           description: Branch, tag, or commit; defaults to remote HEAD.
         manifestPath:
           type: string
-          description: Repository-relative manifest path. An adjacent aib.lock is used when present.
+          description: Repository-relative manifest path. An adjacent lockfile named after the manifest (for example, simple.aib.lock for simple.aib.yml) is used when present.
+        lockfilePath:
+          type: string
+          description: Optional repository-relative lockfile path. When set, the file must exist in the selected commit; otherwise, the adjacent manifest-named lockfile is used when present.
         credentialsSecretRef:
           type: string
           description: Namespace-local basic-auth Secret annotated with the requesting user's identity.
@@ -389,6 +392,9 @@ components:
           type: array
         architecture:
           type: string
+        architectureFallback:
+          type: string
+          description: Optional CLI architecture used for Git sources only when the target has no default and architecture is not explicit.
         automotiveImageBuilder:
           type: string
         buildDiskImage:
@@ -535,6 +541,9 @@ components:
         sourceCommit:
           type: string
           description: Resolved Git commit used for this build.
+        architectureSource:
+          type: string
+          description: How the Git build architecture was selected (explicit, target-default, client-fallback, or operator-fallback).
         artifacts:
           items:
             $ref: '#/components/schemas/ArtifactStatus'

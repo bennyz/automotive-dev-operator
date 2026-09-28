@@ -910,6 +910,12 @@ func (r *ImageBuildReconciler) handleExpiredState(
 	if name := imageBuild.Status.SourceTaskRunName; name != "" {
 		deleteObj(&tektonv1.TaskRun{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}}, "source TaskRun")
 	}
+	if imageBuild.Spec.GetGitSource() != nil {
+		name := safeDerivedName(imageBuild.Name, "-source-discovery")
+		if name != imageBuild.Status.SourceTaskRunName {
+			deleteObj(&tektonv1.TaskRun{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}}, "source discovery TaskRun")
+		}
+	}
 	if name := imageBuild.Status.PushTaskRunName; name != "" {
 		deleteObj(&tektonv1.TaskRun{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}}, "push TaskRun")
 	}

@@ -35,7 +35,34 @@ rm -rf repository
 git init -q repository
 cd repository
 git remote add origin "$SOURCE_URL"
-git -c http.followRedirects=false -c protocol.file.allow=never fetch --quiet --depth=1 --no-tags origin "${SOURCE_REVISION:-HEAD}"
+git config http.followRedirects false
+git config protocol.file.allow never
+if [ "${SOURCE_DISCOVERY:-}" = "true" ]; then
+  git config remote.origin.promisor true
+  git config remote.origin.partialclonefilter blob:none
+  git fetch --quiet --depth=1 --filter=blob:none --no-tags origin "${SOURCE_REVISION:-HEAD}"
+  git rev-parse FETCH_HEAD > ../commit
+  entry=$(git ls-tree FETCH_HEAD -- "$SOURCE_MANIFEST")
+  case "$entry" in
+    "100644 "*|"100755 "*) ;;
+    "120000 "*) echo "Git manifest must not be a symlink" >&2; exit 1 ;;
+    *) echo "Git manifest is missing or is not a regular file" >&2; exit 1 ;;
+  esac
+  git show "FETCH_HEAD:$SOURCE_MANIFEST" > ../manifest
+  exit 0
+fi
+if [ -n "${SOURCE_COMMIT:-}" ]; then
+  if ! git fetch --quiet --depth=1 --no-tags origin "$SOURCE_COMMIT"; then
+    git fetch --quiet --depth=1 --no-tags origin "${SOURCE_REVISION:-HEAD}"
+  fi
+  actual_commit=$(git rev-parse FETCH_HEAD)
+  if [ "$actual_commit" != "$SOURCE_COMMIT" ]; then
+    echo "Git revision changed since discovery; retry the build to discover its new target" >&2
+    exit 1
+  fi
+else
+  git fetch --quiet --depth=1 --no-tags origin "${SOURCE_REVISION:-HEAD}"
+fi
 git -c advice.detachedHead=false checkout --quiet --detach FETCH_HEAD
 git rev-parse HEAD > ../commit
 if git ls-files --stage | grep -q '^160000 '; then

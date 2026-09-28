@@ -125,6 +125,43 @@ func lockedBuildScript(t *testing.T, data string) string {
 	return "export SOURCE_METADATA_PATH=" + block
 }
 
+func automaticBuildLockFixture(t *testing.T, dir, config string, gitSource, customGitLock bool, supplied string) string {
+	t.Helper()
+	manifestFile := "input.aib.yml"
+	lockfileDir := config
+	if gitSource {
+		lockfileDir = filepath.Join(dir, ".caib-source", "repository", "images")
+		if err := os.MkdirAll(lockfileDir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		manifestFile = filepath.Join(lockfileDir, "input.aib.yml")
+		if err := os.WriteFile(filepath.Join(config, "git-manifest-path"), []byte("images/input.aib.yml"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		lockfilePath := "images/input.aib.lock"
+		if customGitLock {
+			lockfilePath = "images/alternate.json"
+		}
+		if err := os.WriteFile(filepath.Join(dir, ".caib-source", "lockfile-path"), []byte(lockfilePath), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if supplied != "" {
+		content := supplied
+		if content == "empty" {
+			content = ""
+		}
+		lockfileName := map[bool]string{false: "aib.lock", true: "input.aib.lock"}[gitSource]
+		if customGitLock {
+			lockfileName = "alternate.json"
+		}
+		if err := os.WriteFile(filepath.Join(lockfileDir, lockfileName), []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return manifestFile
+}
+
 func TestAutomaticBuildLock(t *testing.T) {
 	data, err := os.ReadFile("scripts/build_image.sh")
 	if err != nil {
@@ -134,7 +171,7 @@ func TestAutomaticBuildLock(t *testing.T) {
 	cases := []struct {
 		name, mode, secure, repro, supplied, restore, resolverResult string
 		wantResolve, wantPrefetch, wantFailure                       bool
-		gitSource                                                    bool
+		gitSource, customGitLock                                     bool
 	}{
 		{name: "ordinary", mode: "package"},
 		{name: "secure", mode: "package", secure: "true", wantResolve: true, wantPrefetch: true},
@@ -142,6 +179,7 @@ func TestAutomaticBuildLock(t *testing.T) {
 		{name: "bootc entrypoint", mode: "bootc", secure: "true", wantResolve: true, wantPrefetch: true},
 		{name: "supplied", mode: "package", secure: "true", supplied: "original", wantPrefetch: true},
 		{name: "git supplied", mode: "package", secure: "true", supplied: "original", wantPrefetch: true, gitSource: true},
+		{name: "git custom lock", mode: "package", secure: "true", supplied: "original", wantPrefetch: true, gitSource: true, customGitLock: true},
 		{name: "restored", mode: "package", secure: "true", restore: "recorded", wantPrefetch: true},
 		{name: "missing restore lock", mode: "package", secure: "true", restore: "missing", wantFailure: true},
 		{name: "resolution failed", mode: "package", secure: "true", resolverResult: "fail", wantResolve: true, wantFailure: true},
@@ -159,27 +197,7 @@ func TestAutomaticBuildLock(t *testing.T) {
 			if err := os.Mkdir(config, 0700); err != nil {
 				t.Fatal(err)
 			}
-			manifestFile := "input.aib.yml"
-			lockfileDir := config
-			if tc.gitSource {
-				lockfileDir = filepath.Join(dir, "source", "images")
-				if err := os.MkdirAll(lockfileDir, 0700); err != nil {
-					t.Fatal(err)
-				}
-				manifestFile = filepath.Join(lockfileDir, "input.aib.yml")
-				if err := os.WriteFile(filepath.Join(config, "git-manifest-path"), []byte("images/input.aib.yml"), 0600); err != nil {
-					t.Fatal(err)
-				}
-			}
-			if tc.supplied != "" {
-				content := tc.supplied
-				if content == "empty" {
-					content = ""
-				}
-				if err := os.WriteFile(filepath.Join(lockfileDir, "aib.lock"), []byte(content), 0600); err != nil {
-					t.Fatal(err)
-				}
-			}
+			manifestFile := automaticBuildLockFixture(t, dir, config, tc.gitSource, tc.customGitLock, tc.supplied)
 			script := `set -e
 fail() { echo "ERROR: $*"; exit 1; }
 write_result() { :; }
