@@ -24,6 +24,7 @@ type BuildConfig struct {
 	YQHelperImage               string
 	HermetoImage                string
 	HermetoPrefetch             bool
+	GitCloneImage               string
 	BuildTimeoutMinutes         int32
 	FlashTimeoutMinutes         int32
 	DefaultLeaseDuration        string
@@ -881,6 +882,14 @@ func GenerateBuildAutomotiveImageTask(namespace string, buildConfig *BuildConfig
 					Description: "Pushed bootc container image digest (Tekton Chains type hint)",
 				},
 				{
+					Name:        "CHAINS-GIT_URL",
+					Description: "Git source URL for Tekton Chains provenance",
+				},
+				{
+					Name:        "CHAINS-GIT_COMMIT",
+					Description: "Resolved Git source commit for Tekton Chains provenance",
+				},
+				{
 					Name:        "ARTIFACT_INTEGRITY_DIGEST",
 					Description: "SHA-256 digest of disk artifact(s) for cross-task integrity verification",
 				},
@@ -908,6 +917,10 @@ func GenerateBuildAutomotiveImageTask(namespace string, buildConfig *BuildConfig
 					Name:   "find-manifest-file",
 					Image:  "$(params.yq-helper-image)",
 					Script: FindManifestScript,
+					SecurityContext: &corev1.SecurityContext{
+						RunAsUser:  new(int64(0)), // Git checkout may be owned by the clone image's UID.
+						RunAsGroup: new(int64(0)),
+					},
 					VolumeMounts: []corev1.VolumeMount{
 						{
 							Name:      "manifest-work",

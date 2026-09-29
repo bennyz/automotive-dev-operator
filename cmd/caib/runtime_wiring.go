@@ -29,6 +29,10 @@ type runtimeState struct {
 	CustomDefs             *[]string
 	DefineFiles            *[]string
 	AIBExtraArgs           *[]string
+	GitURL                 *string
+	GitRef                 *string
+	GitSecret              *string
+	GitLockfile            *string
 	Lockfile               *string
 	RootPassword           *string
 	ExtraRepos             *[]string
@@ -111,6 +115,10 @@ func newRuntimeState() runtimeState {
 		DefineFiles:            &defineFiles,
 		AIBExtraArgs:           &aibExtraArgs,
 		Lockfile:               new(string),
+		GitURL:                 new(string),
+		GitRef:                 new(string),
+		GitSecret:              new(string),
+		GitLockfile:            new(string),
 		RootPassword:           &rootPassword,
 		ExtraRepos:             &extraRepos,
 		LocalRepo:              &localRepo,
@@ -203,6 +211,10 @@ func (s runtimeState) newHandlers() handlerSet {
 			DefineFiles:               s.DefineFiles,
 			AIBExtraArgs:              s.AIBExtraArgs,
 			Lockfile:                  s.Lockfile,
+			GitURL:                    s.GitURL,
+			GitRef:                    s.GitRef,
+			GitSecret:                 s.GitSecret,
+			GitLockfile:               s.GitLockfile,
 			RootPassword:              s.RootPassword,
 			ExtraRepos:                s.ExtraRepos,
 			LocalRepo:                 s.LocalRepo,
@@ -361,6 +373,10 @@ func (s runtimeState) imageOptions(h handlerSet) image.Options {
 		DefineFiles:            s.DefineFiles,
 		AIBExtraArgs:           s.AIBExtraArgs,
 		Lockfile:               s.Lockfile,
+		GitURL:                 s.GitURL,
+		GitRef:                 s.GitRef,
+		GitSecret:              s.GitSecret,
+		GitLockfile:            s.GitLockfile,
 		RootPassword:           s.RootPassword,
 		ExtraRepos:             s.ExtraRepos,
 		LocalRepo:              s.LocalRepo,

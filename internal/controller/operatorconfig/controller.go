@@ -579,6 +579,7 @@ func (r *OperatorConfigReconciler) deployOSBuilds(
 			YQHelperImage:               config.Spec.GetImages().GetYQHelperImage(),
 			HermetoImage:                config.Spec.GetImages().GetHermetoImage(),
 			HermetoPrefetch:             config.Spec.OSBuilds.HermetoPrefetch,
+			GitCloneImage:               config.Spec.GetImages().GetGitCloneImage(),
 			BuildTimeoutMinutes:         config.Spec.OSBuilds.GetBuildTimeoutMinutes(),
 			FlashTimeoutMinutes:         config.Spec.OSBuilds.GetFlashTimeoutMinutes(),
 			DefaultLeaseDuration:        config.Spec.Jumpstarter.GetDefaultLeaseDuration(),
@@ -607,6 +608,8 @@ func (r *OperatorConfigReconciler) deployOSBuilds(
 		tasks.GeneratePushArtifactRegistryTask(config.Namespace, buildConfig),
 		tasks.GeneratePushArtifactS3Task(config.Namespace, buildConfig),
 		tasks.GenerateFlashTask(config.Namespace, buildConfig),
+		tasks.GenerateGitSourceTask(config.Namespace, buildConfig),
+		tasks.GenerateGitSourceDiscoveryTask(config.Namespace, buildConfig),
 	}
 	tektonTasks = append(tektonTasks, tasks.GenerateSealedTasks(config.Namespace, buildConfig)...)
 
@@ -817,6 +820,7 @@ func (r *OperatorConfigReconciler) cleanupOSBuilds(ctx context.Context, config *
 	// Delete Tekton tasks
 	taskNames := []string{
 		"build-automotive-image", "push-artifact-registry", "push-artifact-s3", "prepare-builder", "flash-image",
+		tasks.GitSourceTaskName, tasks.GitSourceDiscoveryTaskName,
 		"sealed-prepare-reseal", "sealed-reseal", "sealed-extract-for-signing", "sealed-inject-signed",
 	}
 	for _, taskName := range taskNames {

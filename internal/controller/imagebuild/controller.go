@@ -18,7 +18,6 @@ import (
 
 	automotivev1alpha1 "github.com/centos-automotive-suite/automotive-dev-operator/api/v1alpha1"
 	"github.com/centos-automotive-suite/automotive-dev-operator/internal/buildapi"
-	"github.com/centos-automotive-suite/automotive-dev-operator/internal/common/bundleverify"
 	"github.com/centos-automotive-suite/automotive-dev-operator/internal/common/labels"
 	"github.com/centos-automotive-suite/automotive-dev-operator/internal/common/registryutil"
 	"github.com/centos-automotive-suite/automotive-dev-operator/internal/common/tasks"
@@ -457,6 +456,10 @@ func (r *ImageBuildReconciler) handleInitialState(
 
 	if err := r.ensureImageStreamOwnerRef(ctx, imageBuild); err != nil {
 		return ctrl.Result{}, err
+	}
+
+	if imageBuild.Spec.GetGitSource() != nil && imageBuild.Status.SourceCommit == "" {
+		return r.prepareGitSource(ctx, imageBuild)
 	}
 
 	if imageBuild.Spec.GetInputFilesServer() {
@@ -904,6 +907,15 @@ func (r *ImageBuildReconciler) handleExpiredState(
 	if name := imageBuild.Status.PipelineRunName; name != "" {
 		deleteObj(&tektonv1.PipelineRun{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}}, "PipelineRun")
 	}
+	if name := imageBuild.Status.SourceTaskRunName; name != "" {
+		deleteObj(&tektonv1.TaskRun{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}}, "source TaskRun")
+	}
+	if imageBuild.Spec.GetGitSource() != nil {
+		name := safeDerivedName(imageBuild.Name, "-source-discovery")
+		if name != imageBuild.Status.SourceTaskRunName {
+			deleteObj(&tektonv1.TaskRun{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}}, "source discovery TaskRun")
+		}
+	}
 	if name := imageBuild.Status.PushTaskRunName; name != "" {
 		deleteObj(&tektonv1.TaskRun{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}}, "push TaskRun")
 	}
@@ -1132,6 +1144,7 @@ func (r *ImageBuildReconciler) createBuildTaskRun(
 			YQHelperImage:               operatorConfig.Spec.GetImages().GetYQHelperImage(),
 			HermetoImage:                operatorConfig.Spec.GetImages().GetHermetoImage(),
 			HermetoPrefetch:             operatorConfig.Spec.OSBuilds.HermetoPrefetch,
+			GitCloneImage:               operatorConfig.Spec.GetImages().GetGitCloneImage(),
 			BuildTimeoutMinutes:         operatorConfig.Spec.OSBuilds.GetBuildTimeoutMinutes(),
 			FlashTimeoutMinutes:         operatorConfig.Spec.OSBuilds.GetFlashTimeoutMinutes(),
 			DefaultLeaseDuration:        operatorConfig.Spec.Jumpstarter.GetDefaultLeaseDuration(),
@@ -1142,55 +1155,8 @@ func (r *ImageBuildReconciler) createBuildTaskRun(
 		controllerutils.ApplyOCIVolumesConfig(buildConfig, &operatorConfig.Spec)
 
 		if imageBuild.Spec.SecureBuild {
-			// Use the digest-pinned ref snapshotted on the CR by the Build API,
-			// not the current OperatorConfig value (which may have changed).
-			ref := strings.TrimSpace(imageBuild.Spec.TaskBundleRef)
-			if ref == "" {
-				return fmt.Errorf("secureBuild requested but taskBundleRef is not set on the ImageBuild: %w", errTerminalConfig)
-			}
-			if !digestPinnedRef.MatchString(ref) {
-				return fmt.Errorf("secureBuild requires a digest-pinned taskBundleRef (must match image@sha256:<64 hex>), got %q: %w", ref, errTerminalConfig)
-			}
-
-			if operatorConfig.Spec.OSBuilds.TaskBundleVerify {
-				if _, ok := r.verifiedBundles.Load(ref); !ok {
-					verifyCtx, verifyCancel := context.WithTimeout(ctx, 30*time.Second)
-					defer verifyCancel()
-					pubKeyPEM, err := bundleverify.FetchCosignPublicKey(verifyCtx, r.Client, operatorConfig.Spec.OSBuilds.TaskBundleCosignKeyRef, controllerutils.OperatorNamespace())
-					if err != nil {
-						return fmt.Errorf("secureBuild: cosign key is unavailable: %w: %w", err, errTerminalConfig)
-					}
-					if err := bundleverify.VerifyBundle(verifyCtx, ref, pubKeyPEM); err != nil {
-						return fmt.Errorf("task bundle signature verification failed: %w: %w", err, errTerminalConfig)
-					}
-					r.verifiedBundles.Store(ref, struct{}{})
-				}
-			}
-
-			buildConfig.TaskResolver = tasks.TaskResolverBundle
-			buildConfig.TaskBundleRef = ref
-
-			// Bundle tasks are exported with nil BuildConfig (defaults only).
-			// Reject settings that would silently diverge from the bundle.
-			if buildConfig.TrustedCABundleName != "" && buildConfig.TrustedCABundleName != tasks.DefaultTrustedCABundleConfigMap {
-				return fmt.Errorf("secureBuild: OperatorConfig specifies custom CA bundle %q but bundle tasks use default %q; build a custom bundle or remove the CA override: %w",
-					buildConfig.TrustedCABundleName, tasks.DefaultTrustedCABundleConfigMap, errTerminalConfig)
-			}
-			if buildConfig.TrustedCABundleKind != "" && !strings.EqualFold(buildConfig.TrustedCABundleKind, "ConfigMap") {
-				return fmt.Errorf("secureBuild: OperatorConfig specifies CA bundle kind %q but bundle tasks use ConfigMap; build a custom bundle or remove the CA override: %w",
-					buildConfig.TrustedCABundleKind, errTerminalConfig)
-			}
-			if buildConfig.UseMemoryVolumes {
-				r.emitEventf(imageBuild, corev1.EventTypeWarning, "SecureBuildConfigDrift",
-					"OperatorConfig.useMemoryVolumes is enabled but bundle tasks use disk-backed emptyDir; memory volumes will not apply to this build")
-			}
-			if buildConfig.UsePVCScratchVolumes {
-				r.emitEventf(imageBuild, corev1.EventTypeWarning, "SecureBuildConfigDrift",
-					"OperatorConfig.usePVCScratchVolumes is enabled but bundle tasks use emptyDir; PVC scratch will not apply to this build")
-			}
-			if buildConfig.UseOCIVolumes {
-				r.emitEventf(imageBuild, corev1.EventTypeWarning, "SecureBuildConfigDrift",
-					"OperatorConfig has OCIVolumes enabled but bundle tasks do not include OCI volume mounts; ORAS will be downloaded at runtime")
+			if err := r.configureSecureTaskBundle(ctx, imageBuild, operatorConfig, buildConfig, true); err != nil {
+				return err
 			}
 		}
 	}
@@ -1651,7 +1617,7 @@ func (r *ImageBuildReconciler) createBuildTaskRun(
 				ClaimName: imageBuild.Spec.BuildCachePVC,
 			},
 		}
-	} else if imageBuild.Spec.GetInputFilesServer() && imageBuild.Status.PVCName != "" {
+	} else if (imageBuild.Spec.GetInputFilesServer() || imageBuild.Spec.GetGitSource() != nil) && imageBuild.Status.PVCName != "" {
 		// Use existing PVC that contains uploaded files
 		log.Info("Using existing PVC with uploaded files", "pvc", imageBuild.Status.PVCName)
 		sharedWorkspaceBinding = tektonv1.WorkspaceBinding{
@@ -1890,6 +1856,9 @@ func (r *ImageBuildReconciler) createOrUpdateManifestConfigMap(
 		}
 		cm.Data = map[string]string{
 			manifestKey: manifestContent,
+		}
+		if source := imageBuild.Spec.GetGitSource(); source != nil {
+			cm.Data = map[string]string{"git-manifest-path": source.ManifestPath}
 		}
 
 		if lockfile != "" {
@@ -2898,6 +2867,7 @@ func (r *ImageBuildReconciler) resolveBuildConfig(ctx context.Context) *tasks.Bu
 		AutomotiveImageBuilderImage: operatorConfig.Spec.GetImages().GetAutomotiveImageBuilderImage(),
 		YQHelperImage:               operatorConfig.Spec.GetImages().GetYQHelperImage(),
 		HermetoImage:                operatorConfig.Spec.GetImages().GetHermetoImage(),
+		GitCloneImage:               operatorConfig.Spec.GetImages().GetGitCloneImage(),
 		DefaultLeaseDuration:        operatorConfig.Spec.Jumpstarter.GetDefaultLeaseDuration(),
 	}
 	if operatorConfig.Spec.OSBuilds != nil {
@@ -2917,6 +2887,7 @@ func (r *ImageBuildReconciler) resolveBuildConfig(ctx context.Context) *tasks.Bu
 }
 
 type targetDefaults struct {
+	Architecture  string   `yaml:"architecture"`
 	DefaultFormat string   `yaml:"defaultFormat"`
 	ExtraArgs     []string `yaml:"extraArgs"`
 }

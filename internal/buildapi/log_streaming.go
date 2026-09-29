@@ -65,8 +65,7 @@ func isPodTerminal(phase corev1.PodPhase) bool {
 	return phase == corev1.PodSucceeded || phase == corev1.PodFailed
 }
 
-func isBuildTerminal(ctx context.Context, k8sClient client.Client, name, namespace string) bool {
-	ib := &automotivev1alpha1.ImageBuild{}
+func isBuildTerminal(ctx context.Context, k8sClient client.Client, name, namespace string, ib *automotivev1alpha1.ImageBuild) bool {
 	if err := k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, ib); err != nil {
 		return false
 	}
@@ -235,8 +234,7 @@ func (a *APIServer) streamLogs(c *gin.Context, name string) {
 		return
 	}
 
-	tr := strings.TrimSpace(ib.Status.PipelineRunName)
-	if tr == "" {
+	if strings.TrimSpace(ib.Status.PipelineRunName) == "" && ib.Status.SourceTaskRunName == "" {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "logs not available yet"})
 		return
 	}
@@ -248,7 +246,6 @@ func (a *APIServer) streamLogs(c *gin.Context, name string) {
 
 	setupLogStreamHeaders(c)
 
-	pipelineRunSelector := "tekton.dev/pipelineRun=" + tr + ",tekton.dev/memberOf=tasks"
 	var hadStream bool
 	var lastKeepalive time.Time
 	streamedContainers := make(map[string]map[string]bool)
@@ -261,7 +258,7 @@ func (a *APIServer) streamLogs(c *gin.Context, name string) {
 		default:
 		}
 
-		pods, err := cs.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{LabelSelector: pipelineRunSelector})
+		pods, err := listBuildLogPods(ctx, cs, namespace, ib)
 		if err != nil {
 			if _, writeErr := fmt.Fprintf(c.Writer, "\n[Error listing pods: %v]\n", err); writeErr != nil {
 				fmt.Fprintf(os.Stderr, "Warning: failed to write error message: %v\n", writeErr)
@@ -272,7 +269,7 @@ func (a *APIServer) streamLogs(c *gin.Context, name string) {
 		}
 
 		if len(pods.Items) == 0 {
-			if isBuildTerminal(ctx, k8sClient, name, namespace) {
+			if isBuildTerminal(ctx, k8sClient, name, namespace, ib) {
 				break
 			}
 			if !hadStream {
@@ -332,6 +329,32 @@ func (a *APIServer) streamLogs(c *gin.Context, name string) {
 	writeLogStreamFooter(c, hadStream)
 }
 
+func listBuildLogPods(ctx context.Context, cs kubernetes.Interface, namespace string, ib *automotivev1alpha1.ImageBuild) (*corev1.PodList, error) {
+	pods := &corev1.PodList{}
+	selectors := buildLogPodSelectors(ib)
+	for _, selector := range selectors {
+		found, err := cs.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
+		if err != nil {
+			return nil, err
+		}
+		pods.Items = append(pods.Items, found.Items...)
+	}
+	return pods, nil
+}
+
+func buildLogPodSelectors(ib *automotivev1alpha1.ImageBuild) []string {
+	selectors := []string{}
+	pipelineRun := strings.TrimSpace(ib.Status.PipelineRunName)
+	sourceTaskRun := strings.TrimSpace(ib.Status.SourceTaskRunName)
+	if pipelineRun != "" {
+		selectors = append(selectors, "tekton.dev/pipelineRun="+pipelineRun+",tekton.dev/memberOf=tasks")
+	}
+	if sourceTaskRun != "" {
+		selectors = append(selectors, "tekton.dev/taskRun="+sourceTaskRun)
+	}
+	return selectors
+}
+
 func shouldExitLogStream(
 	ctx context.Context,
 	k8sClient client.Client,
@@ -339,12 +362,8 @@ func shouldExitLogStream(
 	ib *automotivev1alpha1.ImageBuild,
 	allPodsComplete bool,
 ) bool {
-	if err := k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, ib); err == nil {
-		if isTerminalPhase(ib.Status.Phase) && allPodsComplete {
-			return true
-		}
-	}
-	return false
+	terminal := isBuildTerminal(ctx, k8sClient, name, namespace, ib)
+	return terminal && allPodsComplete
 }
 
 func writeLogStreamFooter(c *gin.Context, hadStream bool) {

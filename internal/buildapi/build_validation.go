@@ -39,13 +39,12 @@ func validateBuildRequest(req *BuildRequest) error {
 		return fmt.Errorf("manifest and lockfile exceed %d byte limit", maxManifestSize)
 	}
 
-	if req.ResolveOnly {
-		if req.Mode != ModePackage {
-			return fmt.Errorf("resolveOnly requires package mode")
-		}
-		if req.Lockfile != "" || req.RestoreSourcesRef != "" || req.Reproducible || req.SecureBuild || req.BuildDiskImage || req.FlashEnabled || req.ContainerRef != "" || req.ContainerPush != "" {
-			return fmt.Errorf("resolveOnly cannot be combined with a lockfile, restored sources, secure/reproducible builds, flashing, or container operations")
-		}
+	if err := validateGitSourceRequest(req); err != nil {
+		return err
+	}
+
+	if err := validateResolveOnlyRequest(req); err != nil {
+		return err
 	}
 
 	if req.Mode == ModeDisk {
@@ -61,7 +60,7 @@ func validateBuildRequest(req *BuildRequest) error {
 		if err := validateContainerRef(req.ContainerRef); err != nil {
 			return err
 		}
-	} else if req.Manifest == "" {
+	} else if req.Manifest == "" && req.GitSource == nil {
 		return fmt.Errorf("manifest is required")
 	}
 
@@ -78,6 +77,45 @@ func validateBuildRequest(req *BuildRequest) error {
 		return fmt.Errorf("secure builds cannot use the internal registry because required OCI referrers are unsupported; use an external referrer-capable registry")
 	}
 
+	return nil
+}
+
+func validateGitSourceRequest(req *BuildRequest) error {
+	if req.GitSource == nil {
+		if req.ArchitectureFallback != "" {
+			return fmt.Errorf("architectureFallback requires gitSource")
+		}
+		return nil
+	}
+	if req.ArchitectureFallback != "" && req.Architecture != "" {
+		return fmt.Errorf("architectureFallback cannot be combined with an explicit architecture")
+	}
+	spec := &automotivev1alpha1.ImageBuildSpec{
+		AIB: &automotivev1alpha1.AIBSpec{
+			GitSource: req.GitSource, Mode: string(req.Mode), Manifest: req.Manifest, Lockfile: req.Lockfile,
+			InputFilesServer: req.HasLocalFiles, OCIRepoImages: req.OCIRepoImages,
+		},
+		Workspace: req.Workspace,
+	}
+	if err := automotivev1alpha1.ValidateGitSourceSpec(spec); err != nil {
+		return err
+	}
+	if len(req.ExtraRepos) > 0 || req.LocalRepo {
+		return fmt.Errorf("git source cannot be combined with extra repository overlays")
+	}
+	return nil
+}
+
+func validateResolveOnlyRequest(req *BuildRequest) error {
+	if !req.ResolveOnly {
+		return nil
+	}
+	if req.Mode != ModePackage {
+		return fmt.Errorf("resolveOnly requires package mode")
+	}
+	if req.Lockfile != "" || req.RestoreSourcesRef != "" || req.Reproducible || req.SecureBuild || req.BuildDiskImage || req.FlashEnabled || req.ContainerRef != "" || req.ContainerPush != "" {
+		return fmt.Errorf("resolveOnly cannot be combined with a lockfile, restored sources, secure/reproducible builds, flashing, or container operations")
+	}
 	return nil
 }
 
@@ -122,17 +160,22 @@ func resolveAndClampTTL(ctx context.Context, k8sClient client.Client, namespace,
 
 // applyBuildDefaults sets default values for build request fields
 func applyBuildDefaults(req *BuildRequest) error {
+	fallback, err := automotivev1alpha1.NormalizeGitArchitectureFallback(string(req.ArchitectureFallback))
+	if err != nil {
+		return err
+	}
+	req.ArchitectureFallback = Architecture(fallback)
 	if req.Distro == "" {
 		req.Distro = "autosd"
 	}
-	if req.Target == "" {
+	if req.Target == "" && req.GitSource == nil {
 		req.Target = "qemu"
 	}
-	if req.Architecture == "" {
+	if req.Architecture == "" && req.GitSource == nil {
 		req.Architecture = "arm64"
 	}
 	req.Architecture = req.Architecture.Normalize()
-	if req.ExportFormat == "" {
+	if req.ExportFormat == "" && req.GitSource == nil {
 		req.ExportFormat = formatImage
 	}
 	if req.Mode == "" {
@@ -147,10 +190,10 @@ func applyBuildDefaults(req *BuildRequest) error {
 	if !req.Distro.IsValid() {
 		return fmt.Errorf("distro cannot be empty")
 	}
-	if !req.Target.IsValid() {
+	if !req.Target.IsValid() && (req.GitSource == nil || req.Target != "") {
 		return fmt.Errorf("target cannot be empty")
 	}
-	if !req.Architecture.IsValid() {
+	if !req.Architecture.IsValid() && (req.GitSource == nil || req.Architecture != "") {
 		return fmt.Errorf("invalid architecture %q: must be amd64, arm64, x86_64, or aarch64", req.Architecture)
 	}
 	// ExportFormat validation removed - allow AIB to handle format validation

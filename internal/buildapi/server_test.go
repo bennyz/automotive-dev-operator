@@ -202,6 +202,39 @@ var _ = Describe("APIServer", func() {
 			Expect(response.Phase).To(Equal(phasePending))
 		})
 
+		It("should preserve a Git architecture fallback without setting the build architecture", func() {
+			fakeClient := newCreateBuildFakeClient()
+			getClientFromRequestFn = func(_ *gin.Context) (ctrlclient.Client, error) {
+				return fakeClient, nil
+			}
+			body := `{"name":"git-build","gitSource":{"url":"https://git.example.com/os.git","manifestPath":"demo.aib.yml"},"architectureFallback":"x86_64"}`
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			c.Request, _ = http.NewRequest(http.MethodPost, "/v1/builds", strings.NewReader(body))
+			c.Request.Header.Set("Content-Type", "application/json")
+
+			server.createBuild(c)
+
+			Expect(w.Code).To(Equal(http.StatusAccepted), w.Body.String())
+			var response BuildResponse
+			Expect(json.Unmarshal(w.Body.Bytes(), &response)).To(Succeed())
+			build := &automotivev1alpha1.ImageBuild{}
+			Expect(fakeClient.Get(context.Background(), types.NamespacedName{Name: response.Name, Namespace: resolveNamespace()}, build)).To(Succeed())
+			Expect(build.Spec.Architecture).To(BeEmpty())
+			Expect(build.Annotations).To(HaveKeyWithValue(labels.DefaultArchitecture, "amd64"))
+			build.Spec.Architecture = "amd64"
+			build.Annotations[labels.ArchitectureSource] = "client-fallback"
+			Expect(fakeClient.Update(context.Background(), build)).To(Succeed())
+			show := httptest.NewRecorder()
+			showContext, _ := gin.CreateTestContext(show)
+			showContext.Request, _ = http.NewRequest(http.MethodGet, "/v1/builds/"+response.Name, nil)
+			server.getBuild(showContext, response.Name)
+			Expect(show.Code).To(Equal(http.StatusOK), show.Body.String())
+			var shown BuildResponse
+			Expect(json.Unmarshal(show.Body.Bytes(), &shown)).To(Succeed())
+			Expect(shown.ArchitectureSource).To(Equal("client-fallback"))
+		})
+
 		It("should clean up inline S3 secret when ImageBuild creation fails", func() {
 			scheme := runtime.NewScheme()
 			Expect(automotivev1alpha1.AddToScheme(scheme)).To(Succeed())

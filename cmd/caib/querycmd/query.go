@@ -239,6 +239,7 @@ func printBuildDetails(st *buildapitypes.BuildResponse) error {
 		{"Message", st.Message},
 		{"External ID", valueOrDash(st.ExternalID)},
 		{"Requested By", valueOrDash(st.RequestedBy)},
+		{"Source Commit", valueOrDash(st.SourceCommit)},
 		{"Start Time", valueOrDash(st.StartTime)},
 		{"Completion Time", valueOrDash(st.CompletionTime)},
 		{"Container Image", valueOrDash(st.ContainerImage)},
@@ -266,6 +267,9 @@ func printBuildDetails(st *buildapitypes.BuildResponse) error {
 			[2]string{"AIB Image", valueOrDash(st.Parameters.AutomotiveImageBuilder)},
 			[2]string{"Builder Image", valueOrDash(st.Parameters.BuilderImage)},
 		)
+		if st.ArchitectureSource != "" {
+			rows = append(rows, [2]string{"Architecture Source", st.ArchitectureSource})
+		}
 	}
 
 	if st.Jumpstarter != nil {

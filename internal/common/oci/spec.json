@@ -20,6 +20,10 @@
         {"key": "custom-defines", "var": "CUSTOM_DEFINES"},
         {"key": "aib-extra-args", "var": "AIB_EXTRA_ARGS"},
         {"key": "export-format", "var": "EXPORT_FORMAT"}
+      ],
+      "standard": [
+        {"key": "org.opencontainers.image.source", "var": "SOURCE"},
+        {"key": "org.opencontainers.image.revision", "var": "REVISION"}
       ]
     },
     "layer": {

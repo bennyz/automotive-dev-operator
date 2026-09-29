@@ -114,15 +114,52 @@ AIB_EXTRA_ARGS=(--verbose)
 
 func lockedBuildScript(t *testing.T, data string) string {
 	t.Helper()
-	_, rest, ok := strings.Cut(data, "resolve_dependency_lock() {")
+	_, rest, ok := strings.Cut(data, "export SOURCE_METADATA_PATH=")
 	if !ok {
-		t.Fatal("resolution helper missing")
+		t.Fatal("source and lockfile setup missing")
 	}
 	block, _, ok := strings.Cut(rest, "declare -a ROOT_PASSWORD_ARGS=()")
 	if !ok {
 		t.Fatal("locked build boundary missing")
 	}
-	return "resolve_dependency_lock() {" + block
+	return "export SOURCE_METADATA_PATH=" + block
+}
+
+func automaticBuildLockFixture(t *testing.T, dir, config string, gitSource, customGitLock bool, supplied string) string {
+	t.Helper()
+	manifestFile := "input.aib.yml"
+	lockfileDir := config
+	if gitSource {
+		lockfileDir = filepath.Join(dir, ".caib-source", "repository", "images")
+		if err := os.MkdirAll(lockfileDir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		manifestFile = filepath.Join(lockfileDir, "input.aib.yml")
+		if err := os.WriteFile(filepath.Join(config, "git-manifest-path"), []byte("images/input.aib.yml"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		lockfilePath := "images/input.aib.lock"
+		if customGitLock {
+			lockfilePath = "images/alternate.json"
+		}
+		if err := os.WriteFile(filepath.Join(dir, ".caib-source", "lockfile-path"), []byte(lockfilePath), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if supplied != "" {
+		content := supplied
+		if content == "empty" {
+			content = ""
+		}
+		lockfileName := map[bool]string{false: "aib.lock", true: "input.aib.lock"}[gitSource]
+		if customGitLock {
+			lockfileName = "alternate.json"
+		}
+		if err := os.WriteFile(filepath.Join(lockfileDir, lockfileName), []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return manifestFile
 }
 
 func TestAutomaticBuildLock(t *testing.T) {
@@ -134,12 +171,15 @@ func TestAutomaticBuildLock(t *testing.T) {
 	cases := []struct {
 		name, mode, secure, repro, supplied, restore, resolverResult string
 		wantResolve, wantPrefetch, wantFailure                       bool
+		gitSource, customGitLock                                     bool
 	}{
 		{name: "ordinary", mode: "package"},
 		{name: "secure", mode: "package", secure: "true", wantResolve: true, wantPrefetch: true},
 		{name: "reproducible", mode: "package", repro: "true", wantResolve: true, wantPrefetch: true},
 		{name: "bootc entrypoint", mode: "bootc", secure: "true", wantResolve: true, wantPrefetch: true},
 		{name: "supplied", mode: "package", secure: "true", supplied: "original", wantPrefetch: true},
+		{name: "git supplied", mode: "package", secure: "true", supplied: "original", wantPrefetch: true, gitSource: true},
+		{name: "git custom lock", mode: "package", secure: "true", supplied: "original", wantPrefetch: true, gitSource: true, customGitLock: true},
 		{name: "restored", mode: "package", secure: "true", restore: "recorded", wantPrefetch: true},
 		{name: "missing restore lock", mode: "package", secure: "true", restore: "missing", wantFailure: true},
 		{name: "resolution failed", mode: "package", secure: "true", resolverResult: "fail", wantResolve: true, wantFailure: true},
@@ -157,15 +197,7 @@ func TestAutomaticBuildLock(t *testing.T) {
 			if err := os.Mkdir(config, 0700); err != nil {
 				t.Fatal(err)
 			}
-			if tc.supplied != "" {
-				content := tc.supplied
-				if content == "empty" {
-					content = ""
-				}
-				if err := os.WriteFile(filepath.Join(config, "aib.lock"), []byte(content), 0600); err != nil {
-					t.Fatal(err)
-				}
-			}
+			manifestFile := automaticBuildLockFixture(t, dir, config, tc.gitSource, tc.customGitLock, tc.supplied)
 			script := `set -e
 fail() { echo "ERROR: $*"; exit 1; }
 write_result() { :; }
@@ -198,7 +230,7 @@ AIB_EXTRA_ARGS=(--verbose)
 				restoreRef = "registry.example/prior@sha256:abc"
 			}
 			cmd := exec.Command("bash", "-c", script)
-			cmd.Env = append(os.Environ(), "RESOLVE_ONLY=false", "USE_PERSISTENT_CACHE=false", "BUILD_MODE="+tc.mode, "SECURE_BUILD="+tc.secure, "REPRODUCIBLE="+tc.repro, "HERMETO_PREFETCH=false", "RESTORE_SOURCES_REF="+restoreRef, "RESTORE_KIND="+tc.restore, "RESOLVER_RESULT="+tc.resolverResult, "WORKSPACE_PATH="+dir, "MANIFEST_CONFIG_PATH="+config, "BUILD_DIR="+dir, "MANIFEST_FILE=input.aib.yml", "DISTRO=autosd", "TARGET=qemu", "ARCH=aarch64")
+			cmd.Env = append(os.Environ(), "RESOLVE_ONLY=false", "USE_PERSISTENT_CACHE=false", "BUILD_MODE="+tc.mode, "SECURE_BUILD="+tc.secure, "REPRODUCIBLE="+tc.repro, "HERMETO_PREFETCH=false", "RESTORE_SOURCES_REF="+restoreRef, "RESTORE_KIND="+tc.restore, "RESOLVER_RESULT="+tc.resolverResult, "WORKSPACE_PATH="+dir, "MANIFEST_CONFIG_PATH="+config, "BUILD_DIR="+dir, "MANIFEST_FILE="+manifestFile, "DISTRO=autosd", "TARGET=qemu", "ARCH=aarch64")
 			output, err := cmd.CombinedOutput()
 			out := string(output)
 			if (err != nil) != tc.wantFailure {

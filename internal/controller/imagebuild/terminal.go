@@ -200,7 +200,7 @@ func (r *ImageBuildReconciler) cancellationRuns(ctx context.Context, ib *api.Ima
 			prs.Items = append(prs.Items, *pr)
 		}
 	}
-	for _, name := range []string{ib.Status.PushTaskRunName, ib.Status.FlashTaskRunName} {
+	for _, name := range []string{ib.Status.SourceTaskRunName, ib.Status.PushTaskRunName, ib.Status.FlashTaskRunName} {
 		if name == "" {
 			continue
 		}

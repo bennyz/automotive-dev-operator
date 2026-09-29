@@ -25,9 +25,12 @@ func TestNoHardcodedOCIStringsInScripts(t *testing.T) {
 	}
 
 	allKeys := spec.AllManifestAnnotationKeys()
-	forbiddenAnnotationKeys := make([]string, 0, len(allKeys)+len(spec.Annotations.Layer.Custom))
+	forbiddenAnnotationKeys := make([]string, 0, len(allKeys)+len(spec.Annotations.Manifest.Standard)+len(spec.Annotations.Layer.Custom))
 	for _, ak := range allKeys {
 		forbiddenAnnotationKeys = append(forbiddenAnnotationKeys, `"`+spec.AnnotationKey(ak.Key)+`"`)
+	}
+	for _, ak := range spec.Annotations.Manifest.Standard {
+		forbiddenAnnotationKeys = append(forbiddenAnnotationKeys, `"`+ak.Key+`"`)
 	}
 	for _, ak := range spec.Annotations.Layer.Custom {
 		forbiddenAnnotationKeys = append(forbiddenAnnotationKeys, `"`+spec.AnnotationKey(ak.Key)+`"`)

@@ -270,6 +270,11 @@ if task_bundle:   a[e["OCI_ANN_TASK_BUNDLE_REF"]]          = task_bundle
 if custom_defs:   a[e["OCI_ANN_CUSTOM_DEFINES"]]           = custom_defs
 if extra_args:    a[e["OCI_ANN_AIB_EXTRA_ARGS"]]           = extra_args
 if export_fmt:    a[e["OCI_ANN_EXPORT_FORMAT"]]            = export_fmt
+source_path = "/workspace/shared/.caib-source/source.json"
+if os.path.isfile(source_path):
+    with open(source_path) as f:
+        source = json.load(f)
+    a.update({e["OCI_ANN_SOURCE"]: source["url"], e["OCI_ANN_REVISION"]: source["commit"]})
 print(json.dumps(a))
 PYEOF
 )
@@ -351,6 +356,10 @@ if task_bundle:   annotations[e["OCI_ANN_TASK_BUNDLE_REF"]]          = task_bund
 if custom_defs:   annotations[e["OCI_ANN_CUSTOM_DEFINES"]]           = custom_defs
 if extra_args:    annotations[e["OCI_ANN_AIB_EXTRA_ARGS"]]           = extra_args
 if export_fmt:    annotations[e["OCI_ANN_EXPORT_FORMAT"]]            = export_fmt
+source_path = Path("/workspace/shared/.caib-source/source.json")
+if source_path.is_file():
+    source = json.loads(source_path.read_text())
+    annotations.update({e["OCI_ANN_SOURCE"]: source["url"], e["OCI_ANN_REVISION"]: source["commit"]})
 Path(out_file).write_text(json.dumps({"$manifest": annotations}))
 PYEOF
 

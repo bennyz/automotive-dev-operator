@@ -63,6 +63,24 @@ var _ = Describe("Log Streaming", func() {
 			isTerminalPhase = originalIsTerminal
 		})
 
+		It("refreshes the PipelineRun name after source streaming has started", func() {
+			scheme := runtime.NewScheme()
+			Expect(automotivev1alpha1.AddToScheme(scheme)).To(Succeed())
+			stored := &automotivev1alpha1.ImageBuild{
+				ObjectMeta: metav1.ObjectMeta{Name: "git-build", Namespace: "default"},
+				Status: automotivev1alpha1.ImageBuildStatus{
+					Phase: "Building", SourceTaskRunName: "source-run", PipelineRunName: "build-run",
+				},
+			}
+			k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(stored).Build()
+			following := &automotivev1alpha1.ImageBuild{Status: automotivev1alpha1.ImageBuildStatus{SourceTaskRunName: "source-run"}}
+			Expect(buildLogPodSelectors(following)).To(Equal([]string{"tekton.dev/taskRun=source-run"}))
+			Expect(shouldExitLogStream(testContext(), k8sClient, "git-build", "default", following, false)).To(BeFalse())
+			Expect(buildLogPodSelectors(following)).To(Equal([]string{
+				"tekton.dev/pipelineRun=build-run,tekton.dev/memberOf=tasks", "tekton.dev/taskRun=source-run",
+			}))
+		})
+
 		It("returns true when phase is terminal and all pods complete", func() {
 			isTerminalPhase = func(_ string) bool { return true }
 
@@ -241,7 +259,7 @@ var _ = Describe("Log Streaming", func() {
 			}
 			k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ib).Build()
 
-			result := isBuildTerminal(testContext(), k8sClient, "done-build", "default")
+			result := isBuildTerminal(testContext(), k8sClient, "done-build", "default", ib)
 			Expect(result).To(BeTrue())
 		})
 
@@ -257,7 +275,7 @@ var _ = Describe("Log Streaming", func() {
 			}
 			k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ib).Build()
 
-			result := isBuildTerminal(testContext(), k8sClient, "running-build", "default")
+			result := isBuildTerminal(testContext(), k8sClient, "running-build", "default", ib)
 			Expect(result).To(BeFalse())
 		})
 
@@ -266,7 +284,7 @@ var _ = Describe("Log Streaming", func() {
 			Expect(automotivev1alpha1.AddToScheme(scheme)).To(Succeed())
 			k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
 
-			result := isBuildTerminal(testContext(), k8sClient, "missing", "default")
+			result := isBuildTerminal(testContext(), k8sClient, "missing", "default", &automotivev1alpha1.ImageBuild{})
 			Expect(result).To(BeFalse())
 		})
 	})

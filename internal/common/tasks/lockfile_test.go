@@ -106,7 +106,7 @@ func TestLockfileReproducibilityArtifacts(t *testing.T) {
 	}
 	for _, want := range []string{
 		`rm -f "$AIB_LOCKFILE"`,
-		`cp "$MANIFEST_CONFIG_PATH/aib.lock" "$AIB_LOCKFILE"`,
+		`cp "$LOCKFILE_PATH" "$AIB_LOCKFILE"`,
 	} {
 		if !strings.Contains(string(buildScript), want) {
 			t.Fatalf("build script missing %q", want)
@@ -192,6 +192,7 @@ func TestPackageReproducibleInputsPreservesBuildLockfile(t *testing.T) {
 				"WORKSPACE_PATH="+workspaceDir,
 				"MANIFEST_FILE="+manifestPath,
 				"MANIFEST_CONFIG_PATH="+configDir,
+				"LOCKFILE_PATH="+filepath.Join(configDir, "aib.lock"),
 			)
 			if out, err := cmd.CombinedOutput(); err != nil {
 				t.Fatalf("script failed: %v\n%s", err, out)

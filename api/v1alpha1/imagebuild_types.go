@@ -50,6 +50,7 @@ func IsTerminalBuildPhase(phase string) bool {
 // +kubebuilder:validation:XValidation:rule="!has(self.reproducible) || !self.reproducible || self.secureBuild",message="reproducible builds require secureBuild to be true"
 // +kubebuilder:validation:XValidation:rule="!(has(self.export) && has(self.export.disk) && has(self.export.disk.oci) && size(self.export.disk.oci) > 0) || size(self.secretRef) > 0 || (has(self.export) && has(self.export.useServiceAccountAuth) && self.export.useServiceAccountAuth)",message="secretRef is required when export.disk.oci is set (unless useServiceAccountAuth is true)"
 // +kubebuilder:validation:XValidation:rule="!(has(self.export) && has(self.export.container) && size(self.export.container) > 0) || size(self.secretRef) > 0 || (has(self.export) && has(self.export.useServiceAccountAuth) && self.export.useServiceAccountAuth)",message="secretRef is required when export.container is set (unless useServiceAccountAuth is true)"
+// +kubebuilder:validation:XValidation:rule="!has(self.aib) || !has(self.aib.gitSource) || ((!has(self.workspace) || size(self.workspace) == 0) && (!has(self.buildCachePVC) || size(self.buildCachePVC) == 0))",message="Git sources cannot be combined with workspace or build cache PVC"
 type ImageBuildSpec struct {
 	// +kubebuilder:validation:MaxLength=512
 	// +optional
@@ -168,7 +169,12 @@ type FlashSpec struct {
 
 // AIBSpec defines the automotive-image-builder configuration
 // +kubebuilder:validation:XValidation:rule="(has(self.manifest) ? bytes(self.manifest).size() : 0) + (has(self.lockfile) ? bytes(self.lockfile).size() : 0) <= 921600",message="manifest and lockfile must not exceed 921600 bytes combined"
+// +kubebuilder:validation:XValidation:rule="!has(self.gitSource) || ((!has(self.manifest) || bytes(self.manifest).size() == 0) && (!has(self.lockfile) || bytes(self.lockfile).size() == 0) && (!has(self.mode) || self.mode != 'disk') && (!has(self.inputFilesServer) || !self.inputFilesServer) && (!has(self.ociRepoImages) || size(self.ociRepoImages) == 0))",message="Git sources cannot be combined with inline manifest/lockfile, disk mode, uploads, or OCI repository overlays"
 type AIBSpec struct {
+	// GitSource supplies the manifest and files instead of inline content.
+	// +optional
+	GitSource *GitSource `json:"gitSource,omitempty"`
+
 	// Distro specifies the distribution to build for (e.g., "autosd")
 	// +kubebuilder:validation:Required
 	Distro string `json:"distro"`
@@ -313,6 +319,19 @@ type S3Export struct {
 // ImageBuildStatus defines the observed state of ImageBuild
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.terminalResult) || has(self.terminalResult)",message="terminal result cannot be removed"
 type ImageBuildStatus struct {
+	// SourceTaskRunName identifies the source preparation execution.
+	// +optional
+	SourceTaskRunName string `json:"sourceTaskRunName,omitempty"`
+	// DiscoveredCommit pins the revision found before the workspace PVC is used.
+	// +optional
+	DiscoveredCommit string `json:"discoveredCommit,omitempty"`
+	// DiscoveredTarget is the manifest target found at DiscoveredCommit.
+	// +optional
+	DiscoveredTarget string `json:"discoveredTarget,omitempty"`
+	// SourceCommit pins the checkout for this build and any execution retries.
+	// +optional
+	SourceCommit string `json:"sourceCommit,omitempty"`
+
 	// +kubebuilder:validation:MaxItems=64
 	// +optional
 	Artifacts []ArtifactStatus `json:"artifacts,omitempty"`
@@ -389,6 +408,9 @@ type ImageBuildStatus struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
+// Keep this rule on ImageBuild: optional spec/aib removal must not bypass it,
+// while ScheduledImageBuild templates that reuse ImageBuildSpec stay editable.
+// +kubebuilder:validation:XValidation:rule="(has(self.spec) && has(self.spec.aib) && has(self.spec.aib.gitSource)) == (has(oldSelf.spec) && has(oldSelf.spec.aib) && has(oldSelf.spec.aib.gitSource)) && (!(has(self.spec) && has(self.spec.aib) && has(self.spec.aib.gitSource)) || self.spec.aib.gitSource == oldSelf.spec.aib.gitSource)",message="gitSource is immutable"
 
 // ImageBuild is the Schema for the imagebuilds API
 type ImageBuild struct {

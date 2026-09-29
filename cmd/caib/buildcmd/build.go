@@ -57,6 +57,10 @@ type Options struct {
 	CustomDefs             *[]string
 	DefineFiles            *[]string
 	AIBExtraArgs           *[]string
+	GitURL                 *string
+	GitRef                 *string
+	GitSecret              *string
+	GitLockfile            *string
 	Lockfile               *string
 	RootPassword           *string
 	ExtraRepos             *[]string
@@ -878,7 +882,7 @@ func (h *Handler) RunBuild(cmd *cobra.Command, args []string) {
 		return
 	}
 
-	manifestBytes, err := os.ReadFile(manifestPath)
+	manifestBytes, gitSource, err := h.readBuildSource(manifestPath)
 	if err != nil {
 		h.handleError(fmt.Errorf("error reading manifest: %w", err))
 		return
@@ -886,14 +890,14 @@ func (h *Handler) RunBuild(cmd *cobra.Command, args []string) {
 
 	h.resolveTarget(cmd, common.ManifestTarget(manifestBytes))
 
-	validateFlash := *h.opts.FlashAfterBuild && *h.opts.ExporterSelector == ""
+	validateFlash := gitSource == nil && *h.opts.FlashAfterBuild && *h.opts.ExporterSelector == ""
 	operatorConfig, cfgErr := h.fetchTargetDefaults(ctx, api, *h.opts.Target, validateFlash)
 	if cfgErr != nil {
 		h.handleError(cfgErr)
 		return
 	}
 
-	if !h.validateManifestSchema(operatorConfig, manifestBytes) {
+	if gitSource == nil && !h.validateManifestSchema(operatorConfig, manifestBytes) {
 		return
 	}
 
@@ -924,6 +928,7 @@ func (h *Handler) RunBuild(cmd *cobra.Command, args []string) {
 	req := buildapitypes.BuildRequest{
 		Name:                   *h.opts.BuildName,
 		Manifest:               string(manifestBytes),
+		GitSource:              gitSource,
 		ManifestFileName:       filepath.Base(manifestPath),
 		Distro:                 buildapitypes.Distro(*h.opts.Distro),
 		Target:                 buildapitypes.Target(*h.opts.Target),
@@ -958,7 +963,10 @@ func (h *Handler) RunBuild(cmd *cobra.Command, args []string) {
 		return
 	}
 
-	ApplyTargetDefaults(cmd, operatorConfig, &req)
+	if req.GitSource == nil {
+		ApplyTargetDefaults(cmd, operatorConfig, &req)
+	}
+	deferGitDefaults(cmd, &req)
 
 	if err := h.applyFlashOptions(&req, "--push-disk"); err != nil {
 		h.handleError(err)
@@ -1168,7 +1176,7 @@ func (h *Handler) RunBuildDev(cmd *cobra.Command, args []string) {
 		return
 	}
 
-	manifestBytes, err := os.ReadFile(manifestPath)
+	manifestBytes, gitSource, err := h.readBuildSource(manifestPath)
 	if err != nil {
 		h.handleError(fmt.Errorf("error reading manifest: %w", err))
 		return
@@ -1176,14 +1184,14 @@ func (h *Handler) RunBuildDev(cmd *cobra.Command, args []string) {
 
 	h.resolveTarget(cmd, common.ManifestTarget(manifestBytes))
 
-	validateFlash := *h.opts.FlashAfterBuild && *h.opts.ExporterSelector == ""
+	validateFlash := gitSource == nil && *h.opts.FlashAfterBuild && *h.opts.ExporterSelector == ""
 	operatorConfig, cfgErr := h.fetchTargetDefaults(ctx, api, *h.opts.Target, validateFlash)
 	if cfgErr != nil {
 		h.handleError(cfgErr)
 		return
 	}
 
-	if !h.validateManifestSchema(operatorConfig, manifestBytes) {
+	if gitSource == nil && !h.validateManifestSchema(operatorConfig, manifestBytes) {
 		return
 	}
 
@@ -1220,6 +1228,7 @@ func (h *Handler) RunBuildDev(cmd *cobra.Command, args []string) {
 	req := buildapitypes.BuildRequest{
 		Name:                   *h.opts.BuildName,
 		Manifest:               string(manifestBytes),
+		GitSource:              gitSource,
 		ManifestFileName:       filepath.Base(manifestPath),
 		Distro:                 buildapitypes.Distro(*h.opts.Distro),
 		Target:                 buildapitypes.Target(*h.opts.Target),
@@ -1250,7 +1259,10 @@ func (h *Handler) RunBuildDev(cmd *cobra.Command, args []string) {
 		return
 	}
 
-	ApplyTargetDefaults(cmd, operatorConfig, &req)
+	if req.GitSource == nil {
+		ApplyTargetDefaults(cmd, operatorConfig, &req)
+	}
+	deferGitDefaults(cmd, &req)
 
 	if err := h.applyFlashOptions(&req, "--push"); err != nil {
 		h.handleError(err)
@@ -1300,6 +1312,9 @@ func (h *Handler) prepareManifestUploads(
 	req *buildapitypes.BuildRequest,
 	manifestPath string,
 ) ([]map[string]string, func(), error) {
+	if req.GitSource != nil {
+		return nil, nopWorkspaceCleanup, nil
+	}
 	workspaceBuild := h.opts.Workspace != nil && strings.TrimSpace(*h.opts.Workspace) != ""
 	rewritten, localRefs, err := common.PrepareLocalFileUploads(req.Manifest, filepath.Dir(manifestPath), workspaceBuild)
 	if err != nil {

@@ -1330,31 +1330,35 @@ func (a *APIServer) applyAllExtraRepos(ctx context.Context, c *gin.Context, span
 	return true
 }
 
+func (a *APIServer) prepareBuildRequest(c *gin.Context, span trace.Span, req *BuildRequest) (bool, bool) {
+	if !bindOperationRequest(c, req) {
+		return false, false
+	}
+	needsUpload := req.HasLocalFiles || manifestNeedsUpload(req.Manifest)
+	if err := validateBuildRequest(req); err != nil {
+		spanError(span, err)
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return false, false
+	}
+	if err := applyBuildDefaults(req); err != nil {
+		spanError(span, err)
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return false, false
+	}
+	if req.GitSource == nil && !a.validateManifestSchema(c, span, req) {
+		return false, false
+	}
+	return needsUpload, true
+}
+
 func (a *APIServer) createBuild(c *gin.Context) {
 	ctx, span := apiTracer.Start(c.Request.Context(), "createBuild")
 	defer span.End()
 	c.Request = c.Request.WithContext(ctx)
 
 	var req BuildRequest
-	if !bindOperationRequest(c, &req) {
-		return
-	}
-
-	needsUpload := req.HasLocalFiles || manifestNeedsUpload(req.Manifest)
-
-	if err := validateBuildRequest(&req); err != nil {
-		spanError(span, err)
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-
-	if err := applyBuildDefaults(&req); err != nil {
-		spanError(span, err)
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-
-	if !a.validateManifestSchema(c, span, &req) {
+	needsUpload, ok := a.prepareBuildRequest(c, span, &req)
+	if !ok {
 		return
 	}
 
@@ -1365,6 +1369,12 @@ func (a *APIServer) createBuild(c *gin.Context) {
 	}
 
 	namespace := resolveNamespace()
+	requestedBy := a.resolveRequester(c)
+	if err := validateGitCredentials(ctx, k8sClient, namespace, requestedBy, req.GitSource); err != nil {
+		c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+		return
+	}
+
 	if httpErr := validateCallbackAdmission(ctx, k8sClient, namespace, req.Callback); httpErr != nil {
 		spanError(span, errors.New(httpErr.message))
 		c.JSON(httpErr.code, gin.H{"error": httpErr.message})
@@ -1387,8 +1397,6 @@ func (a *APIServer) createBuild(c *gin.Context) {
 	// Append a short random suffix to ensure unique names for parallel builds
 	req.Name = fmt.Sprintf("%s-%s", req.Name, uuid.New().String()[:5])
 	span.SetAttributes(attribute.String("build.name", req.Name))
-
-	requestedBy := a.resolveRequester(c)
 
 	taskBundleRef, bundleStatus, bundleErr := resolveTaskBundleRef(ctx, k8sClient, namespace, &req)
 	if bundleErr != nil {
@@ -1478,6 +1486,12 @@ func (a *APIServer) createBuild(c *gin.Context) {
 	annotations := map[string]string{
 		automotivev1alpha1.AnnotationRequestedBy: requestedBy,
 		automotivev1alpha1.AnnotationTraceID:     traceID,
+	}
+	if req.ArchitectureFallback != "" {
+		annotations[labels.DefaultArchitecture] = string(req.ArchitectureFallback)
+	}
+	if req.GitSource != nil && req.Architecture != "" {
+		annotations[labels.ArchitectureSource] = "explicit"
 	}
 	callbackSecretRef := ""
 	if req.Callback != nil {
@@ -1748,12 +1762,15 @@ func (a *APIServer) getBuild(c *gin.Context, name string) {
 
 	writeJSON(c, http.StatusOK, BuildResponse{
 		ExternalID: build.Spec.ExternalID, Artifacts: storedArtifacts(build), Flash: storedFlash(build),
-		Notification: notificationStatus,
-		Name:         build.Name,
-		Phase:        build.Status.Phase,
-		Message:      build.Status.Message,
-		RequestedBy:  build.Annotations[labels.RequestedBy],
-		TraceID:      build.Annotations[automotivev1alpha1.AnnotationTraceID],
+		Notification:       notificationStatus,
+		GitSource:          build.Spec.GetGitSource(),
+		SourceCommit:       build.Status.SourceCommit,
+		ArchitectureSource: build.Annotations[labels.ArchitectureSource],
+		Name:               build.Name,
+		Phase:              build.Status.Phase,
+		Message:            build.Status.Message,
+		RequestedBy:        build.Annotations[labels.RequestedBy],
+		TraceID:            build.Annotations[automotivev1alpha1.AnnotationTraceID],
 		StartTime: func() string {
 			if build.Status.StartTime != nil {
 				return build.Status.StartTime.Format(time.RFC3339)
@@ -1819,9 +1836,16 @@ func getBuildTemplate(c *gin.Context, name string) {
 	}
 
 	sourceFiles := extractManifestSourceFiles(manifest)
+	gitSource := build.Spec.GetGitSource()
+	if gitSource != nil && build.Status.SourceCommit != "" {
+		resolved := *gitSource
+		resolved.Revision = build.Status.SourceCommit
+		gitSource = &resolved
+	}
 
 	writeJSON(c, http.StatusOK, BuildTemplateResponse{
 		BuildRequest: BuildRequest{
+			GitSource:              gitSource,
 			Name:                   build.Name,
 			Manifest:               manifest,
 			ResolveOnly:            build.Spec.GetResolveOnly(),

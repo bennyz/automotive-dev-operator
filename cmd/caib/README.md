@@ -122,6 +122,10 @@ caib image build <manifest.aib.yml> [flags]
 | `-d`, `--distro` | `autosd` | Distribution to build |
 | `-t`, `--target` | `qemu` | Target platform |
 | `-a`, `--arch` | (current system) | Architecture (`amd64`, `arm64`) |
+| `--git-url` | | HTTPS repository containing the manifest |
+| `--git-ref` | remote HEAD | Branch, tag, or full commit ID (requires `--git-url`) |
+| `--git-secret` | | Namespace-local basic-auth Secret for a private repository (requires `--git-url`) |
+| `--git-lockfile` | adjacent `<manifest>.lock` | Repository-relative path to a committed lockfile (requires `--git-url`) |
 | `--disk` | `false` | Also build a disk image from the container |
 | `--format` | (inferred from `-o`) | Disk image format (`qcow2`, `raw`, `simg`) |
 | `--compress` | `gzip` | Compression algorithm (`gzip`, `xz`) |
@@ -251,6 +255,8 @@ Builds a disk image (ostree or package-based) for development workflows. Creates
 ```bash
 caib image build-dev <manifest.aib.yml> [flags]
 ```
+
+`build-dev` accepts the same `--git-url`, `--git-ref`, `--git-secret`, and `--git-lockfile` options as `build`.
 
 **Required flags:**
 | Flag | Description |
@@ -570,6 +576,46 @@ caib image cancel <build-name> [flags]
 | Update mechanism | `bootc switch/upgrade` | Requires re-imaging |
 | Use case | OTA-updatable systems | Development/standalone disk images |
 | Mode | Always `bootc` | `image` or `package` |
+
+## Building from Git
+
+Pass a repository-relative manifest path to `build` or `build-dev` with `--git-url`. When the architecture is unknown, a PVC-free discovery TaskRun reads the manifest target before the source TaskRun checks out and validates the repository onto the build PVC. If the lockfile produced by `caib image resolve` is committed beside the manifest (for example, `simple.aib.lock` for `simple.aib.yml`), the build uses it. Use `--git-lockfile locks/release.json` to select a different committed file; an explicit selection must exist in the same commit. Local `--lockfile` overrides are not supported with Git sources. Use `--git-ref` to choose a branch, tag, or full commit ID. `caib image show` reports the resolved commit, and build templates use that commit for a repeatable run.
+
+A lockfile covers one architecture; when building the same manifest for both arm64 and amd64, commit separate locks and select the right one with `--git-lockfile`.
+
+Use `refs/tags/<name>` or `refs/heads/<name>` for a hex-only tag or branch name; an unqualified hex value shorter than a full commit ID is rejected as an abbreviated SHA. With Git sources, explicit `--extra-args` replace the target-default extra args. Omit the flag to use those defaults. The source TaskRun timeout follows `osBuilds.buildTimeoutMinutes` when configured.
+
+An explicit `--arch` skips discovery. An explicit `--target` also skips it. The controller chooses the architecture from `--arch`, the target defaults, then the CLI host architecture; direct API and CR builds without a fallback use `arm64`. `caib image show` reports where the chosen architecture came from. On topology-bound or node-local storage, the checkout and build pods are then scheduled with the same architecture constraint. If the Git revision changes between discovery and checkout, the build fails rather than using a different commit; retry the build to discover the new target.
+
+```bash
+caib image build images/demo.aib.yml \
+  --git-url https://git.example.com/team/os.git \
+  --git-ref main \
+  --push quay.io/team/os:latest
+
+caib image build-dev images/dev.aib.yml \
+  --git-url https://git.example.com/team/os.git \
+  --git-ref main --mode package -o dev.raw
+```
+
+For a private repository, a cluster administrator must create a `kubernetes.io/basic-auth` Secret in the build namespace. The Secret must have `tekton.dev/git-0` set to the repository's HTTPS origin and `automotive.sdv.cloud.redhat.com/requested-by` set to the requesting identity as reported by the API. The API checks both annotations; the controller enforces the host binding for ImageBuild resources created directly. The CLI does not create this Secret.
+
+Do not link this Secret to the build ServiceAccount: Tekton may then inject it into unrelated builds. Restrict direct ImageBuild creation with RBAC, because a caller who can create ImageBuild resources can reference another user's Secret for a repository on the same allowed host.
+
+```bash
+oc -n automotive-dev-operator create secret generic team-git-auth \
+  --type=kubernetes.io/basic-auth \
+  --from-literal=username=YOUR_USERNAME \
+  --from-literal=password=YOUR_TOKEN
+oc -n automotive-dev-operator annotate secret team-git-auth \
+  tekton.dev/git-0=https://git.example.com \
+  automotive.sdv.cloud.redhat.com/requested-by=YOUR_REQUESTER_ID
+caib image build images/demo.aib.yml \
+  --git-url https://git.example.com/team/os.git \
+  --git-secret team-git-auth --push quay.io/team/os:latest
+```
+
+Git builds with `--secure` require a newly published task bundle containing `prepare-git-source` and `discover-git-source`. Older bundles cannot resolve these tasks.
 
 ## Secure & Reproducible Builds
 

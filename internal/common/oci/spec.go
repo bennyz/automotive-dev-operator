@@ -38,6 +38,7 @@ type AnnotationSpec struct {
 type ManifestAnnotations struct {
 	Required []AnnotationKey `json:"required"`
 	Optional []AnnotationKey `json:"optional"`
+	Standard []AnnotationKey `json:"standard"`
 }
 
 // LayerAnnotations separates custom (prefixed) from standard OCI keys.
@@ -116,6 +117,9 @@ func (s *Spec) ShellVars() string {
 	}
 	for _, ak := range s.Annotations.Manifest.Optional {
 		fmt.Fprintf(&b, "export OCI_ANN_%s=%q\n", ak.Var, s.AnnotationPrefix+ak.Key)
+	}
+	for _, ak := range s.Annotations.Manifest.Standard {
+		fmt.Fprintf(&b, "export OCI_ANN_%s=%q\n", ak.Var, ak.Key)
 	}
 
 	for _, ak := range s.Annotations.Layer.Custom {
