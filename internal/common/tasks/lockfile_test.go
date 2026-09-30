@@ -64,6 +64,8 @@ run_aib_followup_command() { shift; "$@"; }
 prefetch_locked_sources() { :; }
 aib() { printf 'CALL'; printf ' <%s>' "$@"; printf '\n'; }
 aib-dev() { aib "$@"; }
+prepare_container_image() { :; }
+import_container_for_disk() { :; }
 start_container_push() { :; }
 pull_registry_image() { :; }
 log_elapsed() { :; }

@@ -28,6 +28,8 @@ BUILD_START_TIME=$(date +%s)
 BUILD_DIR=""
 LOCAL_BUILDER_IMAGE=""
 CONTAINER_PUSH_PID=""
+CONTAINER_PUSH_DIGEST_FILE="/tmp/container-push-digest.txt"
+CONTAINER_IMAGE_DIGEST=""
 AIB_METADATA_PID=""
 AIB_METADATA_FINISHED=false
 RESTORE_TMPDIR=""
@@ -426,13 +428,14 @@ pull_registry_image() {
 }
 
 copy_to_registry() {
-  local source="$1" destination="$2" digest_file="${3:-}"
+  local source="$1" destination="$2" digest_file="${3:-}" preserve_digests="${4:-false}"
   local -a args=("${SKOPEO_COPY_TLS_ARGS[@]}")
   local registry_host="${destination%%/*}"
   local route_host="${CLUSTER_REGISTRY_ROUTE%%/*}"
   local auth_file=""
 
   [ -z "$digest_file" ] || args+=(--digestfile "$digest_file")
+  [ "$preserve_digests" != "true" ] || args+=(--preserve-digests)
   if [ "$registry_host" = "$INTERNAL_REGISTRY" ] || { [ -n "$route_host" ] && [ "$registry_host" = "$route_host" ]; }; then
     auth_file=$(mktemp /tmp/registry-push-auth.XXXXXX)
     create_service_account_auth "$registry_host" "$auth_file"
@@ -717,34 +720,66 @@ index_path.write_text(json.dumps(index, indent=2))
 PYEOF
 }
 
-start_container_push() {
+prepare_container_image() {
   [ "$NEEDS_PUSH" = "true" ] || return 0
   [ -n "$BUILDER_IMAGE" ] || fail "builder image is required to annotate the bootc container"
 
   finish_aib_metadata_capture
-  emit_progress "Pushing container" $((STEP_BUILD + 1)) "$PROGRESS_TOTAL"
-  rm -f /tmp/container-push-digest.txt
+  rm -f "$CONTAINER_PUSH_DIGEST_FILE"
   CONTAINER_OCI_DIR=$(mktemp -d /tmp/bootc-oci.XXXXXX)
+  local prepare_start copy_done
+  prepare_start=$(date +%s)
+  skopeo copy "containers-storage:$BOOTC_CONTAINER_NAME" "oci:${CONTAINER_OCI_DIR}:latest"
+  copy_done=$(date +%s)
+  log_elapsed "Container copy to OCI" "$prepare_start" "$copy_done"
+
+  annotate_oci_image "$CONTAINER_OCI_DIR"
+  log_elapsed "Container annotation" "$copy_done"
+  CONTAINER_IMAGE_DIGEST=$(skopeo inspect --format '{{.Digest}}' "oci:${CONTAINER_OCI_DIR}:latest")
+  [ -n "$CONTAINER_IMAGE_DIGEST" ] || fail "prepared container has no digest"
+
+  log_elapsed "Container preparation" "$prepare_start"
+}
+
+import_container_for_disk() {
+  local import_start local_digest
+  import_start=$(date +%s)
+  # Import the same annotated manifest while the push reads the OCI directory,
+  # keeping the OTA tag on the local image used for disk conversion.
+  skopeo copy --preserve-digests "oci:${CONTAINER_OCI_DIR}:latest" "containers-storage:$BOOTC_CONTAINER_NAME"
+  local_digest=$(skopeo inspect --format '{{.Digest}}' "containers-storage:$BOOTC_CONTAINER_NAME")
+  [ "$local_digest" = "$CONTAINER_IMAGE_DIGEST" ] \
+    || fail "disk source digest differs from prepared container: expected $CONTAINER_IMAGE_DIGEST, got $local_digest"
+  log_elapsed "Container import to storage" "$import_start"
+}
+
+start_container_push() {
+  [ "$NEEDS_PUSH" = "true" ] || return 0
+  emit_progress "Pushing container" $((STEP_BUILD + 1)) "$PROGRESS_TOTAL"
   local oci_dir="$CONTAINER_OCI_DIR"
 
   (
-    local push_start copy_done annotate_done push_done
+    local push_start
     push_start=$(date +%s)
-    skopeo copy "containers-storage:$BOOTC_CONTAINER_NAME" "oci:${oci_dir}:latest"
-    copy_done=$(date +%s)
-    log_elapsed "Container copy to OCI" "$push_start" "$copy_done"
-
-    annotate_oci_image "$oci_dir"
-    annotate_done=$(date +%s)
-    log_elapsed "Container annotation" "$copy_done" "$annotate_done"
-
-    copy_to_registry "oci:${oci_dir}:latest" "$CONTAINER_PUSH" /tmp/container-push-digest.txt
-    push_done=$(date +%s)
-    log_elapsed "Container registry push" "$annotate_done" "$push_done"
-    log_elapsed "Container push total" "$push_start" "$push_done"
-    rm -rf "$oci_dir"
+    copy_to_registry "oci:${oci_dir}:latest" "$CONTAINER_PUSH" "$CONTAINER_PUSH_DIGEST_FILE" "$SPLIT_BUILD"
+    log_elapsed "Container registry push" "$push_start"
   ) &
   CONTAINER_PUSH_PID=$!
+}
+
+wait_for_container_push() {
+  [ -n "$CONTAINER_PUSH_PID" ] || return 0
+  echo "Waiting for container push"
+  wait "$CONTAINER_PUSH_PID" || fail "container push failed"
+  CONTAINER_PUSH_PID=""
+  local pushed_digest
+  pushed_digest=$(cat "$CONTAINER_PUSH_DIGEST_FILE" 2>/dev/null || true)
+  [ -n "$pushed_digest" ] || fail "container push completed without a digest"
+  if [ "$SPLIT_BUILD" = "true" ] && [ "$pushed_digest" != "$CONTAINER_IMAGE_DIGEST" ]; then
+    fail "pushed digest differs from prepared container: expected $CONTAINER_IMAGE_DIGEST, got $pushed_digest"
+  fi
+  rm -rf "$CONTAINER_OCI_DIR"
+  CONTAINER_OCI_DIR=""
 }
 
 run_bootc() {
@@ -776,12 +811,14 @@ run_bootc() {
   local -a command=(aib --verbose build "${build_args[@]}")
   prefetch_locked_sources aib "${build_args[@]}"
   run_aib_command "Running bootc build" "${command[@]}"
+  prepare_container_image
   start_container_push
 
   if [ "$SPLIT_BUILD" = "true" ]; then
+    import_container_for_disk
     local disk_start
     disk_start=$(date +%s)
-    # Conversion consumes the local bootc image and remains network-isolated,
+    # Conversion consumes the prepared image and remains network-isolated,
     # but the primary build command is the provenance-bearing operation.
     run_aib_followup_command "Creating disk image" aib --verbose to-disk-image \
       "${FORMAT_ARGS[@]}" \
@@ -974,20 +1011,11 @@ record_artifact_integrity() {
 
 record_artifact_integrity
 
-wait_for_container_push() {
-  [ -n "$CONTAINER_PUSH_PID" ] || return 0
-  echo "Waiting for container push"
-  wait "$CONTAINER_PUSH_PID" || fail "container push failed"
-  CONTAINER_PUSH_PID=""
-  rm -rf "$CONTAINER_OCI_DIR"
-  CONTAINER_OCI_DIR=""
-}
-
 write_container_results() {
   [ "$NEEDS_PUSH" = "true" ] || return 0
 
   local pushed_digest result_path
-  pushed_digest=$(cat /tmp/container-push-digest.txt 2>/dev/null || true)
+  pushed_digest=$(cat "$CONTAINER_PUSH_DIGEST_FILE" 2>/dev/null || true)
   [ -n "$pushed_digest" ] || fail "container push completed without a digest"
 
   if [ "$SECURE_BUILD" = "true" ] || [ "$REPRODUCIBLE" = "true" ]; then
