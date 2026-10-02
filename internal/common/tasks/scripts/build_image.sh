@@ -40,6 +40,7 @@ AIB_IMAGE_PINNED=""
 FINAL_NAME=""
 AIB_BUILD_NETWORK_DISABLED=false
 AIB_SOURCE_PREFETCH_REQUIRED=false
+BUILDER_AUTH_FILE=""
 
 cleanup() {
   local status=$?
@@ -54,6 +55,7 @@ cleanup() {
   fi
   [ -z "$RESTORE_TMPDIR" ] || rm -rf "$RESTORE_TMPDIR"
   [ -z "$CONTAINER_OCI_DIR" ] || rm -rf "$CONTAINER_OCI_DIR"
+  [ -z "${BUILDER_AUTH_FILE:-}" ] || rm -f "$BUILDER_AUTH_FILE"
 
   return "$status"
 }
@@ -488,41 +490,33 @@ declare -a BUILD_CONTAINER_ARGS=()
 
 prepare_builder_if_needed() {
   if [ "$PREPARES_BUILDER" = "true" ]; then
-    local target_builder_image route_host auth_file builder_cached=false
+    local target_builder_image route_host
     target_builder_image="${CLUSTER_REGISTRY_ROUTE}/${NAMESPACE}/aib-build:${DISTRO}-${TARGET_ARCH}-${AIB_HASH}"
     route_host="${CLUSTER_REGISTRY_ROUTE%%/*}"
-    auth_file=$(mktemp /tmp/builder-registry-auth.XXXXXX)
-    create_service_account_auth "$route_host" "$auth_file"
+    BUILDER_AUTH_FILE=$(mktemp /tmp/builder-registry-auth.XXXXXX)
+    create_service_account_auth "$route_host" "$BUILDER_AUTH_FILE"
 
     emit_progress "Preparing builder" 2 "$PROGRESS_TOTAL"
-    if [ "$REBUILD_BUILDER" = "true" ]; then
-      echo "Rebuild requested, skipping builder cache check"
-    elif skopeo inspect "${SKOPEO_INSPECT_TLS_ARGS[@]}" --authfile="$auth_file" \
-      "docker://$target_builder_image" >/dev/null 2>&1; then
-      echo "Builder image found in cluster registry: $target_builder_image"
-      builder_cached=true
+    if [ "$SECURE_BUILD" = "true" ]; then
+      echo "WARNING: bootc helper builder preparation is online and is not covered by the application lockfile; only final AIB assembly is network-isolated"
     fi
-
-    if [ "$builder_cached" = "false" ]; then
-      if [ "$SECURE_BUILD" = "true" ]; then
-        echo "WARNING: bootc helper builder preparation is online and is not covered by the application lockfile; only final AIB assembly is network-isolated"
-      fi
-      echo "Building builder image $LOCAL_BUILDER_IMAGE"
-      aib --verbose build-builder --build-dir "$BUILD_DIR" --cache "$BUILD_DIR/dnf-cache" \
-        --distro "$DISTRO" "${CUSTOM_DEFS_ARGS[@]}" "$LOCAL_BUILDER_IMAGE"
-      copy_to_registry "containers-storage:$LOCAL_BUILDER_IMAGE" "$target_builder_image"
-    fi
-
-    rm -f "$auth_file"
-    BUILDER_IMAGE="$target_builder_image"
+    refresh_builder_image "$target_builder_image" "$LOCAL_BUILDER_IMAGE" "$BUILDER_AUTH_FILE" true \
+      --build-dir "$BUILD_DIR" --cache "$BUILD_DIR/dnf-cache" \
+      --distro "$DISTRO" "${CUSTOM_DEFS_ARGS[@]}"
+    rm -f "$BUILDER_AUTH_FILE"
+    BUILDER_AUTH_FILE=""
   fi
 
   write_result builder-image "$BUILDER_IMAGE"
 
   if [ "$PULLS_BUILDER" = "true" ]; then
-    emit_progress "Pulling builder image" $((STEP_BUILD - 1)) "$PROGRESS_TOTAL"
-    echo "Pulling builder image: $BUILDER_IMAGE"
-    pull_registry_image "$BUILDER_IMAGE" "containers-storage:$LOCAL_BUILDER_IMAGE"
+    if [ "$PREPARES_BUILDER" != "true" ]; then
+      emit_progress "Pulling builder image" $((STEP_BUILD - 1)) "$PROGRESS_TOTAL"
+      echo "Pulling builder image: $BUILDER_IMAGE"
+      pull_registry_image "$BUILDER_IMAGE" "containers-storage:$LOCAL_BUILDER_IMAGE"
+    else
+      emit_progress "Builder image ready" $((STEP_BUILD - 1)) "$PROGRESS_TOTAL"
+    fi
     BUILD_CONTAINER_ARGS=(--build-container "$LOCAL_BUILDER_IMAGE")
   fi
 }

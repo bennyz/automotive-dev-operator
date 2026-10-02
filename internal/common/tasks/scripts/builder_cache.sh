@@ -1,0 +1,96 @@
+# shellcheck shell=bash
+
+builder_digest_ref() {
+  local ref="$1" digest="$2"
+  if [[ ! "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+    echo "ERROR: invalid builder image digest: $digest" >&2
+    return 1
+  fi
+  ref="${ref%%@*}"
+  local name="${ref##*/}"
+  if [[ "$ref" == */* ]]; then
+    printf '%s@%s' "${ref%/*}/${name%%:*}" "$digest"
+  else
+    printf '%s@%s' "${name%%:*}" "$digest"
+  fi
+}
+
+builder_local_digest() {
+  local image="$1" digest
+  if ! digest=$(skopeo inspect --format '{{.Digest}}' "containers-storage:$image"); then
+    echo "ERROR: could not inspect local builder: $image" >&2
+    return 1
+  fi
+  if [ -z "$digest" ]; then
+    echo "ERROR: local builder has no manifest digest: $image" >&2
+    return 1
+  fi
+  printf '%s' "$digest"
+}
+
+# Sets BUILDER_IMAGE to the registry digest corresponding to the local helper.
+# Compare local digests separately: registry copies may convert manifest formats.
+refresh_builder_image() {
+  local target="$1" local_image="$2" auth_file="$3" sync_local="$4"
+  shift 4
+  local cached_digest="" old_local_digest="" new_local_digest pinned_ref digest_file
+  local -a freshness_args=(--if-needed)
+
+  if [ "$REBUILD_BUILDER" = "true" ]; then
+    echo "Rebuild requested, skipping builder cache check"
+    freshness_args=()
+  elif cached_digest=$(skopeo inspect "${SKOPEO_INSPECT_TLS_ARGS[@]}" \
+    --authfile="$auth_file" --format '{{.Digest}}' "docker://$target" 2>/dev/null); then
+    pinned_ref=$(builder_digest_ref "$target" "$cached_digest") || return 1
+    echo "Checking cached builder: $pinned_ref"
+    skopeo copy "${SKOPEO_COPY_TLS_ARGS[@]}" --authfile="$auth_file" \
+      "docker://$pinned_ref" "containers-storage:$local_image" || {
+      echo "ERROR: could not pull cached builder: $pinned_ref" >&2
+      return 1
+    }
+    old_local_digest=$(builder_local_digest "$local_image") || return 1
+  else
+    cached_digest=""
+    echo "No cached builder available: $target"
+  fi
+
+  aib --verbose build-builder "${freshness_args[@]}" "$@" "$local_image" || {
+    echo "ERROR: builder preparation failed: $local_image" >&2
+    return 1
+  }
+  new_local_digest=$(builder_local_digest "$local_image") || return 1
+
+  if [ -n "$cached_digest" ] && [ "$old_local_digest" = "$new_local_digest" ]; then
+    echo "Builder is up to date"
+    BUILDER_IMAGE=$(builder_digest_ref "$target" "$cached_digest") || return 1
+    return 0
+  fi
+
+  digest_file=$(mktemp /tmp/builder-push-digest.XXXXXX) || {
+    echo "ERROR: could not create builder push digest file" >&2
+    return 1
+  }
+  echo "Pushing updated builder: $target"
+  if ! skopeo copy "${SKOPEO_COPY_TLS_ARGS[@]}" --authfile="$auth_file" --digestfile "$digest_file" \
+    "containers-storage:$local_image" "docker://$target"; then
+    rm -f "$digest_file"
+    echo "ERROR: could not push updated builder: $target" >&2
+    return 1
+  fi
+  cached_digest=$(cat "$digest_file")
+  rm -f "$digest_file"
+  pinned_ref=$(builder_digest_ref "$target" "$cached_digest") || return 1
+
+  # Registry conversion can change the manifest digest. Synchronize local
+  # consumers with the recorded digest; the prepare-only task has no consumer.
+  if [ "$sync_local" = "true" ]; then
+    skopeo copy "${SKOPEO_COPY_TLS_ARGS[@]}" --authfile="$auth_file" \
+      "docker://$pinned_ref" "containers-storage:$local_image" || {
+      echo "ERROR: could not synchronize local builder with pushed digest: $pinned_ref" >&2
+      return 1
+    }
+  fi
+  # Consumed by the task script prepended alongside this helper.
+  # shellcheck disable=SC2034
+  BUILDER_IMAGE="$pinned_ref"
+}
