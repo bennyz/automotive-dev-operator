@@ -11,11 +11,19 @@ import (
 func TestBuilderCache(t *testing.T) {
 	for _, entrypoint := range []string{"build", "prepare"} {
 		for _, tc := range []struct {
-			name, scenario string
-			force, fails   bool
-			pulls, pushes  int
+			name, scenario, policy                 string
+			force, fails, skipAIB, prepareSucceeds bool
+			pulls, pushes                          int
 		}{
 			{name: "unchanged", scenario: "unchanged", pulls: 1},
+			{name: "explicit validation", scenario: "unchanged", policy: "validate", pulls: 1},
+			{name: "reuse without depsolve", scenario: "aib-fail", policy: "reuse", pulls: 1, skipAIB: true},
+			{name: "reuse cache miss builds", scenario: "missing", policy: "reuse", pulls: 1, pushes: 1},
+			{name: "force overrides reuse", scenario: "unchanged", policy: "reuse", force: true, pulls: 1, pushes: 1},
+			{name: "reuse pull failure only affects local consumer", scenario: "pull-fail", policy: "reuse", fails: true, prepareSucceeds: true, skipAIB: true},
+			{name: "reuse local inspection failure only affects local consumer", scenario: "inspect-fail", policy: "reuse", fails: true, prepareSucceeds: true, skipAIB: true},
+			{name: "reuse invalid digest is fatal", scenario: "cache-invalid", policy: "reuse", fails: true},
+			{name: "invalid policy", scenario: "unchanged", policy: "invalid", fails: true},
 			{name: "changed inputs", scenario: "changed", pulls: 2, pushes: 1},
 			{name: "cache miss", scenario: "missing", pulls: 1, pushes: 1},
 			{name: "forced identical rebuild", scenario: "unchanged", force: true, pulls: 1, pushes: 1},
@@ -34,31 +42,25 @@ func TestBuilderCache(t *testing.T) {
 			}
 			t.Run(entrypoint+"/"+tc.name, func(t *testing.T) {
 				dir := t.TempDir()
-				body := builderCacheHarness + builderCacheScript
-				if entrypoint == "build" {
-					body += shellFunctions(t, buildImageScript, "cleanup() {", "fail() {")
-					body += shellFunctions(t, buildImageScript, "prepare_builder_if_needed() {", "\nprepare_builder_if_needed\n") + "\nprepare_builder_if_needed\n"
-				} else {
-					body += strings.ReplaceAll(buildBuilderScript, "$(workspaces.manifest-config-workspace.path)", dir)
-				}
-				body += "\nprintf 'SUCCESS <%s>\\n' \"$(cat \"$RESULT_PATH\")\"\n"
+				body := builderCacheTestScript(t, entrypoint, dir)
 				force := "false"
 				if tc.force {
 					force = "true"
 				}
 				cmd := exec.Command("bash", "-c", body)
 				cmd.Env = append(os.Environ(), "TEST_DIR="+dir, "RESULT_PATH="+filepath.Join(dir, "result"),
-					"SCENARIO="+tc.scenario, "REBUILD_BUILDER="+force)
+					"SCENARIO="+tc.scenario, "REBUILD_BUILDER="+force, "BUILDER_CACHE_POLICY="+tc.policy)
 				output, err := cmd.CombinedOutput()
 				out := string(output)
-				if (err != nil) != tc.fails {
-					t.Fatalf("error=%v, want failure=%t\n%s", err, tc.fails, out)
+				fails := tc.fails && (entrypoint != "prepare" || !tc.prepareSucceeds)
+				if (err != nil) != fails {
+					t.Fatalf("error=%v, want failure=%t\n%s", err, fails, out)
 				}
 				leftovers, err := filepath.Glob(filepath.Join(dir, "builder-*-*.*"))
 				if err != nil || len(leftovers) != 0 {
 					t.Fatalf("temporary builder files leaked: %v, %v", leftovers, err)
 				}
-				if tc.fails {
+				if fails {
 					if !strings.Contains(out, "ERROR:") {
 						t.Errorf("failure has no diagnostic\n%s", out)
 					}
@@ -71,12 +73,26 @@ func TestBuilderCache(t *testing.T) {
 				if entrypoint == "prepare" && tc.pushes > 0 {
 					pulls--
 				}
-				for event, want := range map[string]int{"PULL <": pulls, "PUSH <": tc.pushes, "AIB <": 1} {
+				if entrypoint == "prepare" && tc.skipAIB {
+					pulls = 0
+					if _, err := os.Stat(filepath.Join(dir, "local-inspects")); !os.IsNotExist(err) {
+						t.Fatalf("prepare reuse inspected local storage: %v", err)
+					}
+					inspects, err := os.ReadFile(filepath.Join(dir, "remote-inspects"))
+					if err != nil || string(inspects) != "inspect\n" {
+						t.Fatalf("prepare reuse should only inspect the registry once: %q, %v", inspects, err)
+					}
+				}
+				aibCalls := 1
+				if tc.skipAIB {
+					aibCalls = 0
+				}
+				for event, want := range map[string]int{"PULL <": pulls, "PUSH <": tc.pushes, "AIB <": aibCalls} {
 					if got := strings.Count(out, event); got != want {
 						t.Errorf("%s count=%d, want %d\n%s", event, got, want, out)
 					}
 				}
-				if strings.Contains(out, "<--if-needed>") == tc.force {
+				if !tc.skipAIB && strings.Contains(out, "<--if-needed>") == tc.force {
 					t.Errorf("incorrect freshness flag for force=%t\n%s", tc.force, out)
 				}
 				if entrypoint == "build" && !strings.Contains(out, "PROGRESS <Builder image ready> <3> <6>") {
@@ -85,7 +101,7 @@ func TestBuilderCache(t *testing.T) {
 				if entrypoint == "prepare" && !strings.Contains(out, "PROGRESS <Builder ready> <2> <2>") {
 					t.Errorf("incorrect prepare-task progress\n%s", out)
 				}
-				if !strings.Contains(out, "<--distro> <autosd> <--define> <repo=two words>") {
+				if !tc.skipAIB && !strings.Contains(out, "<--distro> <autosd> <--define> <repo=two words>") {
 					t.Errorf("builder lost custom definitions\n%s", out)
 				}
 				digestChar := "a"
@@ -98,6 +114,73 @@ func TestBuilderCache(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func builderCacheTestScript(t *testing.T, entrypoint, dir string) string {
+	t.Helper()
+	body := builderCacheHarness + builderCacheScript
+	if entrypoint == "build" {
+		body += shellFunctions(t, buildImageScript, "cleanup() {", "fail() {")
+		body += shellFunctions(t, buildImageScript, "BOOTC_CONTAINER_NAME=", "\nprepare_builder_if_needed() {")
+		body += shellFunctions(t, buildImageScript, "prepare_builder_if_needed() {", "\nprepare_builder_if_needed\n") + "\nprepare_builder_if_needed\n"
+	} else {
+		body += strings.ReplaceAll(buildBuilderScript, "$(workspaces.manifest-config-workspace.path)", dir)
+	}
+	return body + "\nprintf 'SUCCESS <%s>\\n' \"$(cat \"$RESULT_PATH\")\"\n"
+}
+
+func TestBuilderCacheTagsAcrossCallers(t *testing.T) {
+	var previous string
+	for _, definition := range []string{"repo=two words", "repo=another repo"} {
+		var buildTag string
+		for _, entrypoint := range []string{"build", "prepare"} {
+			dir := t.TempDir()
+			cmd := exec.Command("bash", "-c", builderCacheTestScript(t, entrypoint, dir))
+			cmd.Env = append(os.Environ(), "TEST_DIR="+dir, "RESULT_PATH="+filepath.Join(dir, "result"),
+				"SCENARIO=unchanged", "REBUILD_BUILDER=false", "BUILDER_CACHE_POLICY=validate", "TEST_DEFINITION="+definition)
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("%s failed: %v\n%s", entrypoint, err, out)
+			}
+			lookup, err := os.ReadFile(filepath.Join(dir, "lookup"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if entrypoint == "build" {
+				buildTag = string(lookup)
+			} else if string(lookup) != buildTag {
+				t.Fatalf("callers use different cache tags: %s != %s", buildTag, lookup)
+			}
+		}
+		if buildTag == previous {
+			t.Fatal("different definitions share a cache tag")
+		}
+		previous = buildTag
+	}
+}
+
+func TestBuilderCacheTagSeparatesInputs(t *testing.T) {
+	inputs := [][]string{
+		{"aib:1.3.5", "autosd", "arm64"},
+		{"aib:1.3.6", "autosd", "arm64"},
+		{"aib:1.3.5", "other", "arm64"},
+		{"aib:1.3.5", "autosd", "amd64"},
+		{"aib:1.3.5", "autosd", "arm64", "--define", "a=one --define b=two"},
+		{"aib:1.3.5", "autosd", "arm64", "--define", "a=one", "--define", "b=two"},
+		{"aib:1.3.5", "autosd", "arm64", "--define", "a=one", "--define", "a=two"},
+		{"aib:1.3.5", "autosd", "arm64", "--define", "a=two", "--define", "a=one"},
+	}
+	seen := make(map[string]bool)
+	for _, args := range inputs {
+		cmd := exec.Command("bash", append([]string{"-c", builderCacheScript + `builder_cache_tag "$@"`, "test"}, args...)...)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("tag failed: %v\n%s", err, out)
+		}
+		if seen[string(out)] {
+			t.Fatalf("cache tag collision for %q: %s", args, out)
+		}
+		seen[string(out)] = true
 	}
 }
 
@@ -170,15 +253,16 @@ REGISTRY_AUTH_FILE="$TEST_DIR/auth"
 NAMESPACE=test
 DISTRO=autosd
 TARGET_ARCH=amd64
-AIB_HASH=hash
+BUILDER_CACHE_TAG=test-tag
 AIB_IMAGE=quay.io/example/aib:1.3.5
+AIB_IMAGE_REF="$AIB_IMAGE"
 LOCAL_BUILDER_IMAGE=localhost/builder
 BUILDER_IMAGE=
 BUILD_DIR="$TEST_DIR/build"
 SECURE_BUILD=true
 STEP_BUILD=4
 PROGRESS_TOTAL=6
-CUSTOM_DEFS_ARGS=(--define 'repo=two words')
+CUSTOM_DEFS_ARGS=(--define "${TEST_DEFINITION:-repo=two words}")
 SKOPEO_INSPECT_TLS_ARGS=(--tls-verify=false)
 SKOPEO_COPY_TLS_ARGS=(--src-tls-verify=false --dest-tls-verify=false)
 OLD_DIGEST=sha256:$(printf 'a%.0s' {1..64})
@@ -191,7 +275,7 @@ setup_container_config() { :; }
 setup_var_tmp() { :; }
 install_custom_ca_certs() { :; }
 setup_osbuild() { :; }
-load_custom_definitions() { CUSTOM_DEFS_ARGS=(--define 'repo=two words'); }
+load_custom_definitions() { CUSTOM_DEFS_ARGS=(--define "${TEST_DEFINITION:-repo=two words}"); }
 write_result() { printf '%s' "$2" > "$RESULT_PATH"; }
 pull_registry_image() { echo 'Unexpected second pull' >&2; return 1; }
 aib() {
@@ -209,10 +293,13 @@ skopeo() {
   if [ "$op" = inspect ]; then
     case "${@: -1}" in
       docker:*)
+        printf 'inspect\n' >> "$TEST_DIR/remote-inspects"
+        printf '%s' "${@: -1}" > "$TEST_DIR/lookup"
         [ "$SCENARIO" != missing ] || return 1
         if [ "$SCENARIO" = cache-invalid ]; then echo invalid; else echo "$OLD_DIGEST"; fi
         ;;
       containers-storage:*)
+        printf 'inspect\n' >> "$TEST_DIR/local-inspects"
         [ "$SCENARIO" != inspect-fail ] || return 1
         [ "$SCENARIO" != inspect-empty ] || return 0
         cat "$TEST_DIR/local"

@@ -483,24 +483,25 @@ fi
 emit_progress "Preparing build" 1 "$PROGRESS_TOTAL"
 
 BOOTC_CONTAINER_NAME="${CONTAINER_PUSH:-localhost/aib-build:${DISTRO}-${TARGET}}"
-AIB_HASH=$(printf '%s' "$AIB_IMAGE_REF" | sha256sum | cut -c1-8)
-LOCAL_BUILDER_IMAGE="localhost/aib-build:${DISTRO}-${TARGET_ARCH}-${AIB_HASH}"
+BUILDER_CACHE_TAG=$(builder_cache_tag "$AIB_IMAGE_REF" "$DISTRO" "$TARGET_ARCH" "${CUSTOM_DEFS_ARGS[@]}")
+LOCAL_BUILDER_IMAGE="localhost/aib-build:${BUILDER_CACHE_TAG}"
 
 declare -a BUILD_CONTAINER_ARGS=()
 
 prepare_builder_if_needed() {
   if [ "$PREPARES_BUILDER" = "true" ]; then
     local target_builder_image route_host
-    target_builder_image="${CLUSTER_REGISTRY_ROUTE}/${NAMESPACE}/aib-build:${DISTRO}-${TARGET_ARCH}-${AIB_HASH}"
+    target_builder_image="${CLUSTER_REGISTRY_ROUTE}/${NAMESPACE}/aib-build:${BUILDER_CACHE_TAG}"
     route_host="${CLUSTER_REGISTRY_ROUTE%%/*}"
     BUILDER_AUTH_FILE=$(mktemp /tmp/builder-registry-auth.XXXXXX)
     create_service_account_auth "$route_host" "$BUILDER_AUTH_FILE"
 
     emit_progress "Preparing builder" 2 "$PROGRESS_TOTAL"
     if [ "$SECURE_BUILD" = "true" ]; then
-      echo "WARNING: bootc helper builder preparation is online and is not covered by the application lockfile; only final AIB assembly is network-isolated"
+      echo "WARNING: bootc helper builder preparation is not covered by the application lockfile; only final AIB assembly is network-isolated"
     fi
-    refresh_builder_image "$target_builder_image" "$LOCAL_BUILDER_IMAGE" "$BUILDER_AUTH_FILE" true \
+    local sync_local_builder=true
+    refresh_builder_image "$target_builder_image" "$LOCAL_BUILDER_IMAGE" "$BUILDER_AUTH_FILE" "$sync_local_builder" \
       --build-dir "$BUILD_DIR" --cache "$BUILD_DIR/dnf-cache" \
       --distro "$DISTRO" "${CUSTOM_DEFS_ARGS[@]}"
     rm -f "$BUILDER_AUTH_FILE"

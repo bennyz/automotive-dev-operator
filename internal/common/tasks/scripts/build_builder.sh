@@ -16,17 +16,16 @@ if [ -n "$CLUSTER_REGISTRY_ROUTE" ]; then
 fi
 setup_cluster_auth "${CLUSTER_REGISTRY_ROUTE:-}"
 
-# Include a short hash of the AIB image in the registry tag so that different
-# AIB versions cache their builder images separately and don't overwrite each other.
-AIB_HASH=$(echo -n "$AIB_IMAGE" | sha256sum | cut -c1-8)
-TARGET_IMAGE="${REGISTRY}/${NAMESPACE}/aib-build:${DISTRO}-${TARGET_ARCH}-${AIB_HASH}"
-echo "AIB image: $AIB_IMAGE (hash: $AIB_HASH)"
+load_custom_definitions "$(workspaces.manifest-config-workspace.path)/custom-definitions.env"
+BUILDER_CACHE_TAG=$(builder_cache_tag "$AIB_IMAGE" "$DISTRO" "$TARGET_ARCH" "${CUSTOM_DEFS_ARGS[@]}")
+TARGET_IMAGE="${REGISTRY}/${NAMESPACE}/aib-build:${BUILDER_CACHE_TAG}"
+echo "AIB image: $AIB_IMAGE (builder cache tag: $BUILDER_CACHE_TAG)"
 
 setup_container_config
 setup_var_tmp
 
 # Local target name for pushing to registry
-LOCAL_TARGET="localhost/aib-build:${DISTRO}-${TARGET_ARCH}-${AIB_HASH}"
+LOCAL_TARGET="localhost/aib-build:${BUILDER_CACHE_TAG}"
 
 BUILDER_TOTAL=2
 
@@ -35,13 +34,12 @@ emit_progress "Checking builder cache" 0 "$BUILDER_TOTAL"
 install_custom_ca_certs
 setup_osbuild
 
-load_custom_definitions "$(workspaces.manifest-config-workspace.path)/custom-definitions.env"
-
 emit_progress "Preparing builder image" 1 "$BUILDER_TOTAL"
 # Used by the embedded builder cache helper.
 # shellcheck disable=SC2034
 declare -a SKOPEO_INSPECT_TLS_ARGS=() SKOPEO_COPY_TLS_ARGS=()
-refresh_builder_image "$TARGET_IMAGE" "$LOCAL_TARGET" "$REGISTRY_AUTH_FILE" false \
+SYNC_LOCAL_BUILDER=false
+refresh_builder_image "$TARGET_IMAGE" "$LOCAL_TARGET" "$REGISTRY_AUTH_FILE" "$SYNC_LOCAL_BUILDER" \
   --distro "$DISTRO" "${CUSTOM_DEFS_ARGS[@]}"
 
 emit_progress "Builder ready" "$BUILDER_TOTAL" "$BUILDER_TOTAL"
