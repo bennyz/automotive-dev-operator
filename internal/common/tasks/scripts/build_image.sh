@@ -508,18 +508,33 @@ prepare_builder_if_needed() {
     BUILDER_AUTH_FILE=""
   fi
 
-  write_result builder-image "$BUILDER_IMAGE"
-
   if [ "$PULLS_BUILDER" = "true" ]; then
     if [ "$PREPARES_BUILDER" != "true" ]; then
       emit_progress "Pulling builder image" $((STEP_BUILD - 1)) "$PROGRESS_TOTAL"
       echo "Pulling builder image: $BUILDER_IMAGE"
+      case "$BUILDER_IMAGE" in
+        "$CLUSTER_REGISTRY_ROUTE/$NAMESPACE/aib-build@sha256:"*|"$INTERNAL_REGISTRY/$NAMESPACE/aib-build@sha256:"*|\
+        "$CLUSTER_REGISTRY_ROUTE/$NAMESPACE/aib-build:"*|"$INTERNAL_REGISTRY/$NAMESPACE/aib-build:"*)
+          BUILDER_AUTH_FILE=$(mktemp /tmp/builder-registry-auth.XXXXXX)
+          create_service_account_auth "${BUILDER_IMAGE%%/*}" "$BUILDER_AUTH_FILE"
+          if [[ "$BUILDER_IMAGE" != *@* ]]; then
+            local digest
+            digest=$(skopeo inspect "${SKOPEO_INSPECT_TLS_ARGS[@]}" --authfile="$BUILDER_AUTH_FILE" \
+              --format '{{.Digest}}' "docker://$BUILDER_IMAGE")
+            BUILDER_IMAGE=$(builder_digest_ref "$BUILDER_IMAGE" "$digest")
+          fi
+          pin_builder_image "$BUILDER_IMAGE" "$BUILDER_AUTH_FILE"
+          rm -f "$BUILDER_AUTH_FILE"
+          BUILDER_AUTH_FILE=""
+          ;;
+      esac
       pull_registry_image "$BUILDER_IMAGE" "containers-storage:$LOCAL_BUILDER_IMAGE"
     else
       emit_progress "Builder image ready" $((STEP_BUILD - 1)) "$PROGRESS_TOTAL"
     fi
     BUILD_CONTAINER_ARGS=(--build-container "$LOCAL_BUILDER_IMAGE")
   fi
+  write_result builder-image "$BUILDER_IMAGE"
 }
 
 prepare_builder_if_needed

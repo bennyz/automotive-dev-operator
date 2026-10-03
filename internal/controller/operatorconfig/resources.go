@@ -636,7 +636,17 @@ func (r *OperatorConfigReconciler) buildBuildControllerClusterRole() *rbacv1.Clu
 			{
 				APIGroups: []string{"image.openshift.io"},
 				Resources: []string{"imagestreams"},
-				Verbs:     []string{"get", "create"},
+				Verbs:     []string{"get", "create", "update"},
+			},
+			{
+				APIGroups: []string{"image.openshift.io"},
+				Resources: []string{"imagestreamtags"},
+				Verbs:     []string{"delete"},
+			},
+			{
+				APIGroups: []string{"automotive.sdv.cloud.redhat.com"},
+				Resources: []string{"imagereseals"},
+				Verbs:     []string{"get", "list", "watch"},
 			},
 			{
 				APIGroups: []string{"route.openshift.io"},

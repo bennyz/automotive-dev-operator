@@ -280,6 +280,24 @@ var _ = Describe("OperatorConfig Resources", func() {
 	})
 
 	Describe("buildBuildControllerClusterRole", func() {
+		It("should allow retaining and expiring helper tags in split-controller mode", func() {
+			role := r.buildBuildControllerClusterRole()
+			Expect(role.Rules).To(ContainElement(rbacv1.PolicyRule{
+				APIGroups: []string{"image.openshift.io"},
+				Resources: []string{"imagestreams"},
+				Verbs:     []string{"get", "create", "update"},
+			}))
+			Expect(role.Rules).To(ContainElement(rbacv1.PolicyRule{
+				APIGroups: []string{"image.openshift.io"},
+				Resources: []string{"imagestreamtags"},
+				Verbs:     []string{"delete"},
+			}))
+			Expect(role.Rules).To(ContainElement(rbacv1.PolicyRule{
+				APIGroups: []string{"automotive.sdv.cloud.redhat.com"},
+				Resources: []string{"imagereseals"},
+				Verbs:     []string{"get", "list", "watch"},
+			}))
+		})
 		It("should grant webhook delivery controller permissions", func() {
 			role := r.buildBuildControllerClusterRole()
 			Expect(role.Rules).To(ContainElement(rbacv1.PolicyRule{

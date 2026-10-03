@@ -8,26 +8,30 @@ import (
 	"testing"
 )
 
+type builderCacheCase struct {
+	name, scenario, policy                 string
+	force, fails, skipAIB, prepareSucceeds bool
+	pulls, pushes                          int
+}
+
 func TestBuilderCache(t *testing.T) {
 	for _, entrypoint := range []string{"build", "prepare"} {
-		for _, tc := range []struct {
-			name, scenario, policy                 string
-			force, fails, skipAIB, prepareSucceeds bool
-			pulls, pushes                          int
-		}{
+		for _, tc := range []builderCacheCase{
 			{name: "unchanged", scenario: "unchanged", pulls: 1},
 			{name: "explicit validation", scenario: "unchanged", policy: "validate", pulls: 1},
 			{name: "reuse without depsolve", scenario: "aib-fail", policy: "reuse", pulls: 1, skipAIB: true},
 			{name: "reuse cache miss builds", scenario: "missing", policy: "reuse", pulls: 1, pushes: 1},
 			{name: "force overrides reuse", scenario: "unchanged", policy: "reuse", force: true, pulls: 1, pushes: 1},
-			{name: "reuse pull failure only affects local consumer", scenario: "pull-fail", policy: "reuse", fails: true, prepareSucceeds: true, skipAIB: true},
+			{name: "reuse pull failure rebuilds", scenario: "pull-fail", policy: "reuse", pulls: 2, pushes: 1},
 			{name: "reuse local inspection failure only affects local consumer", scenario: "inspect-fail", policy: "reuse", fails: true, prepareSucceeds: true, skipAIB: true},
 			{name: "reuse invalid digest is fatal", scenario: "cache-invalid", policy: "reuse", fails: true},
 			{name: "invalid policy", scenario: "unchanged", policy: "invalid", fails: true},
 			{name: "changed inputs", scenario: "changed", pulls: 2, pushes: 1},
 			{name: "cache miss", scenario: "missing", pulls: 1, pushes: 1},
 			{name: "forced identical rebuild", scenario: "unchanged", force: true, pulls: 1, pushes: 1},
-			{name: "cached pull fails", scenario: "pull-fail", fails: true},
+			{name: "cached pull failure rebuilds", scenario: "pull-fail", pulls: 2, pushes: 1},
+			{name: "cache removed before pin", scenario: "pin-race", pulls: 1, pushes: 1},
+			{name: "pin failure stops publication", scenario: "pin-fail", fails: true},
 			{name: "freshness check fails", scenario: "aib-fail", fails: true},
 			{name: "local inspect fails", scenario: "inspect-fail", fails: true},
 			{name: "local digest empty", scenario: "inspect-empty", fails: true},
@@ -37,10 +41,13 @@ func TestBuilderCache(t *testing.T) {
 			{name: "cache digest invalid", scenario: "cache-invalid", fails: true},
 			{name: "pushed digest pull fails", scenario: "final-pull-fail", fails: true},
 		} {
-			if entrypoint == "prepare" && tc.scenario == "final-pull-fail" {
+			if entrypoint == "prepare" && (tc.scenario == "final-pull-fail" || tc.scenario == "pin-fail" || tc.scenario == "pin-race") {
 				continue // The prepare task has no local consumer after the push.
 			}
 			t.Run(entrypoint+"/"+tc.name, func(t *testing.T) {
+				if entrypoint == "prepare" && tc.scenario == "pull-fail" && tc.policy == "reuse" {
+					tc.pulls, tc.pushes, tc.skipAIB = 0, 0, true
+				}
 				dir := t.TempDir()
 				body := builderCacheTestScript(t, entrypoint, dir)
 				force := "false"
@@ -69,51 +76,63 @@ func TestBuilderCache(t *testing.T) {
 					}
 					return
 				}
-				pulls := tc.pulls
-				if entrypoint == "prepare" && tc.pushes > 0 {
-					pulls--
-				}
-				if entrypoint == "prepare" && tc.skipAIB {
-					pulls = 0
-					if _, err := os.Stat(filepath.Join(dir, "local-inspects")); !os.IsNotExist(err) {
-						t.Fatalf("prepare reuse inspected local storage: %v", err)
-					}
-					inspects, err := os.ReadFile(filepath.Join(dir, "remote-inspects"))
-					if err != nil || string(inspects) != "inspect\n" {
-						t.Fatalf("prepare reuse should only inspect the registry once: %q, %v", inspects, err)
-					}
-				}
-				aibCalls := 1
-				if tc.skipAIB {
-					aibCalls = 0
-				}
-				for event, want := range map[string]int{"PULL <": pulls, "PUSH <": tc.pushes, "AIB <": aibCalls} {
-					if got := strings.Count(out, event); got != want {
-						t.Errorf("%s count=%d, want %d\n%s", event, got, want, out)
-					}
-				}
-				if !tc.skipAIB && strings.Contains(out, "<--if-needed>") == tc.force {
-					t.Errorf("incorrect freshness flag for force=%t\n%s", tc.force, out)
-				}
-				if entrypoint == "build" && !strings.Contains(out, "PROGRESS <Builder image ready> <3> <6>") {
-					t.Errorf("incorrect prepared-builder progress\n%s", out)
-				}
-				if entrypoint == "prepare" && !strings.Contains(out, "PROGRESS <Builder ready> <2> <2>") {
-					t.Errorf("incorrect prepare-task progress\n%s", out)
-				}
-				if !tc.skipAIB && !strings.Contains(out, "<--distro> <autosd> <--define> <repo=two words>") {
-					t.Errorf("builder lost custom definitions\n%s", out)
-				}
-				digestChar := "a"
-				if tc.pushes > 0 {
-					digestChar = "b"
-				}
-				want := "registry.example:5000/test/aib-build@sha256:" + strings.Repeat(digestChar, 64)
-				if !strings.Contains(out, "SUCCESS <"+want+">") {
-					t.Errorf("result does not pin the consumed builder\n%s", out)
-				}
+				assertBuilderCacheSuccess(t, entrypoint, tc, dir, out)
 			})
 		}
+	}
+}
+
+func assertBuilderCacheSuccess(t *testing.T, entrypoint string, tc builderCacheCase, dir, out string) {
+	t.Helper()
+	pulls := tc.pulls
+	if entrypoint == "prepare" && tc.pushes > 0 {
+		pulls--
+	}
+	if entrypoint == "prepare" && tc.skipAIB {
+		pulls = 0
+		if _, err := os.Stat(filepath.Join(dir, "local-inspects")); !os.IsNotExist(err) {
+			t.Fatalf("prepare reuse inspected local storage: %v", err)
+		}
+		inspects, err := os.ReadFile(filepath.Join(dir, "remote-inspects"))
+		if err != nil || string(inspects) != "inspect\n" {
+			t.Fatalf("prepare reuse should only inspect the registry once: %q, %v", inspects, err)
+		}
+	}
+	aibCalls := 1
+	if tc.skipAIB {
+		aibCalls = 0
+	}
+	pins := 0
+	if entrypoint == "build" {
+		pins = 1
+		if tc.pushes > 0 && !tc.force && tc.scenario != "missing" {
+			pins++
+		}
+	}
+	for event, want := range map[string]int{"PIN <": pins, "PULL <": pulls, "PUSH <": tc.pushes, "AIB <": aibCalls} {
+		if got := strings.Count(out, event); got != want {
+			t.Errorf("%s count=%d, want %d\n%s", event, got, want, out)
+		}
+	}
+	if !tc.skipAIB && strings.Contains(out, "<--if-needed>") == (tc.force || tc.scenario == "pull-fail" || tc.scenario == "pin-race") {
+		t.Errorf("incorrect freshness flag for force=%t\n%s", tc.force, out)
+	}
+	if entrypoint == "build" && !strings.Contains(out, "PROGRESS <Builder image ready> <3> <6>") {
+		t.Errorf("incorrect prepared-builder progress\n%s", out)
+	}
+	if entrypoint == "prepare" && !strings.Contains(out, "PROGRESS <Builder ready> <2> <2>") {
+		t.Errorf("incorrect prepare-task progress\n%s", out)
+	}
+	if !tc.skipAIB && !strings.Contains(out, "<--distro> <autosd> <--define> <repo=two words>") {
+		t.Errorf("builder lost custom definitions\n%s", out)
+	}
+	digestChar := "a"
+	if tc.pushes > 0 {
+		digestChar = "b"
+	}
+	want := "registry.example:5000/test/aib-build@sha256:" + strings.Repeat(digestChar, 64)
+	if !strings.Contains(out, "SUCCESS <"+want+">") {
+		t.Errorf("result does not pin the consumed builder\n%s", out)
 	}
 }
 
@@ -282,9 +301,9 @@ aib() {
   printf 'AIB'; printf ' <%s>' "$@"; printf '\n'
   [ "$SCENARIO" != aib-fail ] || return 1
   if [ "$SCENARIO" = unchanged ]; then
-    printf local-old > "$TEST_DIR/local"
+    printf "%s" "$OLD_DIGEST" > "$TEST_DIR/local"
   else
-    printf local-new > "$TEST_DIR/local"
+    printf "sha256:%064d" 0 > "$TEST_DIR/local"
   fi
 }
 skopeo() {
@@ -313,12 +332,19 @@ skopeo() {
     case "$1" in
       --digestfile) digest_file="$2"; shift ;;
       --authfile=*) auth=true; [ -f "${1#*=}" ] || return 1 ;;
-      --src-tls-verify=false|--dest-tls-verify=false) ;;
+      --src-tls-verify=false|--dest-tls-verify=false|--preserve-digests) ;;
       *) echo "Unexpected copy option: $1" >&2; return 1 ;;
     esac
     shift
   done
   [ "$auth" = true ] || return 1
+      case "$2" in
+        *:pin-*)
+          printf 'PIN <%s>\n' "$2"
+          [ "$SCENARIO" != pin-fail ] || return 1
+          if [ "$SCENARIO" = pin-race ] && [[ "$1" == *"@$OLD_DIGEST" ]]; then return 1; fi
+          return 0 ;;
+      esac
   case "$1" in
     docker:*)
       printf 'PULL <%s>\n' "$1"
@@ -326,9 +352,11 @@ skopeo() {
       case "$1" in
         *"@$OLD_DIGEST")
           [ "$SCENARIO" != pull-fail ] || return 1
-          printf local-old > "$TEST_DIR/local"
+          printf "%s" "$OLD_DIGEST" > "$TEST_DIR/local"
           ;;
-        *"@$PUSH_DIGEST") [ "$SCENARIO" != final-pull-fail ] || return 1 ;;
+        *"@$PUSH_DIGEST")
+          [ "$SCENARIO" != final-pull-fail ] || return 1
+          printf "%s" "$PUSH_DIGEST" > "$TEST_DIR/local" ;;
         *) echo 'Unexpected registry digest' >&2; return 1 ;;
       esac
       ;;
@@ -346,3 +374,30 @@ skopeo() {
   esac
 }
 `
+
+func TestProvidedManagedBuilderPinnedBeforePull(t *testing.T) {
+	for _, suffix := range []string{":manual", "@sha256:" + strings.Repeat("a", 64)} {
+		t.Run(suffix, func(t *testing.T) {
+			dir := t.TempDir()
+			body := builderCacheHarness + builderCacheScript + `
+PREPARES_BUILDER=false
+BUILDER_IMAGE="registry.example:5000/test/aib-build$TEST_SUFFIX"
+pull_registry_image() { printf 'CONSUME <%s>\n' "$1"; }
+` + shellFunctions(t, buildImageScript, "prepare_builder_if_needed() {", "\nprepare_builder_if_needed\n") + "\nprepare_builder_if_needed\n"
+			cmd := exec.Command("bash", "-c", body)
+			cmd.Env = append(os.Environ(), "TEST_DIR="+dir, "RESULT_PATH="+filepath.Join(dir, "result"), "TEST_SUFFIX="+suffix, "SCENARIO=unchanged")
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("%v\n%s", err, out)
+			}
+			pin, consume := strings.Index(string(out), "PIN <"), strings.Index(string(out), "CONSUME <")
+			if pin < 0 || consume < pin {
+				t.Fatalf("did not pin before consuming: %s", out)
+			}
+			result, err := os.ReadFile(filepath.Join(dir, "result"))
+			if err != nil || string(result) != "registry.example:5000/test/aib-build@sha256:"+strings.Repeat("a", 64) {
+				t.Fatalf("wrong recorded ref: %s, %v", result, err)
+			}
+		})
+	}
+}

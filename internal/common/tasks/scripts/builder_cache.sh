@@ -64,14 +64,20 @@ refresh_builder_image() {
     pinned_ref=$(builder_digest_ref "$target" "$cached_digest") || return 1
     echo "Checking cached builder: $pinned_ref"
     if [ "$cache_policy" != reuse ] || [ "$sync_local" = true ]; then
-      skopeo copy "${SKOPEO_COPY_TLS_ARGS[@]}" --authfile="$auth_file" \
-        "docker://$pinned_ref" "containers-storage:$local_image" || {
-        echo "ERROR: could not pull cached builder: $pinned_ref" >&2
-        return 1
-      }
-      old_local_digest=$(builder_local_digest "$local_image") || return 1
+      # A pin must preserve the registry's compressed layers. Create it before
+      # pulling; if cleanup won the race, rebuild instead of publishing a bad ref.
+      if { [ "$sync_local" != true ] || pin_builder_image "$pinned_ref" "$auth_file"; } &&
+        skopeo copy "${SKOPEO_COPY_TLS_ARGS[@]}" --authfile="$auth_file" \
+          "docker://$pinned_ref" "containers-storage:$local_image"; then
+        old_local_digest=$(builder_local_digest "$local_image") || return 1
+      else
+        echo "WARNING: cached builder is unavailable; rebuilding: $pinned_ref" >&2
+        cached_digest=""
+        # A failed copy can leave an older local image behind.
+        freshness_args=()
+      fi
     fi
-    if [ "$cache_policy" = reuse ]; then
+    if [ "$cache_policy" = reuse ] && [ -n "$cached_digest" ]; then
       echo "Reusing cached builder without checking package freshness: $pinned_ref"
       BUILDER_IMAGE="$pinned_ref"
       return 0
@@ -111,6 +117,7 @@ refresh_builder_image() {
   # Registry conversion can change the manifest digest. Synchronize local
   # consumers with the recorded digest; the prepare-only task has no consumer.
   if [ "$sync_local" = "true" ]; then
+    pin_builder_image "$pinned_ref" "$auth_file" || return 1
     skopeo copy "${SKOPEO_COPY_TLS_ARGS[@]}" --authfile="$auth_file" \
       "docker://$pinned_ref" "containers-storage:$local_image" || {
       echo "ERROR: could not synchronize local builder with pushed digest: $pinned_ref" >&2
@@ -120,4 +127,18 @@ refresh_builder_image() {
   # Consumed by the task script prepended alongside this helper.
   # shellcheck disable=SC2034
   BUILDER_IMAGE="$pinned_ref"
+}
+
+# Keep the recorded digest pullable after its cache tag changes or expires.
+pin_builder_image() {
+  local ref="$1" auth_file="$2" digest pin_ref
+  digest="${ref##*@}"
+  builder_digest_ref "$ref" "$digest" >/dev/null || return 1
+  pin_ref="${ref%@*}:pin-${digest#sha256:}"
+  echo "Pinning builder for published artifacts: $pin_ref"
+  skopeo copy "${SKOPEO_COPY_TLS_ARGS[@]}" --authfile="$auth_file" --preserve-digests \
+    "docker://$ref" "docker://$pin_ref" || {
+    echo "ERROR: could not pin builder: $ref" >&2
+    return 1
+  }
 }
