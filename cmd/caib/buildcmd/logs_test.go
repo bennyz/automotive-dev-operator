@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/clilog"
 	buildapiclient "github.com/centos-automotive-suite/automotive-dev-operator/internal/buildapi/client"
 	buildcontract "github.com/centos-automotive-suite/automotive-dev-operator/internal/buildcontract"
 )
@@ -48,6 +49,120 @@ func fakeBuildServer(t *testing.T, responses []buildcontract.BuildResponse) *htt
 			t.Errorf("failed to encode response: %v", err)
 		}
 	}))
+}
+
+func TestWaitForBuildCompletion_FlashFeedback(t *testing.T) {
+	tests := []struct {
+		name        string
+		message     string
+		flash       *buildcontract.FlashOutcomeStatus
+		wantLease   string
+		wantFlashed bool
+		wantError   string
+	}{
+		{
+			name: "successful flash", message: "Build completed",
+			flash:     &buildcontract.FlashOutcomeStatus{Enabled: true, State: "Succeeded", LeaseID: "flash-lease"},
+			wantLease: "flash-lease", wantFlashed: true,
+		},
+		{
+			name: "missing lease", message: "Build and flash completed successfully",
+			flash:     &buildcontract.FlashOutcomeStatus{Enabled: true, State: "Succeeded"},
+			wantError: "successful flash but no lease ID",
+		},
+		{
+			name: "flash not started overrides message wording", message: "Build completed without flashing",
+			flash: &buildcontract.FlashOutcomeStatus{State: "NotStarted"},
+		},
+		{
+			name: "no flash outcome", message: "Build and flash completed successfully",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := buildcontract.BuildResponse{Name: "test-build", Phase: "Completed", Message: tt.message, Flash: tt.flash}
+			srv := fakeBuildServer(t, []buildcontract.BuildResponse{st})
+			defer srv.Close()
+			api, err := buildapiclient.New(srv.URL)
+			if err != nil {
+				t.Fatalf("failed to create client: %v", err)
+			}
+			h := NewHandler(newTestOpts())
+			var waitErr error
+			output := captureStdout(t, func() {
+				waitErr = h.waitForBuildCompletion(t.Context(), api, st.Name)
+			})
+			if tt.wantError != "" {
+				if waitErr == nil || !strings.Contains(waitErr.Error(), tt.wantError) {
+					t.Fatalf("waitForBuildCompletion error = %v, want %q", waitErr, tt.wantError)
+				}
+				if strings.Contains(output, "Build and flash completed successfully!") || strings.Contains(output, "caib image logs") || strings.Contains(output, "jmp ") {
+					t.Errorf("incomplete flash status should not produce success or recovery guidance: %s", output)
+				}
+				return
+			}
+			if waitErr != nil {
+				t.Fatalf("waitForBuildCompletion failed: %v", waitErr)
+			}
+			if got := strings.Contains(output, "Build and flash completed successfully!"); got != tt.wantFlashed {
+				t.Fatalf("flash banner present = %v, want %v; output: %s", got, tt.wantFlashed, output)
+			}
+			if !tt.wantFlashed {
+				return
+			}
+			for _, want := range []string{"Lease ID: " + tt.wantLease, "jmp shell --lease " + tt.wantLease, "jmp delete leases " + tt.wantLease} {
+				if !strings.Contains(output, want) {
+					t.Errorf("missing %q in completion output: %s", want, output)
+				}
+			}
+		})
+	}
+}
+
+func TestFinishBuild_StructuredOutputUsesStatusLease(t *testing.T) {
+	wasQuiet := clilog.IsQuiet()
+	clilog.SetQuiet(true)
+	t.Cleanup(func() { clilog.SetQuiet(wasQuiet) })
+	for _, tt := range []struct {
+		name  string
+		phase string
+		state string
+		wait  bool
+	}{
+		{name: "without waiting", phase: "Completed", state: "Succeeded"},
+		{name: "failed flash", phase: "Failed", state: "Failed", wait: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			st := buildcontract.BuildResponse{
+				Name: "test-build", Phase: tt.phase, Message: "terminal build result",
+				Flash: &buildcontract.FlashOutcomeStatus{Enabled: true, State: tt.state, LeaseID: "status-lease"},
+			}
+			srv := fakeBuildServer(t, []buildcontract.BuildResponse{st})
+			defer srv.Close()
+			api, err := buildapiclient.New(srv.URL)
+			if err != nil {
+				t.Fatalf("failed to create client: %v", err)
+			}
+			opts := newTestOpts()
+			opts.Output.Format = "json"
+			var buildErr error
+			opts.HandleError = func(err error) { buildErr = err }
+			h := NewHandler(opts)
+			output := captureStdout(t, func() {
+				h.finishBuild(t.Context(), api, st.Name, tt.wait)
+			})
+			var result BuildResult
+			if err := json.Unmarshal([]byte(output), &result); err != nil {
+				t.Fatalf("invalid structured output: %v; output: %s", err, output)
+			}
+			if result.LeaseID != "status-lease" {
+				t.Errorf("lease ID = %q, want status-lease", result.LeaseID)
+			}
+			if got := buildErr != nil; got != (tt.phase == "Failed") {
+				t.Errorf("build error present = %v, want %v", got, tt.phase == "Failed")
+			}
+		})
+	}
 }
 
 func TestWaitForBuildCompletion_BuildFailedNoDiskImage(t *testing.T) {
@@ -163,6 +278,7 @@ func TestFinishBuild_FlashFailure_ShowsFlashInstructions(t *testing.T) {
 			Phase:     "Failed",
 			Message:   "Flash to device failed: timeout waiting for device",
 			DiskImage: "registry.example.com/ns/test-build:disk",
+			Flash:     &buildcontract.FlashOutcomeStatus{Enabled: true, State: "Failed"},
 			Jumpstarter: &buildcontract.JumpstarterInfo{
 				Available:        true,
 				ExporterSelector: "board-type=renesas-rcar-s4,enabled=true",
@@ -225,6 +341,7 @@ func TestFinishBuild_FlashFailure_NoJumpstarter(t *testing.T) {
 			Phase:     "Failed",
 			Message:   "Flash to device failed: connection refused",
 			DiskImage: "registry.example.com/ns/test-build:disk",
+			Flash:     &buildcontract.FlashOutcomeStatus{Enabled: true, State: "Failed"},
 		},
 	}
 	srv := fakeBuildServer(t, responses)

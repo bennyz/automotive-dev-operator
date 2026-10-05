@@ -94,16 +94,16 @@ func (h *Handler) waitForBuildCompletion(ctx context.Context, api *buildapiclien
 			}
 
 			if st.Phase == phaseCompleted {
-				pb.Complete()
-				flashWasExecuted := strings.Contains(strings.ToLower(st.Message), "flash")
-
+				flashWasExecuted := st.Flash != nil && st.Flash.State == "Succeeded"
 				leaseID := ""
-				if st.Jumpstarter != nil && st.Jumpstarter.LeaseID != "" {
-					leaseID = st.Jumpstarter.LeaseID
-				} else if streamState.LeaseID != "" {
-					leaseID = streamState.LeaseID
+				if st.Flash != nil {
+					leaseID = st.Flash.LeaseID
 				}
-				h.lastLeaseID = leaseID
+				if flashWasExecuted && leaseID == "" {
+					pb.Clear()
+					return fmt.Errorf("build %s reports a successful flash but no lease ID", name)
+				}
+				pb.Complete()
 				if leaseID != "" && h.opts.Build.Workspace != "" {
 					leaseCtx, cancelLease := context.WithTimeout(ctx, 10*time.Second)
 					leaseErr := api.SetWorkspaceLease(leaseCtx, h.opts.Build.Workspace, leaseID)
@@ -214,7 +214,7 @@ func (h *Handler) tryLogStreaming(ctx context.Context, logClient *http.Client, n
 	}()
 
 	if resp.StatusCode == http.StatusOK {
-		return logstream.StreamLogs(logstream.LogWriter(), resp.Body, state, true)
+		return logstream.StreamLogs(logstream.LogWriter(), resp.Body, state)
 	}
 
 	return logstream.HandleLogStreamError(resp, state, maxLogRetries)
@@ -242,22 +242,13 @@ func (h *Handler) displayFlashCompletionBanner(leaseID string) {
 	fmt.Println("\n" + bannerColor(divider))
 	fmt.Println(bannerColor("Build and flash completed successfully!"))
 	fmt.Println(bannerColor(divider))
-	fmt.Println("\n" + infoColor("The device has been flashed and a lease has been acquired."))
+	fmt.Println("\n" + infoColor("The device has been flashed successfully."))
 
-	if leaseID != "" {
-		fmt.Printf("\n%s %s\n", infoColor("Lease ID:"), commandColor(leaseID))
-		fmt.Printf("\n%s\n", infoColor("To access the device:"))
-		fmt.Printf("  %s\n", commandColor(fmt.Sprintf("jmp shell --lease %s", leaseID)))
-		fmt.Printf("\n%s\n", infoColor("To release the lease when done:"))
-		fmt.Printf("  %s\n", commandColor(fmt.Sprintf("jmp delete leases %s", leaseID)))
-	} else {
-		fmt.Println(infoColor("Check the logs above for lease details, or use:"))
-		fmt.Printf("  %s\n", commandColor("jmp list leases"))
-		fmt.Printf("\n%s\n", infoColor("To access the device:"))
-		fmt.Printf("  %s\n", commandColor("jmp shell --lease <lease-id>"))
-		fmt.Printf("\n%s\n", infoColor("To release the lease when done:"))
-		fmt.Printf("  %s\n", commandColor("jmp delete leases <lease-id>"))
-	}
+	fmt.Printf("\n%s %s\n", infoColor("Lease ID:"), commandColor(leaseID))
+	fmt.Printf("\n%s\n", infoColor("To access the device:"))
+	fmt.Printf("  %s\n", commandColor("jmp shell --lease "+leaseID))
+	fmt.Printf("\n%s\n", infoColor("To release the lease when done:"))
+	fmt.Printf("  %s\n", commandColor("jmp delete leases "+leaseID))
 }
 
 // RunLogs handles `caib image logs`.

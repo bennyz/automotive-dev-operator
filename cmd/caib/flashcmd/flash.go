@@ -439,7 +439,7 @@ func (h *Handler) tryFlashLogStreaming(ctx context.Context, logClient *http.Clie
 	}()
 
 	if resp.StatusCode == http.StatusOK {
-		return logstream.StreamLogs(logstream.LogWriter(), resp.Body, state, false)
+		return logstream.StreamLogs(logstream.LogWriter(), resp.Body, state)
 	}
 	return logstream.HandleLogStreamError(resp, state, maxLogRetries)
 }

@@ -177,7 +177,7 @@ func tryContainerLogStreaming(ctx context.Context, logClient *http.Client, name 
 				state.Completed = true
 			}
 		}
-		return logstream.StreamLogs(logstream.LogWriter(), resp.Body, state, false)
+		return logstream.StreamLogs(logstream.LogWriter(), resp.Body, state)
 	}
 
 	return logstream.HandleLogStreamError(resp, state, maxLogRetries)

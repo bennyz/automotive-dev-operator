@@ -14,7 +14,7 @@ func TestStreamLogs_WritesToProvidedWriter(t *testing.T) {
 	state := &State{}
 	body := strings.NewReader("line1\nline2\nline3\n")
 
-	if err := StreamLogs(&buf, body, state, false); err != nil {
+	if err := StreamLogs(&buf, body, state); err != nil {
 		t.Fatalf("StreamLogs returned error: %v", err)
 	}
 
@@ -24,25 +24,11 @@ func TestStreamLogs_WritesToProvidedWriter(t *testing.T) {
 	}
 }
 
-func TestStreamLogs_CapturesLeaseID(t *testing.T) {
-	var buf bytes.Buffer
-	state := &State{}
-	body := strings.NewReader("some output\njmp shell --lease abc-123 foo\nmore output\n")
-
-	if err := StreamLogs(&buf, body, state, true); err != nil {
-		t.Fatalf("StreamLogs returned error: %v", err)
-	}
-
-	if state.LeaseID != "abc-123" {
-		t.Errorf("expected LeaseID=abc-123, got %q", state.LeaseID)
-	}
-}
-
 func TestStreamLogs_NilStateReturnsError(t *testing.T) {
 	var buf bytes.Buffer
 	body := strings.NewReader("line\n")
 
-	if err := StreamLogs(&buf, body, nil, false); err == nil {
+	if err := StreamLogs(&buf, body, nil); err == nil {
 		t.Error("expected error for nil state")
 	}
 }
@@ -75,7 +61,7 @@ func TestStreamLogs_LineHandler(t *testing.T) {
 	}
 	body := strings.NewReader("alpha\nbeta\n")
 
-	if err := StreamLogs(&buf, body, state, false); err != nil {
+	if err := StreamLogs(&buf, body, state); err != nil {
 		t.Fatalf("StreamLogs returned error: %v", err)
 	}
 
