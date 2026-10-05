@@ -9,6 +9,7 @@ import (
 	io_prometheus_client "github.com/prometheus/client_model/go"
 	tektonv1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/cache"
 )
 
 func gaugeValue(g prometheus.Gauge) float64 {
@@ -19,27 +20,56 @@ func gaugeValue(g prometheus.Gauge) float64 {
 	return m.GetGauge().GetValue()
 }
 
-func TestAdjustActiveBuildsGauge(t *testing.T) {
-	ActiveBuilds.Set(0)
-
-	adjustActiveBuildsGauge("", "Building")
-	if v := gaugeValue(ActiveBuilds); v != 1 {
-		t.Errorf("after entering Building: got %v, want 1", v)
+func TestActiveBuildsHandler(t *testing.T) {
+	gauge := prometheus.NewGauge(prometheus.GaugeOpts{Name: "test_active_builds"})
+	handler := newActiveBuildsHandler(gauge)
+	building := &automotivev1alpha1.ImageBuild{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "first", Name: "build"},
+		Status:     automotivev1alpha1.ImageBuildStatus{Phase: phaseBuilding},
 	}
+	completed := building.DeepCopy()
+	completed.Status.Phase = phaseCompleted
+	otherNamespace := building.DeepCopy()
+	otherNamespace.Namespace = "second"
 
-	adjustActiveBuildsGauge("Building", "Building")
-	if v := gaugeValue(ActiveBuilds); v != 1 {
-		t.Errorf("same phase should not change gauge: got %v, want 1", v)
+	steps := []struct {
+		name  string
+		event func()
+		want  float64
+	}{
+		{"initial replay", func() { handler.OnAdd(building, true) }, 1},
+		{"duplicate add", func() { handler.OnAdd(building, true) }, 1},
+		{"resync", func() { handler.OnUpdate(building, building) }, 1},
+		{"same name in another namespace", func() { handler.OnAdd(otherNamespace, false) }, 2},
+		{"completed", func() { handler.OnUpdate(building, completed) }, 1},
+		{"repeated completion", func() { handler.OnUpdate(building, completed) }, 1},
+		{"active deletion", func() { handler.OnDelete(otherNamespace) }, 0},
+		{"repeated deletion", func() { handler.OnDelete(otherNamespace) }, 0},
+		{"completion without observed start", func() { handler.OnUpdate(building, completed) }, 0},
+		{"start observed through update", func() { handler.OnUpdate(completed, building) }, 1},
+		{"left Building again", func() { handler.OnUpdate(building, completed) }, 0},
+		{"build started again", func() { handler.OnAdd(building, false) }, 1},
+		{"tombstone deletion", func() {
+			handler.OnDelete(cache.DeletedFinalStateUnknown{Key: "first/build", Obj: building})
+		}, 0},
+		{"start before key-only deletion", func() { handler.OnAdd(building, false) }, 1},
+		{"another namespace before key-only deletion", func() { handler.OnAdd(otherNamespace, false) }, 2},
+		{"key-only tombstone deletion", func() {
+			handler.OnDelete(cache.DeletedFinalStateUnknown{Key: "first/build"})
+		}, 1},
+		{"repeated key-only deletion", func() {
+			handler.OnDelete(cache.DeletedFinalStateUnknown{Key: "first/build"})
+		}, 1},
+		{"remaining namespace deletion", func() { handler.OnDelete(otherNamespace) }, 0},
+		{"unknown tombstone", func() {
+			handler.OnDelete(cache.DeletedFinalStateUnknown{Key: "unknown", Obj: "unknown"})
+		}, 0},
 	}
-
-	adjustActiveBuildsGauge("Building", "Completed")
-	if v := gaugeValue(ActiveBuilds); v != 0 {
-		t.Errorf("after leaving Building: got %v, want 0", v)
-	}
-
-	adjustActiveBuildsGauge("Completed", "Failed")
-	if v := gaugeValue(ActiveBuilds); v != 0 {
-		t.Errorf("non-Building transition should not change gauge: got %v, want 0", v)
+	for _, step := range steps {
+		step.event()
+		if got := gaugeValue(gauge); got != step.want {
+			t.Fatalf("%s: ActiveBuilds = %v, want %v", step.name, got, step.want)
+		}
 	}
 }
 
@@ -390,7 +420,7 @@ func TestSeedMetricsFromCRs(t *testing.T) {
 				PreviousPhase: "Failed",
 			},
 		},
-		// In-progress build — should only count as active, not seed counters
+		// In-progress builds must not seed terminal counters
 		{
 			Spec: automotivev1alpha1.ImageBuildSpec{
 				Architecture: "amd64",
@@ -420,24 +450,14 @@ func TestSeedMetricsFromCRs(t *testing.T) {
 	}
 }
 
-func TestSeedMetricsFromCRs_ActiveBuilds(t *testing.T) {
-	ActiveBuilds.Set(0)
+func TestSeedMetricsDoesNotOverwriteActiveBuilds(t *testing.T) {
+	before := gaugeValue(ActiveBuilds)
+	t.Cleanup(func() { ActiveBuilds.Set(before) })
+	ActiveBuilds.Set(2)
 
-	builds := []automotivev1alpha1.ImageBuild{
-		{
-			Status: automotivev1alpha1.ImageBuildStatus{Phase: "Building"},
-		},
-		{
-			Status: automotivev1alpha1.ImageBuildStatus{Phase: "Building"},
-		},
-		{
-			Status: automotivev1alpha1.ImageBuildStatus{Phase: "Completed"},
-		},
-	}
+	seedMetrics(nil)
 
-	seedMetrics(builds)
-
-	if v := gaugeValue(ActiveBuilds); v != 2 {
-		t.Errorf("ActiveBuilds = %v, want 2", v)
+	if got := gaugeValue(ActiveBuilds); got != 2 {
+		t.Fatalf("counter seeding overwrote ActiveBuilds: got %v, want 2", got)
 	}
 }

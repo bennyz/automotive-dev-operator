@@ -2430,7 +2430,6 @@ func (r *ImageBuildReconciler) updateStatus(
 		return err
 	}
 	fresh.DeepCopyInto(imageBuild)
-	adjustActiveBuildsGauge(oldPhase, phase)
 	if oldPhase != phase || oldMessage != message {
 		r.emitEventf(
 			fresh,

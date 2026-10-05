@@ -6,6 +6,8 @@ import (
 
 	automotivev1alpha1 "github.com/centos-automotive-suite/automotive-dev-operator/api/v1alpha1"
 	"github.com/prometheus/client_golang/prometheus"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/cache"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/metrics"
@@ -55,13 +57,13 @@ var (
 		[]string{"mode", "distro", "target", "format", "arch", "status"},
 	)
 
-	// ActiveBuilds tracks the number of currently in-progress builds.
+	// ActiveBuilds tracks the number of ImageBuilds in the Building phase.
 	ActiveBuilds = prometheus.NewGauge(
 		prometheus.GaugeOpts{
 			Namespace: metricsNamespace,
 			Subsystem: metricsSubsystem,
 			Name:      "active",
-			Help:      "Number of currently in-progress builds",
+			Help:      "Number of ImageBuilds in the Building phase",
 		},
 	)
 
@@ -100,14 +102,38 @@ func init() {
 	)
 }
 
-func adjustActiveBuildsGauge(oldPhase, newPhase string) {
-	if oldPhase == newPhase {
-		return
+func newActiveBuildsHandler(gauge prometheus.Gauge) cache.ResourceEventHandler {
+	// Informer notifications are ordered. Track names so replays and updates
+	// replacing a deleted build with a new UID cannot double-count a build.
+	active := make(map[types.NamespacedName]struct{})
+	observe := func(obj any) {
+		build, ok := obj.(*automotivev1alpha1.ImageBuild)
+		if !ok {
+			return
+		}
+		key := types.NamespacedName{Namespace: build.Namespace, Name: build.Name}
+		if build.Status.Phase == phaseBuilding {
+			active[key] = struct{}{}
+		} else {
+			delete(active, key)
+		}
+		gauge.Set(float64(len(active)))
 	}
-	if newPhase == phaseBuilding {
-		ActiveBuilds.Inc()
-	} else if oldPhase == phaseBuilding {
-		ActiveBuilds.Dec()
+	return cache.ResourceEventHandlerFuncs{
+		AddFunc:    observe,
+		UpdateFunc: func(_, obj any) { observe(obj) },
+		DeleteFunc: func(obj any) {
+			key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
+			if err != nil {
+				return
+			}
+			namespace, name, err := cache.SplitMetaNamespaceKey(key)
+			if err != nil {
+				return
+			}
+			delete(active, types.NamespacedName{Namespace: namespace, Name: name})
+			gauge.Set(float64(len(active)))
+		},
 	}
 }
 
@@ -127,14 +153,8 @@ func buildMetricStatus(b *automotivev1alpha1.ImageBuild) string {
 }
 
 func seedMetrics(builds []automotivev1alpha1.ImageBuild) {
-	var active float64
-
 	for i := range builds {
 		b := &builds[i]
-
-		if b.Status.Phase == phaseBuilding {
-			active++
-		}
 
 		if !automotivev1alpha1.IsTerminalBuildPhase(b.Status.Phase) {
 			continue
@@ -153,17 +173,24 @@ func seedMetrics(builds []automotivev1alpha1.ImageBuild) {
 			FlashTotal.WithLabelValues(target, status).Add(1)
 		}
 	}
-
-	ActiveBuilds.Set(active)
 }
 
-// seedMetricsFromCRs pre-loads counters from existing ImageBuild CRs so that
-// metrics survive operator pod restarts. Histograms are not seeded to avoid
-// inflating observation counts on each restart.
+// seedMetricsFromCRs pre-loads terminal counters from existing ImageBuild CRs
+// and registers live active-build tracking on the leader. Histograms are not
+// seeded to avoid inflating observation counts on each restart.
 func (r *ImageBuildReconciler) seedMetricsFromCRs(mgr ctrl.Manager) manager.RunnableFunc {
 	return func(ctx context.Context) error {
 		if !mgr.GetCache().WaitForCacheSync(ctx) {
 			return fmt.Errorf("cache sync failed")
+		}
+		informer, err := mgr.GetCache().GetInformer(ctx, &automotivev1alpha1.ImageBuild{})
+		if err != nil {
+			return fmt.Errorf("failed to get ImageBuild informer: %w", err)
+		}
+		// Register on the leader only. The informer replays its existing objects
+		// before delivering updates, avoiding a separate gauge-seeding race.
+		if _, err := informer.AddEventHandler(newActiveBuildsHandler(ActiveBuilds)); err != nil {
+			return fmt.Errorf("failed to register active build metrics handler: %w", err)
 		}
 		var builds automotivev1alpha1.ImageBuildList
 		if err := mgr.GetClient().List(ctx, &builds); err != nil {
