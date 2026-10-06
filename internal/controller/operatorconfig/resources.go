@@ -1050,7 +1050,7 @@ func (r *OperatorConfigReconciler) buildMetricsReaderClusterRoleBinding(namespac
 		RoleRef: rbacv1.RoleRef{
 			APIGroup: rbacv1.GroupName,
 			Kind:     "ClusterRole",
-			Name:     "metrics-reader",
+			Name:     metricsReaderRoleName,
 		},
 		Subjects: []rbacv1.Subject{
 			{

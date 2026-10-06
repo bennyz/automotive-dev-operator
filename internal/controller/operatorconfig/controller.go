@@ -525,6 +525,22 @@ func (r *OperatorConfigReconciler) createOrUpdate(
 		return nil
 	}
 
+	// Kubernetes makes roleRef immutable, so upgrades must replace the metrics binding.
+	if binding, ok := obj.(*rbacv1.ClusterRoleBinding); ok && binding.Name == metricsReaderBindingName {
+		current := existing.(*rbacv1.ClusterRoleBinding)
+		if current.RoleRef != binding.RoleRef {
+			if err := r.Delete(ctx, current, client.Preconditions{
+				UID: &current.UID, ResourceVersion: &current.ResourceVersion,
+			}); err != nil && !errors.IsNotFound(err) {
+				return err
+			}
+			if desiredHash != "" {
+				setSpecHashAnnotation(obj, desiredHash)
+			}
+			return r.Create(ctx, obj)
+		}
+	}
+
 	// Skip update if the desired state hasn't changed
 	if desiredHash != "" {
 		if existingAnnotations := existing.GetAnnotations(); existingAnnotations != nil {
