@@ -403,13 +403,11 @@ func (a *APIServer) getContainerBuild(c *gin.Context, name string) {
 		resp.CompletionTime = cb.Status.CompletionTime.Format(time.RFC3339)
 	}
 
-	// Mint a fresh registry token for completed/failed internal registry builds
-	// that belong to the requesting user
 	requester := a.resolveRequester(c)
 	buildOwner := cb.Annotations[labels.RequestedBy]
 	if requester == buildOwner &&
 		cb.Spec.UseServiceAccountAuth &&
-		isTerminalPhase(cb.Status.Phase) {
+		isTerminalPhase(cb.Status.Phase) && cb.Status.ImageDigest != "" && outputImage != "" {
 		tokenLifetime := a.resolveTokenLifetime(ctx, k8sClient, namespace)
 		token, _, tokenErr := a.mintRegistryToken(ctx, c, namespace, tokenLifetime)
 		if tokenErr != nil {

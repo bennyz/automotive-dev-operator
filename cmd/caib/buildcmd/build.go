@@ -383,6 +383,9 @@ func (h *Handler) displayBuildResults(ctx context.Context, api *buildapiclient.C
 		fmt.Fprintf(os.Stderr, "Warning: failed to get build results for %s: %v\n", buildName, err)
 		return nil
 	}
+	if st.ContainerImage == "" && st.DiskImage == "" && st.LockfileArtifact == "" {
+		st.RegistryToken = ""
+	}
 
 	if h.isStructuredOutput() {
 		credsFile := h.handleBuildArtifacts(st)

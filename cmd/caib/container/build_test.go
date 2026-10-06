@@ -1,8 +1,86 @@
 package container
 
 import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/clilog"
+	"github.com/centos-automotive-suite/automotive-dev-operator/internal/buildcontract"
 )
+
+func TestDisplayContainerBuildResultCredentialsRequireRecordedImage(t *testing.T) {
+	for _, tc := range []struct {
+		name, output, digest string
+		wantCredentials      bool
+	}{
+		{name: "no output", digest: "sha256:recorded"},
+		{name: "no digest", output: "registry.example/requested:latest"},
+		{name: "recorded image", output: "registry.example/image:latest", digest: "sha256:recorded", wantCredentials: true},
+	} {
+		for _, quiet := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/quiet=%t", tc.name, quiet), func(t *testing.T) {
+				tmp := t.TempDir()
+				t.Setenv("TMPDIR", tmp)
+				t.Setenv("NO_COLOR", "1")
+				clilog.SetQuiet(quiet)
+				t.Cleanup(func() { clilog.SetQuiet(false) })
+				capturePath := filepath.Join(tmp, "stdout")
+				capture, err := os.Create(capturePath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				previous := os.Stdout
+				os.Stdout = capture
+				t.Cleanup(func() { os.Stdout = previous; _ = capture.Close() })
+				status := &buildcontract.ContainerBuildResponse{
+					Name: "build", Phase: phaseCompleted, OutputImage: tc.output,
+					ImageDigest: tc.digest, RegistryToken: "test-registry-token",
+				}
+				displayContainerBuildResult(status)
+				os.Stdout = previous
+				if err := capture.Close(); err != nil {
+					t.Fatal(err)
+				}
+				files, err := filepath.Glob(filepath.Join(tmp, "caib-registry-creds-*.json"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				wantFiles := 0
+				if tc.wantCredentials {
+					wantFiles = 1
+				}
+				if len(files) != wantFiles || (status.RegistryToken != "") != tc.wantCredentials {
+					t.Fatalf("credential files=%d, token returned=%t", len(files), status.RegistryToken != "")
+				}
+				if !tc.wantCredentials {
+					return
+				}
+				output, err := os.ReadFile(capturePath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !strings.Contains(string(output), files[0]) {
+					t.Fatal("credential file path was not printed")
+				}
+				data, err := os.ReadFile(files[0])
+				if err != nil {
+					t.Fatal(err)
+				}
+				var credentials map[string]string
+				if err := json.Unmarshal(data, &credentials); err != nil {
+					t.Fatal(err)
+				}
+				if credentials["username"] != "serviceaccount" || credentials["token"] != "test-registry-token" {
+					t.Fatal("credential file does not contain the expected credentials")
+				}
+			})
+		}
+	}
+}
 
 func TestParseContainerBuildArgs(t *testing.T) {
 	tests := []struct {
