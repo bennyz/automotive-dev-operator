@@ -17,11 +17,93 @@ limitations under the License.
 package operatorconfig
 
 import (
+	"context"
+
 	automotivev1alpha1 "github.com/centos-automotive-suite/automotive-dev-operator/api/v1alpha1"
+	"github.com/go-logr/logr"
 	. "github.com/onsi/ginkgo/v2" //nolint:revive
 	. "github.com/onsi/gomega"    //nolint:revive
+	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
+
+var _ = Describe("metrics reader ClusterRoleBinding reconciliation", func() {
+	DescribeTable("should reconcile existing bindings",
+		func(mutate func(*rbacv1.ClusterRoleBinding), expectedDeletes, expectedCreates, expectedUpdates int, unmanaged bool) {
+			ctx := context.Background()
+			r := &OperatorConfigReconciler{Log: logr.Discard()}
+			desired := r.buildMetricsReaderClusterRoleBinding("test-ns")
+			existing := desired.DeepCopy()
+			mutate(existing)
+			existing.UID = "original-binding"
+
+			scheme := runtime.NewScheme()
+			Expect(rbacv1.AddToScheme(scheme)).To(Succeed())
+			var deletes, creates, updates int
+			r.Client = fake.NewClientBuilder().WithScheme(scheme).WithObjects(existing).
+				WithInterceptorFuncs(interceptor.Funcs{
+					Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+						deletes++
+						Expect(obj.GetUID()).To(Equal(existing.UID))
+						return c.Delete(ctx, obj, opts...)
+					},
+					Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+						creates++
+						Expect(obj.GetResourceVersion()).To(BeEmpty())
+						return c.Create(ctx, obj, opts...)
+					},
+					Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+						updates++
+						Expect(obj.(*rbacv1.ClusterRoleBinding).RoleRef).To(Equal(existing.RoleRef), "roleRef is immutable")
+						return c.Update(ctx, obj, opts...)
+					},
+				}).Build()
+
+			Expect(r.createOrUpdate(ctx, desired, nil)).To(Succeed())
+			Expect(deletes).To(Equal(expectedDeletes))
+			Expect(creates).To(Equal(expectedCreates))
+			Expect(updates).To(Equal(expectedUpdates))
+
+			actual := &rbacv1.ClusterRoleBinding{}
+			Expect(r.Get(ctx, client.ObjectKeyFromObject(desired), actual)).To(Succeed())
+			if unmanaged {
+				Expect(actual.RoleRef).To(Equal(existing.RoleRef))
+				Expect(actual.UID).To(Equal(existing.UID))
+				return
+			}
+			Expect(actual.RoleRef).To(Equal(desired.RoleRef))
+			Expect(actual.Subjects).To(Equal(desired.Subjects))
+			Expect(actual.Annotations).To(HaveKeyWithValue(specHashAnnotation,
+				computeSpecHash(r.buildMetricsReaderClusterRoleBinding("test-ns"))))
+
+			Expect(r.createOrUpdate(ctx, r.buildMetricsReaderClusterRoleBinding("test-ns"), nil)).To(Succeed())
+			Expect(deletes).To(Equal(expectedDeletes))
+			Expect(creates).To(Equal(expectedCreates))
+			Expect(updates).To(Equal(expectedUpdates))
+		},
+		Entry("replace the legacy role reference with its old desired-state hash", func(binding *rbacv1.ClusterRoleBinding) {
+			binding.RoleRef.Name = "metrics-reader"
+			setSpecHashAnnotation(binding, computeSpecHash(binding))
+		}, 1, 1, 0, false),
+		Entry("replace the legacy role reference without a hash", func(binding *rbacv1.ClusterRoleBinding) {
+			binding.RoleRef.Name = "metrics-reader"
+		}, 1, 1, 0, false),
+		Entry("leave unmanaged legacy bindings untouched", func(binding *rbacv1.ClusterRoleBinding) {
+			binding.RoleRef.Name = "metrics-reader"
+			binding.Annotations = map[string]string{unmanagedAnnotationKey: unmanagedAnnotationTrue}
+		}, 0, 0, 0, true),
+		Entry("skip unchanged bindings", func(binding *rbacv1.ClusterRoleBinding) {
+			setSpecHashAnnotation(binding, computeSpecHash(binding))
+		}, 0, 0, 0, false),
+		Entry("update subjects without replacing the binding", func(binding *rbacv1.ClusterRoleBinding) {
+			binding.Subjects[0].Namespace = "old-ns"
+		}, 0, 0, 1, false),
+	)
+})
 
 var _ = Describe("setCondition", func() {
 	var (
