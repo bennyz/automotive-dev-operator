@@ -32,8 +32,6 @@ const (
 	phasePending   = automotivev1alpha1.ImageBuildPhasePending
 	phaseUploading = automotivev1alpha1.ImageBuildPhaseUploading
 	phaseRunning   = "Running"
-
-	errPrefixFlash = "flash"
 )
 
 var isTerminalPhase = automotivev1alpha1.IsTerminalBuildPhase
@@ -54,8 +52,7 @@ type Options struct {
 
 // Handler implements image build command run functions.
 type Handler struct {
-	opts        Options
-	lastLeaseID string
+	opts Options
 }
 
 // NewHandler creates a build workflow handler.
@@ -395,8 +392,10 @@ func (h *Handler) displayBuildResults(ctx context.Context, api *buildapiclient.C
 			Message:                 st.Message,
 			ContainerImage:          st.ContainerImage,
 			DiskImage:               st.DiskImage,
-			LeaseID:                 h.lastLeaseID,
 			RegistryCredentialsFile: credsFile,
+		}
+		if st.Flash != nil {
+			result.LeaseID = st.Flash.LeaseID
 		}
 		if st.RegistryToken != "" && h.opts.Registry.UseInternalRegistry {
 			result.RegistryUsername = "serviceaccount"
@@ -420,7 +419,7 @@ func (h *Handler) finishBuild(ctx context.Context, api *buildapiclient.Client, b
 	if waitErr == nil {
 		return
 	}
-	if st != nil && ((st.Flash != nil && st.Flash.State == "Failed") || strings.Contains(strings.ToLower(st.Message), errPrefixFlash)) {
+	if st != nil && st.Flash != nil && st.Flash.State == "Failed" {
 		h.handleFlashError(waitErr, st)
 		return
 	}

@@ -321,7 +321,7 @@ func (h *Handler) sealedStreamLogs(ctx context.Context, op buildcontract.SealedO
 	}
 
 	state := &logstream.State{}
-	return logstream.StreamLogs(logstream.LogWriter(), resp.Body, state, false)
+	return logstream.StreamLogs(logstream.LogWriter(), resp.Body, state)
 }
 
 // resolveSealedTwoRefs returns input and output refs from --input/--output flags or positionals (any order).

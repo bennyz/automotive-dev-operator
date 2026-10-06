@@ -20,7 +20,6 @@ type State struct {
 	WarningShown bool
 	StartTime    time.Time
 	Completed    bool
-	LeaseID      string
 	LineHandler  func(line string)
 }
 
@@ -51,7 +50,7 @@ func LogWriter() io.Writer {
 }
 
 // StreamLogs streams response body line-by-line to the provided writer.
-func StreamLogs(w io.Writer, body io.Reader, state *State, captureLeaseID bool) error {
+func StreamLogs(w io.Writer, body io.Reader, state *State) error {
 	if state == nil {
 		return fmt.Errorf("stream state is required")
 	}
@@ -75,28 +74,6 @@ func StreamLogs(w io.Writer, body io.Reader, state *State, captureLeaseID bool) 
 		state.StartTime = time.Now()
 		if state.LineHandler != nil {
 			state.LineHandler(line)
-		}
-
-		if !captureLeaseID {
-			continue
-		}
-
-		if strings.Contains(line, "jmp shell --lease ") {
-			parts := strings.Split(line, "jmp shell --lease ")
-			if len(parts) > 1 {
-				tokens := strings.Fields(parts[1])
-				if len(tokens) > 0 {
-					state.LeaseID = tokens[0]
-				}
-			}
-		} else if strings.Contains(line, "Lease acquired: ") {
-			parts := strings.Split(line, "Lease acquired: ")
-			if len(parts) > 1 {
-				tokens := strings.Fields(parts[1])
-				if len(tokens) > 0 {
-					state.LeaseID = tokens[0]
-				}
-			}
 		}
 	}
 	state.Active = false
