@@ -5,16 +5,104 @@ import (
 	"encoding/json"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/clilog"
 	"github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/commandopts"
 	caibcommon "github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/common"
+	buildapiclient "github.com/centos-automotive-suite/automotive-dev-operator/internal/buildapi/client"
 	"github.com/centos-automotive-suite/automotive-dev-operator/internal/buildcontract"
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
 )
+
+func TestDisplayBuildResultsCredentialsRequireArtifact(t *testing.T) {
+	for _, tc := range []struct {
+		name, phase, container, disk, lockfile string
+	}{
+		{name: "failed", phase: "Failed"},
+		{name: "cancelled", phase: "Cancelled"},
+		{name: "pending", phase: "Pending"},
+		{name: "completed without image", phase: "Completed"},
+		{name: "container", phase: "Completed", container: "registry.example/image:latest"},
+		{name: "disk", phase: "Completed", disk: "registry.example/disk:latest"},
+		{name: "flash failed", phase: "Failed", disk: "registry.example/disk:latest"},
+		{name: "lockfile", phase: "Completed", lockfile: "registry.example/lockfile:latest"},
+	} {
+		for _, format := range []string{"table", "json", "yaml"} {
+			t.Run(tc.name+"/"+format, func(t *testing.T) {
+				tmp := t.TempDir()
+				t.Setenv("TMPDIR", tmp)
+				clilog.SetQuiet(false)
+				t.Cleanup(func() { clilog.SetQuiet(false) })
+				server := fakeBuildServer(t, []buildcontract.BuildResponse{{
+					Name: "build", Phase: tc.phase, ContainerImage: tc.container,
+					DiskImage: tc.disk, LockfileArtifact: tc.lockfile, RegistryToken: "test-registry-token",
+				}})
+				t.Cleanup(server.Close)
+				api, err := buildapiclient.New(server.URL)
+				if err != nil {
+					t.Fatal(err)
+				}
+				h := NewHandler(Options{
+					Output:      &commandopts.Output{Format: format},
+					Registry:    &commandopts.Registry{UseInternalRegistry: true},
+					HandleError: func(err error) { t.Errorf("unexpected error: %v", err) },
+				})
+				out := captureStdout(t, func() { h.displayBuildResults(t.Context(), api, "build") })
+				files, err := filepath.Glob(filepath.Join(tmp, "caib-registry-creds-*.json"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				wantCredentials := tc.container != "" || tc.disk != "" || tc.lockfile != ""
+				wantFiles := 0
+				if wantCredentials {
+					wantFiles = 1
+				}
+				if len(files) != wantFiles {
+					t.Fatalf("created %d credential files, want %d", len(files), wantFiles)
+				}
+				if wantCredentials {
+					data, err := os.ReadFile(files[0])
+					if err != nil {
+						t.Fatal(err)
+					}
+					var credentials map[string]string
+					if err := json.Unmarshal(data, &credentials); err != nil {
+						t.Fatal(err)
+					}
+					if credentials["username"] != "serviceaccount" || credentials["token"] != "test-registry-token" {
+						t.Fatal("credential file does not contain the expected credentials")
+					}
+				}
+				if format == "table" {
+					if strings.Contains(out, "Registry credentials") != wantCredentials {
+						t.Fatalf("unexpected credential output: %q", out)
+					}
+				} else {
+					var result BuildResult
+					decode := json.Unmarshal
+					if format == "yaml" {
+						decode = yaml.Unmarshal
+					}
+					if err := decode([]byte(out), &result); err != nil {
+						t.Fatal(err)
+					}
+					if (result.RegistryToken != "") != wantCredentials ||
+						(result.RegistryUsername != "") != wantCredentials ||
+						(result.RegistryCredentialsFile != "") != wantCredentials {
+						t.Fatalf("unexpected credential fields: %#v", result)
+					}
+					if result.Phase != tc.phase {
+						t.Fatalf("phase = %q, want %q", result.Phase, tc.phase)
+					}
+				}
+			})
+		}
+	}
+}
 
 func TestBuildResultJSONMarshal(t *testing.T) {
 	result := BuildResult{

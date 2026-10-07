@@ -211,6 +211,16 @@ func imageStreamHasTags(ctx context.Context, k8sClient client.Client, namespace,
 	return len(tags) > 0, nil
 }
 
+// Recorded artifacts survive flash failures and expiry, but may no longer be pullable.
+func buildRegistryTokenEligible(build *automotivev1alpha1.ImageBuild, requester string) bool {
+	if requester != build.Annotations[labels.RequestedBy] ||
+		!build.Spec.GetUseServiceAccountAuth() || !isTerminalPhase(build.Status.Phase) {
+		return false
+	}
+	container, disk := storedArtifactURLs(build)
+	return container != "" || disk != ""
+}
+
 // mintRegistryToken creates a fresh short-lived token for the pipeline SA
 // so the caller can pull images from the internal registry.
 func (a *APIServer) mintRegistryToken(ctx context.Context, c *gin.Context, namespace string, tokenLifetimeSeconds int64) (string, metav1.Time, error) {

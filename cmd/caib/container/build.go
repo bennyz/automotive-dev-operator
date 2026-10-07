@@ -446,6 +446,9 @@ func waitForContainerBuildCompletion(ctx context.Context, name string, pb *ui.Pr
 }
 
 func displayContainerBuildResult(finalStatus *buildcontract.ContainerBuildResponse) {
+	if finalStatus.OutputImage == "" || finalStatus.ImageDigest == "" {
+		finalStatus.RegistryToken = ""
+	}
 	if clilog.IsQuiet() {
 		if finalStatus.Phase == phaseFailed {
 			handleError(fmt.Errorf("build failed"))

@@ -1581,15 +1581,11 @@ func (a *APIServer) getBuild(c *gin.Context, name string) {
 		return
 	}
 
-	// Only report artifact URLs when the build progressed past the Building
-	// phase — otherwise no image was produced and the URLs are misleading.
-	var containerImage, diskImage string
-	if buildProducedArtifacts(build) {
+	// Preserve legacy URL display without treating requested URLs as token eligibility.
+	containerImage, diskImage := storedArtifactURLs(build)
+	if build.Status.TerminalResult == nil && len(build.Status.Artifacts) == 0 && buildProducedArtifacts(build) {
 		containerImage = build.Spec.GetContainerPush()
 		diskImage = build.Spec.GetExportOCI()
-	}
-	if build.Status.TerminalResult != nil {
-		containerImage, diskImage = storedArtifactURLs(build)
 	}
 	containerImage, diskImage, lockfileArtifact := classifyBuildArtifactURLs(build, containerImage, diskImage)
 	var warning string
@@ -1649,14 +1645,8 @@ func (a *APIServer) getBuild(c *gin.Context, name string) {
 		}
 	}
 
-	// Mint a fresh registry token only for completed/failed internal registry builds
-	// that belong to the requesting user
 	var registryToken string
-	requester := a.resolveRequester(c)
-	buildOwner := build.Annotations[labels.RequestedBy]
-	if requester == buildOwner &&
-		build.Spec.GetUseServiceAccountAuth() &&
-		isTerminalPhase(build.Status.Phase) {
+	if buildRegistryTokenEligible(build, a.resolveRequester(c)) {
 		var tokenErr error
 		tokenLifetime := a.resolveTokenLifetime(ctx, k8sClient, namespace)
 		registryToken, _, tokenErr = a.mintRegistryToken(ctx, c, namespace, tokenLifetime)
