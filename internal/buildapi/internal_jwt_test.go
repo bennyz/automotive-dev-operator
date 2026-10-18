@@ -142,9 +142,24 @@ var _ = Describe("validateInternalJWT", func() {
 		Expect(subject).To(BeEmpty())
 	})
 
-	It("should reject token with wrong signing method", func() {
-		// Test with an invalid token string (wrong signing method)
-		// This will fail validation since it doesn't match the expected HS256 method
+	DescribeTable("rejects otherwise valid tokens using a different signing method",
+		func(method jwt.SigningMethod) {
+			claims := jwt.RegisteredClaims{
+				Issuer: "test-issuer", Audience: jwt.ClaimStrings{"test-audience"},
+				Subject: "test-user", ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
+			}
+			tokenString, err := jwt.NewWithClaims(method, claims).SignedString(key)
+			Expect(err).NotTo(HaveOccurred())
+
+			subject, valid := validateInternalJWT(tokenString, cfg)
+			Expect(valid).To(BeFalse())
+			Expect(subject).To(BeEmpty())
+		},
+		Entry("HS384", jwt.SigningMethodHS384),
+		Entry("HS512", jwt.SigningMethodHS512),
+	)
+
+	It("should reject a malformed token", func() {
 		tokenString := "invalid.token.string"
 
 		subject, valid := validateInternalJWT(tokenString, cfg)

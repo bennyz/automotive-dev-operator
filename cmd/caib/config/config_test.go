@@ -715,9 +715,12 @@ var _ = Describe("JumpstarterToken", func() {
 
 	It("rejects a current-client alias that escapes the clients directory", func() {
 		jmpDir := filepath.Join(tempDir, ".config", "jumpstarter")
-		Expect(os.MkdirAll(jmpDir, 0700)).To(Succeed())
+		Expect(os.MkdirAll(filepath.Join(jmpDir, "clients"), 0700)).To(Succeed())
+		// Without alias validation, ../outside resolves to this valid token file.
+		Expect(os.WriteFile(filepath.Join(jmpDir, "outside.yaml"),
+			[]byte("endpoint: grpc.lab.apps.example.com:443\ntoken: "+jmpToken+"\n"), 0600)).To(Succeed())
 		Expect(os.WriteFile(filepath.Join(jmpDir, "config.yaml"),
-			[]byte("config:\n  current-client: ../../../etc/passwd\n"), 0600)).To(Succeed())
+			[]byte("config:\n  current-client: ../outside\n"), 0600)).To(Succeed())
 
 		Expect(JumpstarterToken()).To(BeEmpty())
 	})

@@ -3,6 +3,7 @@ package caibcommon
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -131,18 +132,22 @@ func TestResolveJumpstarterClient_EmptyCurrentClient(t *testing.T) {
 func TestResolveJumpstarterClient_PathTraversal(t *testing.T) {
 	dir := t.TempDir()
 	jmpDir := filepath.Join(dir, "jumpstarter")
-	if err := os.MkdirAll(jmpDir, 0700); err != nil {
+	if err := os.MkdirAll(filepath.Join(jmpDir, "clients"), 0700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(jmpDir, "config.yaml"), []byte("config:\n  current-client: ../../../etc/passwd\n"), 0600); err != nil {
+	// Without alias validation, ../outside resolves to this valid client file.
+	if err := os.WriteFile(filepath.Join(jmpDir, "outside.yaml"), []byte("endpoint: grpc.lab.example.com:443\nmetadata:\n  name: outside\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(jmpDir, "config.yaml"), []byte("config:\n  current-client: ../outside\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
 
 	withEnv(t, "JMP_CLIENT_CONFIG_HOME", jmpDir)
 
 	_, err := ResolveJumpstarterClient("")
-	if err == nil {
-		t.Fatal("expected error for path traversal alias")
+	if err == nil || !strings.Contains(err.Error(), "invalid current-client alias") {
+		t.Fatalf("expected alias validation error, got %v", err)
 	}
 }
 
