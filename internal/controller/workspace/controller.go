@@ -393,34 +393,15 @@ func (r *Reconciler) buildPod(ws *automotivev1alpha1.Workspace, operatorConfig *
 	image := resolveWorkspaceImage(ws, wsConfig)
 	imagePullSecrets := resolveImagePullSecrets(ws, wsConfig)
 
-	// Determine if the cluster supports user namespaces.
-	// With user namespaces: drop ALL caps + add specific ones, procMount=Unmasked
-	// Without (OCP < 4.19): privileged=true for nested podman/buildah
-	userNamespaces := operatorConfig != nil && operatorConfig.Status.UserNamespacesSupported
-
-	var secCtx *corev1.SecurityContext
-	if userNamespaces {
-		secCtx = &corev1.SecurityContext{
-			AllowPrivilegeEscalation: new(true),
-			ProcMount:                ptr.To(corev1.UnmaskedProcMount),
-			Capabilities: &corev1.Capabilities{
-				Drop: []corev1.Capability{"ALL"},
-				Add:  []corev1.Capability{"SETUID", "SETGID", "SYS_ADMIN", "DAC_OVERRIDE", "CHOWN", "FOWNER"},
-			},
-		}
-	} else if image == configuredImage {
-		secCtx = &corev1.SecurityContext{
-			Privileged:               new(true),
-			AllowPrivilegeEscalation: new(true),
-		}
-	} else {
-		secCtx = &corev1.SecurityContext{
-			AllowPrivilegeEscalation: new(true),
-			Capabilities: &corev1.Capabilities{
-				Drop: []corev1.Capability{"ALL"},
-				Add:  []corev1.Capability{"SETUID", "SETGID", "DAC_OVERRIDE", "CHOWN", "FOWNER"},
-			},
-		}
+	// OpenShift 4.21+ supports pod user namespaces. Scope the capabilities needed
+	// for nested podman/buildah and persistent overlays to the pod's namespace.
+	secCtx := &corev1.SecurityContext{
+		AllowPrivilegeEscalation: new(true),
+		ProcMount:                ptr.To(corev1.UnmaskedProcMount),
+		Capabilities: &corev1.Capabilities{
+			Drop: []corev1.Capability{"ALL"},
+			Add:  []corev1.Capability{"SETUID", "SETGID", "SYS_ADMIN", "DAC_OVERRIDE", "CHOWN", "FOWNER"},
+		},
 	}
 
 	annotations := map[string]string{
@@ -517,6 +498,7 @@ chown -R 1000:1000 /workspace/src /workspace/cache /workspace/.cache /workspace/
 
 	podSpec := corev1.PodSpec{
 		ServiceAccountName: workspaceServiceAccountName,
+		HostUsers:          new(false),
 		SecurityContext: &corev1.PodSecurityContext{
 			RunAsUser: ptr.To[int64](0),
 		},
@@ -570,9 +552,6 @@ chown -R 1000:1000 /workspace/src /workspace/cache /workspace/.cache /workspace/
 		Tolerations:                   wsConfig.GetTolerations(),
 		TerminationGracePeriodSeconds: ptr.To[int64](5),
 		RestartPolicy:                 corev1.RestartPolicyNever,
-	}
-	if userNamespaces {
-		podSpec.HostUsers = new(false)
 	}
 
 	pod := &corev1.Pod{

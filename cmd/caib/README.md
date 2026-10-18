@@ -879,6 +879,8 @@ caib auth refresh
 
 Create and manage persistent developer workspaces with cross-compilation toolchains for building C/C++/Rust applications targeting automotive boards.
 
+Workspaces require OpenShift 4.21+ and always run in pod user namespaces (`hostUsers: false`). The backing filesystem of the workspace PVC must support ID-mapped mounts; NFS-backed volumes are not supported. The operator does not fall back to privileged workspace pods.
+
 ### workspace create
 
 ```bash

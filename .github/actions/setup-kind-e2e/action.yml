@@ -9,10 +9,10 @@ inputs:
     default: v3.17.0
   kind-version:
     description: Kind version to install
-    default: v0.24.0
+    default: v0.30.0
   kubectl-version:
     description: kubectl version to install
-    default: v1.31.0
+    default: v1.34.0
   tekton-version:
     description: Tekton Pipelines version to install
     default: v1.9.1

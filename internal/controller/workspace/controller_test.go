@@ -2,6 +2,7 @@ package workspace
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"testing"
 
@@ -734,48 +735,36 @@ func TestBuildPod_SecurityContext(t *testing.T) {
 	tests := []struct {
 		name           string
 		image          string
-		userNamespaces bool
-		wantPrivileged bool
-		wantSysAdmin   bool
-		wantProcMount  *corev1.ProcMountType
+		operatorConfig *automotivev1alpha1.OperatorConfig
 	}{
 		{
-			name:           "no userns + toolchain image → privileged",
-			image:          "", // defaults to toolchain
-			userNamespaces: false,
-			wantPrivileged: true,
-			wantSysAdmin:   false, // privileged implies all caps
+			name: "without OperatorConfig",
 		},
 		{
-			name:           "no userns + custom image → not privileged, no SYS_ADMIN",
+			name:           "with uninitialized OperatorConfig status",
+			operatorConfig: &automotivev1alpha1.OperatorConfig{},
+		},
+		{
+			name:  "custom image without OperatorConfig",
+			image: customImage,
+		},
+		{
+			name:           "custom image with OperatorConfig",
 			image:          customImage,
-			userNamespaces: false,
-			wantPrivileged: false,
-			wantSysAdmin:   false,
+			operatorConfig: &automotivev1alpha1.OperatorConfig{},
 		},
 		{
-			name:           "userns + toolchain image → not privileged, has SYS_ADMIN",
-			image:          "", // defaults to toolchain
-			userNamespaces: true,
-			wantPrivileged: false,
-			wantSysAdmin:   true,
-			wantProcMount:  ptr.To(corev1.UnmaskedProcMount),
-		},
-		{
-			name:           "userns + custom image → not privileged, has SYS_ADMIN (scoped to userns)",
-			image:          customImage,
-			userNamespaces: true,
-			wantPrivileged: false,
-			wantSysAdmin:   true,
-			wantProcMount:  ptr.To(corev1.UnmaskedProcMount),
-		},
-		{
-			name:           "userns + explicit toolchain image → not privileged, has SYS_ADMIN",
+			name:           "explicit default toolchain image",
 			image:          toolchainImage,
-			userNamespaces: true,
-			wantPrivileged: false,
-			wantSysAdmin:   true,
-			wantProcMount:  ptr.To(corev1.UnmaskedProcMount),
+			operatorConfig: &automotivev1alpha1.OperatorConfig{},
+		},
+		{
+			name: "configured toolchain image",
+			operatorConfig: &automotivev1alpha1.OperatorConfig{
+				Spec: automotivev1alpha1.OperatorConfigSpec{
+					Workspaces: &automotivev1alpha1.WorkspacesConfig{ToolchainImage: customImage},
+				},
+			},
 		},
 	}
 
@@ -783,66 +772,38 @@ func TestBuildPod_SecurityContext(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			ws := makeWorkspace(tt.image)
 
-			var operatorConfig *automotivev1alpha1.OperatorConfig
-			if tt.userNamespaces {
-				operatorConfig = &automotivev1alpha1.OperatorConfig{
-					Status: automotivev1alpha1.OperatorConfigStatus{
-						UserNamespacesSupported: true,
-					},
-				}
-			}
-
 			r := &Reconciler{Scheme: newTestScheme()}
-			pod := r.buildPod(ws, operatorConfig)
+			pod := r.buildPod(ws, tt.operatorConfig)
+			if pod.Spec.HostUsers == nil || *pod.Spec.HostUsers {
+				t.Fatal("workspace must explicitly require a pod user namespace")
+			}
 
 			secCtx := pod.Spec.Containers[0].SecurityContext
 			if secCtx == nil {
 				t.Fatal("expected SecurityContext to be set")
 			}
 
-			// Check Privileged
-			isPrivileged := secCtx.Privileged != nil && *secCtx.Privileged
-			if isPrivileged != tt.wantPrivileged {
-				t.Errorf("Privileged = %v, want %v", isPrivileged, tt.wantPrivileged)
+			if ptr.Deref(secCtx.Privileged, false) {
+				t.Error("workspace must not be privileged")
 			}
-
-			// Check SYS_ADMIN capability
-			hasSysAdmin := false
-			if secCtx.Capabilities != nil {
-				for _, cap := range secCtx.Capabilities.Add {
-					if cap == "SYS_ADMIN" {
-						hasSysAdmin = true
-					}
-				}
+			if !ptr.Deref(secCtx.AllowPrivilegeEscalation, false) {
+				t.Error("nested containers require privilege escalation within the user namespace")
 			}
-			if hasSysAdmin != tt.wantSysAdmin {
-				t.Errorf("SYS_ADMIN capability = %v, want %v", hasSysAdmin, tt.wantSysAdmin)
+			if ptr.Deref(secCtx.ProcMount, corev1.DefaultProcMount) != corev1.UnmaskedProcMount {
+				t.Error("nested containers require an unmasked proc mount within the user namespace")
 			}
-
-			// Check ProcMount
-			if tt.wantProcMount != nil {
-				if secCtx.ProcMount == nil {
-					t.Errorf("ProcMount = nil, want %v", *tt.wantProcMount)
-				} else if *secCtx.ProcMount != *tt.wantProcMount {
-					t.Errorf("ProcMount = %v, want %v", *secCtx.ProcMount, *tt.wantProcMount)
-				}
-			} else if secCtx.ProcMount != nil {
-				t.Errorf("ProcMount = %v, want nil", *secCtx.ProcMount)
+			if secCtx.Capabilities == nil {
+				t.Fatal("expected explicit capabilities for nested containers")
 			}
-
-			// Non-privileged containers must drop ALL caps
-			if !tt.wantPrivileged {
-				if secCtx.Capabilities == nil {
-					t.Fatal("expected Capabilities to be set for non-privileged container")
-				}
-				dropsAll := false
-				for _, cap := range secCtx.Capabilities.Drop {
-					if cap == "ALL" {
-						dropsAll = true
-					}
-				}
-				if !dropsAll {
-					t.Error("non-privileged container must drop ALL capabilities")
+			if !slices.Contains(secCtx.Capabilities.Drop, corev1.Capability("ALL")) {
+				t.Error("workspace must drop all default capabilities")
+			}
+			if !slices.Contains(secCtx.Capabilities.Add, corev1.Capability("SYS_ADMIN")) {
+				t.Error("persistent overlays require SYS_ADMIN within the user namespace")
+			}
+			for _, init := range pod.Spec.InitContainers {
+				if init.SecurityContext != nil && ptr.Deref(init.SecurityContext.Privileged, false) {
+					t.Errorf("init container %q must not be privileged", init.Name)
 				}
 			}
 		})
