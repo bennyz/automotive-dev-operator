@@ -995,10 +995,6 @@ type OperatorConfigStatus struct {
 	// JumpstarterAvailable indicates if Jumpstarter is available (explicitly configured or local CRDs detected)
 	JumpstarterAvailable bool `json:"jumpstarterAvailable,omitempty"`
 
-	// UserNamespacesSupported indicates if the cluster supports user namespaces in pods
-	// (SCC userNamespaceLevel field). When false, workspace pods use privileged mode.
-	UserNamespacesSupported bool `json:"userNamespacesSupported,omitempty"`
-
 	// MonitoringEnabled indicates if the ServiceMonitor is currently deployed
 	MonitoringEnabled bool `json:"monitoringEnabled,omitempty"`
 

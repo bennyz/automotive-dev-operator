@@ -18,11 +18,14 @@ package operatorconfig
 
 import (
 	"context"
+	"fmt"
 
 	automotivev1alpha1 "github.com/centos-automotive-suite/automotive-dev-operator/api/v1alpha1"
 	"github.com/go-logr/logr"
 	. "github.com/onsi/ginkgo/v2" //nolint:revive
 	. "github.com/onsi/gomega"    //nolint:revive
+	securityv1 "github.com/openshift/api/security/v1"
+	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -30,6 +33,81 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
+
+var _ = Describe("workspace infrastructure reconciliation", func() {
+	var (
+		r      *OperatorConfigReconciler
+		config *automotivev1alpha1.OperatorConfig
+	)
+
+	BeforeEach(func() {
+		scheme := runtime.NewScheme()
+		Expect(corev1.AddToScheme(scheme)).To(Succeed())
+		Expect(rbacv1.AddToScheme(scheme)).To(Succeed())
+		Expect(securityv1.AddToScheme(scheme)).To(Succeed())
+		r = &OperatorConfigReconciler{
+			Client:      fake.NewClientBuilder().WithScheme(scheme).Build(),
+			Log:         logr.Discard(),
+			IsOpenShift: new(true),
+		}
+		config = &automotivev1alpha1.OperatorConfig{
+			ObjectMeta: metav1.ObjectMeta{Name: "config", Namespace: "test-ns"},
+		}
+	})
+
+	DescribeTable("requires pod user namespaces",
+		func(upgrade bool) {
+			ctx := context.Background()
+			if upgrade {
+				legacy := r.buildWorkspaceSCC()
+				legacy.UserNamespaceLevel = ""
+				legacy.AllowPrivilegedContainer = true
+				legacy.AllowedCapabilities = []corev1.Capability{"*"}
+				legacy.FSGroup = securityv1.FSGroupStrategyOptions{Type: securityv1.FSGroupStrategyRunAsAny}
+				legacy.SupplementalGroups = securityv1.SupplementalGroupsStrategyOptions{Type: securityv1.SupplementalGroupsStrategyRunAsAny}
+				legacy.Volumes = []securityv1.FSType{securityv1.FSTypeAll}
+				setSpecHashAnnotation(legacy, computeSpecHash(legacy))
+				Expect(r.Create(ctx, legacy)).To(Succeed())
+			}
+
+			Expect(r.deployWorkspaceInfra(ctx, config)).To(Succeed())
+			actual := &securityv1.SecurityContextConstraints{}
+			Expect(r.Get(ctx, client.ObjectKey{Name: workspaceSCCName}, actual)).To(Succeed())
+			Expect(actual.UserNamespaceLevel).To(Equal(securityv1.NamespaceLevelRequirePod))
+			Expect(actual.AllowPrivilegedContainer).To(BeFalse())
+			Expect(actual.AllowedCapabilities).NotTo(ContainElement(corev1.Capability("*")))
+			Expect(actual.AllowHostDirVolumePlugin).To(BeFalse())
+			Expect(actual.Volumes).NotTo(ContainElement(securityv1.FSTypeAll))
+			Expect(actual.FSGroup.Ranges).To(Equal([]securityv1.IDRange{{Min: 0, Max: 65534}}))
+			Expect(actual.SupplementalGroups.Ranges).To(Equal([]securityv1.IDRange{{Min: 0, Max: 65534}}))
+
+			// Reconciliation must keep the same policy on subsequent passes.
+			Expect(r.deployWorkspaceInfra(ctx, config)).To(Succeed())
+			unchanged := &securityv1.SecurityContextConstraints{}
+			Expect(r.Get(ctx, client.ObjectKey{Name: workspaceSCCName}, unchanged)).To(Succeed())
+			Expect(unchanged.ResourceVersion).To(Equal(actual.ResourceVersion))
+		},
+		Entry("on a new installation", false),
+		Entry("when upgrading from the privileged workspace SCC", true),
+	)
+
+	It("propagates SCC creation failures without retrying a privileged policy", func() {
+		var attempts int
+		r.Client = interceptor.NewClient(r.Client.(client.WithWatch), interceptor.Funcs{
+			Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+				if scc, ok := obj.(*securityv1.SecurityContextConstraints); ok {
+					attempts++
+					Expect(scc.UserNamespaceLevel).To(Equal(securityv1.NamespaceLevelRequirePod))
+					Expect(scc.AllowPrivilegedContainer).To(BeFalse())
+					return fmt.Errorf("workspace SCC rejected")
+				}
+				return c.Create(ctx, obj, opts...)
+			},
+		})
+		Expect(r.deployWorkspaceInfra(context.Background(), config)).To(MatchError(ContainSubstring("workspace SCC rejected")))
+		Expect(attempts).To(Equal(1))
+	})
+})
 
 var _ = Describe("metrics reader ClusterRoleBinding reconciliation", func() {
 	DescribeTable("should reconcile existing bindings",

@@ -17,9 +17,10 @@ The CentOS Automotive Suite Operator enables automotive OS image building throug
 ### Prerequisites
 
 **For OpenShift Installation (Recommended):**
-- OpenShift 4.18+ cluster
+- OpenShift 4.21+ cluster
 - OpenShift Pipelines Operator (Tekton) installed
 - Cluster admin permissions (for initial installation)
+- For Workspaces: a storage class whose backing filesystem supports ID-mapped mounts (NFS-backed volumes are not supported)
 
 **For Development:**
 - Go 1.22.0+
@@ -115,7 +116,7 @@ See [Installing the CLI](#installing-the-cli-caib) for setup and [`cmd/caib/READ
 ### Dependencies
 
 - **OpenShift Pipelines Operator**: Required for Tekton pipeline execution
-- **OpenShift 4.18+**: Minimum supported OpenShift version
+- **OpenShift 4.21+**: Minimum supported OpenShift version
 - **Container Registry**: For storing built images (--internal-registry)
 
 ## Development

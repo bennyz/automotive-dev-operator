@@ -51,7 +51,7 @@ OPERATOR_SDK_VERSION ?= v1.42.0
 # Image URL to use all building/pushing image targets
 IMG ?= $(IMAGE_TAG_BASE):v$(VERSION)
 # ENVTEST_K8S_VERSION refers to the version of kubebuilder assets to be downloaded by envtest binary.
-ENVTEST_K8S_VERSION = 1.31.0
+ENVTEST_K8S_VERSION = 1.34.0
 
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
 ifeq (,$(shell go env GOBIN))
@@ -441,9 +441,8 @@ community-operators-bundle: bundle ## Prepare bundle for community-operators-pro
 	@mkdir -p community-operators-prod/operators/automotive-dev-operator/$(VERSION)/metadata
 	@cp -r bundle/manifests/* community-operators-prod/operators/automotive-dev-operator/$(VERSION)/manifests/
 	@cp -r bundle/metadata/* community-operators-prod/operators/automotive-dev-operator/$(VERSION)/metadata/
-	@if ! grep -q 'com.redhat.openshift.versions' community-operators-prod/operators/automotive-dev-operator/$(VERSION)/metadata/annotations.yaml; then \
-		echo '  com.redhat.openshift.versions: v4.18-v4.21' >> community-operators-prod/operators/automotive-dev-operator/$(VERSION)/metadata/annotations.yaml; \
-	fi
+	@sed -i '/^[[:space:]]*com\.redhat\.openshift\.versions:/d' community-operators-prod/operators/automotive-dev-operator/$(VERSION)/metadata/annotations.yaml
+	@echo '  com.redhat.openshift.versions: v4.21' >> community-operators-prod/operators/automotive-dev-operator/$(VERSION)/metadata/annotations.yaml
 	@if [ ! -f community-operators-prod/operators/automotive-dev-operator/ci.yaml ]; then \
 		echo "updateGraph: semver-mode" > community-operators-prod/operators/automotive-dev-operator/ci.yaml; \
 		echo "Created ci.yaml with default updateGraph: semver-mode"; \

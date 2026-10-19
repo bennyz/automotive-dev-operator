@@ -245,7 +245,7 @@ Report final status:
 ### Community operators pipeline fails on `check_api_version_constraints`
 Missing `com.redhat.openshift.versions` in `metadata/annotations.yaml`. The `make community-operators-bundle` target handles this. If not, add manually:
 ```bash
-echo '  com.redhat.openshift.versions: v4.18-v4.21' >> metadata/annotations.yaml
+echo '  com.redhat.openshift.versions: v4.21' >> metadata/annotations.yaml
 ```
 
 ### CI race condition (retag before build)
