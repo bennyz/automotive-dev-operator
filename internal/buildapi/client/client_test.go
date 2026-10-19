@@ -2,10 +2,14 @@ package client
 
 import (
 	"context"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"testing"
 
 	buildapi "github.com/centos-automotive-suite/automotive-dev-operator/internal/buildcontract"
@@ -57,56 +61,55 @@ var _ = Describe("WithInsecureTLS", func() {
 
 var _ = Describe("WithCACertificate", func() {
 	var tempCertFile string
+	var tlsServer *httptest.Server
 
 	BeforeEach(func() {
-		// Create a temporary CA certificate file (PEM format)
-		tempFile, err := os.CreateTemp("", "test-ca-*.pem")
-		Expect(err).NotTo(HaveOccurred())
-		tempCertFile = tempFile.Name()
-
-		// Write a minimal valid PEM certificate (this is just for testing the file reading logic)
-		// This is a self-signed certificate in valid PEM format
-		certData := `-----BEGIN CERTIFICATE-----
-MIIBkTCB+wIJAKH4hJ8v5qQkMA0GCSqGSIb3DQEBCwUAMCExHzAdBgNVBAoM
-Fk15IE9yZ2FuaXphdGlvbiBJbmMuMRMwEQYDVQQDDApNeSBDQSBOYW1lMB4X
-DTIwMDEwMTAwMDAwMFoXDTI1MDEwMTAwMDAwMFowITEfMB0GA1UECgwWTXkg
-T3JnYW5pemF0aW9uIEluYy4xEzARBgNVBAMMCk15IENBIE5hbWUwWTATBgcq
-hkjOPQIBBggqhkjOPQMBBwNCAATestExample123456789012345678901234
-56789012345678901234567890123456789012345678901234567890
------END CERTIFICATE-----`
-		_, err = tempFile.WriteString(certData)
-		Expect(err).NotTo(HaveOccurred())
-		Expect(tempFile.Close()).To(Succeed())
+		tlsServer = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost || r.URL.Path != "/v1/workspaces/my-app/start" {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(buildapi.WorkspaceResponse{Name: "my-app", Phase: "Running"})
+		}))
+		tempCertFile = filepath.Join(GinkgoT().TempDir(), "ca.pem")
+		certData := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: tlsServer.Certificate().Raw})
+		Expect(os.WriteFile(tempCertFile, certData, 0o600)).To(Succeed())
 	})
 
 	AfterEach(func() {
-		if tempCertFile != "" {
-			_ = os.Remove(tempCertFile)
-		}
+		tlsServer.Close()
 	})
 
-	It("should preserve default transport settings when cloning", func() {
-		client, err := New("https://api.example.com", WithCACertificate(tempCertFile))
+	It("trusts the supplied CA for HTTPS and preserves default transport settings", func() {
+		untrustedClient, err := New(tlsServer.URL)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(client).NotTo(BeNil())
+		_, err = untrustedClient.StartWorkspace(context.Background(), "my-app")
+		Expect(err).To(HaveOccurred())
+		var unknownAuthority x509.UnknownAuthorityError
+		Expect(errors.As(err, &unknownAuthority)).To(BeTrue(), "the negative control must fail certificate verification")
 
-		// If certificate parsing succeeds, verify transport is set up correctly
-		// If it fails (invalid cert), the function gracefully skips (uses system CAs)
-		// Both behaviors are valid
+		client, err := New(tlsServer.URL, WithCACertificate(tempCertFile))
+		Expect(err).NotTo(HaveOccurred())
 		transport, ok := client.httpClient.Transport.(*http.Transport)
-		if ok && transport != nil {
-			// Certificate was parsed successfully, verify TLS config
-			Expect(transport.TLSClientConfig).NotTo(BeNil())
-			if transport.TLSClientConfig.RootCAs != nil {
-				// Verify that default transport settings are preserved
-				// Note: We can't compare function pointers directly, but we verify
-				// that the transport was cloned (not nil) and TLS config is set
-				Expect(transport.Proxy).NotTo(BeNil())
-				Expect(transport.DialContext).NotTo(BeNil())
-			}
-		}
-		// If transport is nil or not *http.Transport, that's also valid
-		// (certificate parsing failed, will use system CAs via default transport)
+		Expect(ok).To(BeTrue())
+		Expect(transport.TLSClientConfig).NotTo(BeNil())
+		Expect(transport.TLSClientConfig.RootCAs).NotTo(BeNil())
+		Expect(transport.TLSClientConfig.InsecureSkipVerify).To(BeFalse())
+		defaultTransport := http.DefaultTransport.(*http.Transport)
+		Expect(transport).NotTo(BeIdenticalTo(defaultTransport))
+		Expect(transport.Proxy).NotTo(BeNil())
+		Expect(transport.DialContext).NotTo(BeNil())
+		Expect(transport.ForceAttemptHTTP2).To(Equal(defaultTransport.ForceAttemptHTTP2))
+		Expect(transport.MaxIdleConns).To(Equal(defaultTransport.MaxIdleConns))
+		Expect(transport.IdleConnTimeout).To(Equal(defaultTransport.IdleConnTimeout))
+		Expect(transport.TLSHandshakeTimeout).To(Equal(defaultTransport.TLSHandshakeTimeout))
+		DeferCleanup(transport.CloseIdleConnections)
+
+		response, err := client.StartWorkspace(context.Background(), "my-app")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(response.Name).To(Equal("my-app"))
+		Expect(response.Phase).To(Equal("Running"))
 	})
 
 	It("should handle non-existent certificate file gracefully", func() {
