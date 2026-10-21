@@ -1572,70 +1572,81 @@ func TestUpdateStatusSkipsLiveResultCollection(t *testing.T) {
 	}
 }
 
-func TestVerifiedBundlesCacheHitSkipsLookup(t *testing.T) {
-	const ref = "registry.example.com/bundle@sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
-
-	scheme := newTestSchemeWithTekton()
-	getCalled := false
-	fakeClient := fake.NewClientBuilder().
-		WithScheme(scheme).
-		WithInterceptorFuncs(interceptor.Funcs{
-			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-				if _, ok := obj.(*corev1.ConfigMap); ok && key.Name == "cosign-pub-key" {
-					getCalled = true
+func TestVerifiedBundlesCache(t *testing.T) {
+	refA := "registry.example.com/bundle@sha256:" + strings.Repeat("a", 64)
+	refB := "registry.example.com/bundle@sha256:" + strings.Repeat("b", 64)
+	for _, tc := range []struct {
+		name, ref, cachedRef, wantError string
+		invalidPEM                      bool
+	}{
+		{name: "cached digest skips key lookup", ref: refA, cachedRef: refA},
+		{name: "missing key is retried", ref: refA, wantError: "cosign key is unavailable: failed to read cosign key ConfigMap"},
+		{name: "verification failure is retried", ref: refA, invalidPEM: true, wantError: "task bundle signature verification failed: parsing cosign public key"},
+		{name: "different digest is not cached", ref: refB, cachedRef: refA, wantError: "cosign key is unavailable: failed to read cosign key ConfigMap"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			scheme := newTestSchemeWithTekton()
+			keyReads := 0
+			builder := fake.NewClientBuilder().WithScheme(scheme).
+				WithInterceptorFuncs(interceptor.Funcs{
+					Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+						if _, ok := obj.(*corev1.ConfigMap); ok {
+							keyReads++
+							if key.Name != "cosign-pub-key" || key.Namespace != controllerutils.OperatorNamespace() {
+								t.Errorf("unexpected cosign key lookup: %s", key)
+							}
+						}
+						return c.Get(ctx, key, obj, opts...)
+					},
+				})
+			if tc.invalidPEM {
+				// The real verifier rejects malformed PEM before contacting a registry.
+				builder = builder.WithObjects(&corev1.ConfigMap{
+					ObjectMeta: metav1.ObjectMeta{Name: "cosign-pub-key", Namespace: controllerutils.OperatorNamespace()},
+					Data:       map[string]string{"cosign.pub": "not a PEM public key"},
+				})
+			}
+			r := &ImageBuildReconciler{Client: builder.Build(), Scheme: scheme}
+			if tc.cachedRef != "" {
+				r.verifiedBundles.Store(tc.cachedRef, struct{}{})
+			}
+			build := &automotivev1alpha1.ImageBuild{Spec: automotivev1alpha1.ImageBuildSpec{
+				SecureBuild: true, TaskBundleRef: tc.ref,
+			}}
+			operatorConfig := &automotivev1alpha1.OperatorConfig{Spec: automotivev1alpha1.OperatorConfigSpec{
+				OSBuilds: &automotivev1alpha1.OSBuildsConfig{
+					TaskBundleVerify: true,
+					TaskBundleCosignKeyRef: &corev1.ConfigMapKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: "cosign-pub-key"}, Key: "cosign.pub",
+					},
+				},
+			}}
+			for attempt := 1; attempt <= 2; attempt++ {
+				config := &tasks.BuildConfig{}
+				err := r.configureSecureTaskBundle(t.Context(), build, operatorConfig, config, false)
+				if tc.wantError == "" {
+					if err != nil {
+						t.Fatalf("cached bundle configuration failed: %v", err)
+					}
+					if config.TaskResolver != tasks.TaskResolverBundle || config.TaskBundleRef != tc.ref {
+						t.Fatalf("cached bundle was not configured: %+v", config)
+					}
+					if keyReads != 0 {
+						t.Fatalf("cached bundle read the cosign key %d times", keyReads)
+					}
+					continue
 				}
-				return c.Get(ctx, key, obj, opts...)
-			},
-		}).
-		Build()
-
-	r := &ImageBuildReconciler{
-		Client: fakeClient,
-		Scheme: scheme,
-	}
-	r.verifiedBundles.Store(ref, struct{}{})
-
-	if _, ok := r.verifiedBundles.Load(ref); !ok {
-		t.Fatal("expected cache hit for pre-stored digest ref")
-	}
-	if getCalled {
-		t.Error("cache hit should not trigger cosign key lookup")
-	}
-}
-
-func TestVerifiedBundlesCacheMissAndFailureNotCached(t *testing.T) {
-	const ref = "registry.example.com/bundle@sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
-
-	r := &ImageBuildReconciler{}
-
-	if _, ok := r.verifiedBundles.Load(ref); ok {
-		t.Fatal("expected cache miss for unknown digest ref")
-	}
-
-	r.verifiedBundles.Store(ref, struct{}{})
-	if _, ok := r.verifiedBundles.Load(ref); !ok {
-		t.Fatal("expected cache hit after Store")
-	}
-
-	const failedRef = "registry.example.com/bundle@sha256:0000000000000000000000000000000000000000000000000000000000000000"
-	if _, ok := r.verifiedBundles.Load(failedRef); ok {
-		t.Fatal("never-stored ref should not be in cache (simulates failed verification not being cached)")
-	}
-}
-
-func TestVerifiedBundlesCacheKeyIsolation(t *testing.T) {
-	r := &ImageBuildReconciler{}
-
-	refA := "registry.example.com/bundle@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-	refB := "registry.example.com/bundle@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-
-	r.verifiedBundles.Store(refA, struct{}{})
-
-	if _, ok := r.verifiedBundles.Load(refA); !ok {
-		t.Error("refA should be cached")
-	}
-	if _, ok := r.verifiedBundles.Load(refB); ok {
-		t.Error("refB should not be cached — different digest means different bundle")
+				if !errors.Is(err, errTerminalConfig) || !strings.Contains(err.Error(), tc.wantError) {
+					t.Fatalf("attempt %d: error = %v, want terminal error containing %q", attempt, err, tc.wantError)
+				}
+				if config.TaskResolver != "" || config.TaskBundleRef != "" {
+					t.Fatalf("failed verification configured a bundle: %+v", config)
+				}
+				if keyReads != attempt {
+					t.Fatalf("attempt %d: cosign key reads = %d, want %d; failed verification must be retried", attempt, keyReads, attempt)
+				}
+			}
+		})
 	}
 }
 
