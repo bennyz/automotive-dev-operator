@@ -4,8 +4,10 @@ package main
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	caibcommon "github.com/centos-automotive-suite/automotive-dev-operator/cmd/caib/common"
+	"github.com/spf13/cobra"
 )
 
 const (
@@ -16,9 +18,20 @@ const (
 var version string
 
 func main() {
-	rootCmd := newRootCmd()
-	if err := rootCmd.Execute(); err != nil {
+	if err := execute(newRootCmd()); err != nil {
 		fmt.Fprintln(os.Stderr, caibcommon.FormatError(err))
 		os.Exit(1)
 	}
+}
+
+// execute runs the command tree and restores the pointer to --help that
+// SilenceErrors suppresses for unknown commands. Cobra builds that error while
+// looking up the command, before any Args validator runs, so addArgsHint cannot
+// reach it.
+func execute(rootCmd *cobra.Command) error {
+	cmd, err := rootCmd.ExecuteC()
+	if err != nil && strings.HasPrefix(err.Error(), "unknown command ") {
+		return fmt.Errorf("%w\nSee '%s --help' for usage", err, cmd.CommandPath())
+	}
+	return err
 }
