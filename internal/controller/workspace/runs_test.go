@@ -9,13 +9,12 @@ import (
 	"github.com/go-logr/logr"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 func TestActiveRunPreventsAutoPause(t *testing.T) {
 	ws, _, _ := runningWorkspace("run-ws", "developer-project")
-	ws.Spec.AutoPauseTimeoutMinutes = ptr.To(int32(1))
+	ws.Spec.AutoPauseTimeoutMinutes = new(int32(1))
 	old := metav1.NewTime(time.Now().Add(-time.Hour))
 	ws.Status.LastActivityTime = &old
 	r, kube := newTestReconciler(ws)
@@ -46,7 +45,7 @@ func TestActiveRunPreventsAutoPause(t *testing.T) {
 func TestRunActivityCheckFailsClosed(t *testing.T) {
 	for _, response := range []string{"invalid JSON", `{"error":"volume unavailable"}`} {
 		ws, _, _ := runningWorkspace("run-ws", "default")
-		ws.Spec.AutoPauseTimeoutMinutes = ptr.To(int32(1))
+		ws.Spec.AutoPauseTimeoutMinutes = new(int32(1))
 		old := metav1.NewTime(time.Now().Add(-time.Hour))
 		ws.Status.LastActivityTime = &old
 		r, _ := newTestReconciler(ws)
@@ -60,7 +59,7 @@ func TestRunActivityCheckFailsClosed(t *testing.T) {
 
 func TestAutoPauseConflictsWithNewRunActivity(t *testing.T) {
 	ws, _, _ := runningWorkspace("run-ws", "default")
-	ws.Spec.AutoPauseTimeoutMinutes = ptr.To(int32(1))
+	ws.Spec.AutoPauseTimeoutMinutes = new(int32(1))
 	old := metav1.NewTime(time.Now().Add(-time.Hour))
 	ws.Status.LastActivityTime = &old
 	r, kube := newTestReconciler(ws)
