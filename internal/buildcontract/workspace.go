@@ -37,6 +37,9 @@ type WorkspaceExecRequest struct {
 // WorkspaceExecExitCodeTrailer carries the exit status after the output stream ends.
 const WorkspaceExecExitCodeTrailer = "X-Caib-Exit-Code"
 
+// MaxWorkspaceRunCommandBytes bounds the encoded shell command accepted by runs.
+const MaxWorkspaceRunCommandBytes = 64 << 10
+
 // WorkspaceRunRequest creates a durable command. Reusing ID with the same
 // command and requested timeout is idempotent, including after an ambiguous
 // network failure. Use a fresh ID for every new command; deleted IDs are retained

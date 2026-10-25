@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"path"
@@ -113,12 +114,12 @@ func (c *Client) WorkspaceRunLogs(ctx context.Context, name, id string, follow b
 	duration := DefaultWorkspaceRunStreamDuration
 	if value := resp.Header.Get("X-Log-Stream-Seconds"); value != "" {
 		seconds, parseErr := strconv.ParseFloat(value, 64)
-		var durationErr error
-		duration, durationErr = time.ParseDuration(strconv.FormatFloat(seconds, 'f', -1, 64) + "s")
-		if parseErr != nil || durationErr != nil || duration <= 0 {
+		nanoseconds := seconds * float64(time.Second)
+		if parseErr != nil || !(nanoseconds >= 1 && nanoseconds < float64(math.MaxInt64)) {
 			closeBody(resp)
 			return nil, fmt.Errorf("invalid workspace log stream duration %q", value)
 		}
+		duration = time.Duration(nanoseconds)
 	}
 	return &WorkspaceRunLogStream{ReadCloser: resp.Body, Offset: offset, Trailers: resp.Trailer, StreamDuration: duration}, nil
 }
@@ -145,7 +146,7 @@ func (c *Client) ListWorkspaceRuns(ctx context.Context, name string, offset, lim
 	return runs, nil
 }
 
-// DeleteWorkspaceRun removes a terminal run's command, result and log.
+// DeleteWorkspaceRun removes a terminal or unreadable run's command, result and log.
 func (c *Client) DeleteWorkspaceRun(ctx context.Context, name, id string) error {
 	req, err := c.workspaceRunRequest(ctx, http.MethodDelete, name, id, "", nil)
 	if err != nil {

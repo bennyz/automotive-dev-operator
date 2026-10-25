@@ -132,6 +132,7 @@ func TestRunnerRetentionAndBudgetPreserveResultsAndLiveRuns(t *testing.T) {
 	}
 	options := DefaultOptions()
 	options.CompletedLogBudgetBytes = 10
+	options.MaxLogBytes = 10
 	call("create", "trigger", "sleep 30", options.JSON())
 	t.Cleanup(func() { call("cancel", "trigger"); awaitRun(t, call, "trigger") })
 	if result := call("get", "expired"); result.Code != 410 {

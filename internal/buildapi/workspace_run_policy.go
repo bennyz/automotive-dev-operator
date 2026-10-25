@@ -67,7 +67,10 @@ func resolveWorkspaceRunOptions(settings *automotivev1alpha1.WorkspacesConfig, r
 			maxTimeout = min(maxTimeout, int64(settings.RunMaxTimeoutMinutes)*60)
 		}
 		if settings.RunRetentionDays > 0 {
-			options.RetentionSeconds = int64(settings.RunRetentionDays) * 24 * 60 * 60
+			options.RetentionSeconds = int64(min(settings.RunRetentionDays, 30)) * 24 * 60 * 60
+		}
+		if settings.RunMaxRecords > 0 {
+			options.MaxRecords = min(int64(settings.RunMaxRecords), options.MaxRecords)
 		}
 		if settings.RunMaxLogSizeMiB > 0 {
 			options.MaxLogBytes = int64(settings.RunMaxLogSizeMiB) << 20

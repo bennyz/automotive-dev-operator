@@ -32,7 +32,7 @@ func TestWorkspaceExecHelperProcess(t *testing.T) {
 }
 
 func TestWorkspaceExecCLI(t *testing.T) {
-	const script = "make dist-srpm\nrpmbuild -bb kernel.spec\n"
+	const script = "[[ $- == *e* && $- == *u* ]] || exit 91\nshopt -qo pipefail || exit 92\nprintf 'script-ok\\n'\n"
 	scriptPath := filepath.Join(t.TempDir(), "build script.sh")
 	if err := os.WriteFile(scriptPath, []byte(script), 0o600); err != nil {
 		t.Fatal(err)
@@ -98,8 +98,9 @@ func TestWorkspaceExecCLI(t *testing.T) {
 			case req := <-requests:
 				switch tc.name {
 				case "script upload":
-					if !strings.Contains(req.Command, script) || !strings.Contains(req.Command, "/bin/bash -euo pipefail") {
-						t.Errorf("script upload = %+v", req)
+					got, err := exec.Command("sh", "-c", req.Command).CombinedOutput()
+					if err != nil || string(got) != "script-ok\n" {
+						t.Errorf("uploaded script lost contents or strict Bash options: output=%q err=%v", got, err)
 					}
 				case "literal arguments", "explicit shell":
 					got, err := exec.Command("sh", "-c", req.Command).Output()

@@ -281,12 +281,16 @@ paths:
         idempotency is no longer guaranteed after that window. The operator controls timeout defaults/caps, log retention and
         storage budgets. Only timeoutSeconds may be overridden per run.
         By default commands time out after 2 hours (maximum 24 hours), keep the
-        last 100 MiB of output and expire after 7 days. Completed logs are pruned
-        oldest first to a budget of min(1 GiB, 10% of the PVC); live runs are
+        last 100 MiB of output and expire after 7 days. At most the newest 1,000
+        terminal records are retained; operators can lower this cap and configure
+        retention up to 30 days. Live runs do not count against the record cap.
+        Completed logs are pruned oldest first to a budget of min(1 GiB, 10% of
+        the PVC); live runs are
         never evicted. Budget eviction removes only logs, sets logsEvicted and
-        retains status and exit code until retention expires. The per-log cap
-        cannot exceed the completed-log budget. Pruning runs during creation and
+        retains status and exit code until the age or record count limit is reached.
+        The per-log cap cannot exceed the completed-log budget. Pruning runs during creation and
         after completion. Unreadable records are skipped by collection operations.
+        Stale runs report Interrupted even when persisting that transition fails.
         The request body is limited to 128 KiB and the command to 65536 bytes.
       requestBody:
         required: true
@@ -359,9 +363,10 @@ paths:
           description: Unreadable run record, or the image cannot execute the run helper
     delete:
       operationId: deleteWorkspaceRun
-      summary: Delete a terminal run and its retained log
+      summary: Delete a terminal or unreadable run and its retained log
       description: |
-        Requires workspace ownership and a running workspace. Live runs cannot
+        Requires workspace ownership and a running workspace. Directories with
+        unreadable or missing records can be deleted. Readable live runs cannot
         be deleted; cancel and wait for completion first. Repeated deletion is
         safe during the 24-hour tombstone window. A small ID tombstone protects
         retried creation during that window, then expires. IDs are single-use.

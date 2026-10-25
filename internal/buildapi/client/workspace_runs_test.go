@@ -18,6 +18,9 @@ func TestWorkspaceRunStreamDurationHeader(t *testing.T) {
 		{"", 40 * time.Second},
 		{"60", time.Minute},
 		{"0.01", 10 * time.Millisecond},
+		{"0.000000001", time.Nanosecond},
+		{"9223372036", 9223372036 * time.Second},
+		{"0.0000000001", 0}, {"9223372036.854776", 0},
 		{"0", 0}, {"-1", 0}, {"invalid", 0}, {"NaN", 0}, {"+Inf", 0}, {"1e300", 0},
 	} {
 		t.Run(tc.header, func(t *testing.T) {

@@ -12,6 +12,149 @@ import (
 	"time"
 )
 
+func TestRunnerRecordCapPreservesNewestResultsAndLiveRuns(t *testing.T) {
+	root, call := localRunner(t)
+	options := DefaultOptions()
+	options.MaxRecords = 2
+	call("create", "live", "sleep 30", options.JSON())
+	t.Cleanup(func() { call("cancel", "live"); awaitRun(t, call, "live") })
+	for id, age := range map[string]time.Duration{"oldest": 3 * time.Hour, "newer": 2 * time.Hour, "newest": time.Hour} {
+		writeTerminalRun(t, root, id, age, []byte(id))
+	}
+	call("create", "trigger", "sleep 30", options.JSON())
+	t.Cleanup(func() { call("cancel", "trigger"); awaitRun(t, call, "trigger") })
+	if got := call("get", "oldest"); got.Code != 410 {
+		t.Fatalf("record cap did not evict the oldest result: %+v", got)
+	}
+	if got := call("create", "oldest", "true", options.JSON()); got.Code != 410 {
+		t.Fatalf("record eviction lost retry protection: %+v", got)
+	}
+	for _, id := range []string{"newer", "newest"} {
+		if got := call("get", id); got.Code != 0 || got.Run.ExitCode == nil || *got.Run.ExitCode != 3 {
+			t.Fatalf("record cap lost %s: %+v", id, got)
+		}
+	}
+	if got := call("list", "0", "100"); got.Code != 0 || len(got.Runs) != 4 {
+		t.Fatalf("record cap counted live runs: %+v", got)
+	}
+	call("cancel", "trigger")
+	awaitRun(t, call, "trigger")
+	// Completion also enforces the cap, after the final result is saved.
+	deadline := time.Now().Add(3 * time.Second)
+	for call("get", "newer").Code != 410 {
+		if time.Now().After(deadline) {
+			t.Fatal("completion did not evict the oldest remaining result")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := call("get", "live"); got.Code != 0 || got.Run.Status != "Running" {
+		t.Fatalf("record cap evicted a live run: %+v", got)
+	}
+	if got := call("get", "trigger"); got.Code != 0 || got.Run.Status != "Cancelled" {
+		t.Fatalf("completion lost its own result: %+v", got)
+	}
+}
+
+func TestUnreadableRecordsCanBeDeleted(t *testing.T) {
+	for _, contents := range []string{`{"id":`, `{}`, "null", "missing"} {
+		t.Run(contents, func(t *testing.T) {
+			root, call := localRunner(t)
+			filename := writeTerminalRun(t, root, "broken", time.Hour, []byte("retained log"))
+			wantCode := 422
+			if contents == "missing" {
+				if err := os.Remove(filename); err != nil {
+					t.Fatal(err)
+				}
+				wantCode = 404
+			} else if err := os.WriteFile(filename, []byte(contents), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if got := call("get", "broken"); got.Code != wantCode {
+				t.Fatalf("record is not unreadable: %+v", got)
+			}
+			for range 2 {
+				if got := call("delete", "broken"); got.Code != 0 {
+					t.Fatalf("unreadable record deletion: %+v", got)
+				}
+			}
+			if _, err := os.Stat(filepath.Dir(filename)); !os.IsNotExist(err) {
+				t.Fatalf("record and logs still occupy disk: %v", err)
+			}
+			if got := call("create", "broken", "true", DefaultOptions().JSON()); got.Code != 410 {
+				t.Fatalf("corrupt record deletion lost retry protection: %+v", got)
+			}
+		})
+	}
+}
+
+func TestInterruptedRecordWriteFailureDoesNotBlockReadsOrLaunch(t *testing.T) {
+	root, call := localRunner(t)
+	filename := writeTerminalRun(t, root, "stale", time.Hour, []byte("retained output"))
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var state map[string]any
+	if err := json.Unmarshal(data, &state); err != nil {
+		t.Fatal(err)
+	}
+	state["status"], state["pid"], state["identity"] = "Running", os.Getpid(), []string{"old-boot", "old-container", "old-process"}
+	delete(state, "exitCode")
+	delete(state, "finishedAt")
+	data, err = json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filename, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a full volume when persisting the stale record's transition.
+	// Other records remain writable so create must still reach its own launch.
+	const failRecoveryWrite = `import errno
+from pathlib import Path
+original_open = Path.open
+def fail_recovery_write(path, *args, **kwargs):
+    if path.name == "state.tmp" and path.parent.name == "stale":
+        raise OSError(errno.ENOSPC, "injected full volume")
+    return original_open(path, *args, **kwargs)
+Path.open = fail_recovery_write
+`
+	for _, args := range [][]string{{"get", "stale"}, {"active"}, {"list", "0", "100"}, {"create", "healthy", "printf healthy", DefaultOptions().JSON()}} {
+		argv := Command(args[0], args[1:]...)
+		argv[3] = failRecoveryWrite + argv[3]
+		argv[4], argv[5] = filepath.Join(root, ".runs"), root
+		out, stderr := executeRunner(t, root, argv)
+		var result runnerResult
+		if err := json.Unmarshal(out, &result); err != nil || result.Code != 0 || len(stderr) != 0 {
+			t.Fatalf("%s blocked by recovery write: %q, stderr=%q, decode=%v", args[0], out, stderr, err)
+		}
+		switch args[0] {
+		case "get":
+			if result.Run.Status != "Interrupted" || result.Run.ExitCode != nil {
+				t.Fatalf("stale read: %+v", result)
+			}
+		case "active":
+			if result.Active {
+				t.Fatal("failed recovery write prevents auto-pause")
+			}
+		case "list":
+			if len(result.Runs) != 1 || result.Runs[0].Status != "Interrupted" {
+				t.Fatalf("stale list: %+v", result)
+			}
+		}
+	}
+	if run := awaitRun(t, call, "healthy"); run.Status != "Succeeded" {
+		t.Fatalf("healthy launch blocked by stale record: %+v", run)
+	}
+	data, err = os.ReadFile(filename)
+	if err != nil || !strings.Contains(string(data), `"Running"`) {
+		t.Fatalf("failure injection did not preserve the stale on-disk record: %s, %v", data, err)
+	}
+	if got := call("get", "stale"); got.Code != 0 || got.Run.Status != "Interrupted" {
+		t.Fatalf("recovery after storage becomes writable: %+v", got)
+	}
+}
+
 func TestLaunchRetryRecoversFromInitialStateWriteFailure(t *testing.T) {
 	root, call := localRunner(t)
 	directory := filepath.Join(root, ".runs", "retry")
@@ -201,10 +344,11 @@ func TestRunnerIsolatedFromWorkspaceAndPythonEnvironment(t *testing.T) {
 	}
 }
 
-func TestBudgetSmallerThanLogCapKeepsLatestTailAndExitCode(t *testing.T) {
+func TestResolvedBudgetKeepsLatestTailAndExitCode(t *testing.T) {
 	root, call := localRunner(t)
 	options := DefaultOptions()
 	options.CompletedLogBudgetBytes = 1 << 20
+	options.MaxLogBytes = 1 << 20 // The API resolves the cap before invoking Python.
 	// Cross segment boundaries and finish mid-segment to exercise trimming.
 	command := `python3 -c 'import sys; sys.stdout.buffer.write(b"x" * (2*1024*1024+123))'; printf 'last error'; exit 3`
 	call("create", "large", command, options.JSON())

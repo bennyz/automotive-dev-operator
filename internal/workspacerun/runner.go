@@ -21,13 +21,14 @@ type Options struct {
 	RequestedTimeoutSeconds int64 `json:"requestedTimeoutSeconds"`
 	MaxLogBytes             int64 `json:"maxLogBytes"`
 	RetentionSeconds        int64 `json:"retentionSeconds"`
+	MaxRecords              int64 `json:"maxRecords"`
 	CompletedLogBudgetBytes int64 `json:"completedLogBudgetBytes"`
 }
 
 // DefaultOptions supplies the defaults used before OperatorConfig overrides.
 func DefaultOptions() Options {
 	return Options{TimeoutSeconds: 2 * 60 * 60, MaxLogBytes: 100 << 20,
-		RetentionSeconds: 7 * 24 * 60 * 60, CompletedLogBudgetBytes: 1 << 30}
+		RetentionSeconds: 7 * 24 * 60 * 60, MaxRecords: 1000, CompletedLogBudgetBytes: 1 << 30}
 }
 
 // JSON encodes limits for the pod-side runner.

@@ -1004,6 +1004,10 @@ command, an unset variable, or a failed pipeline. Shell operators such as `&&`,
 pipes, and substitutions require an explicit `sh -c '...'` or a script; a single
 quoted command string is not split into arguments.
 
+The encoded command, including shell quoting and script contents, is limited to
+64 KiB. For larger scripts, sync the file to the workspace and execute it there:
+`caib workspace exec my-app -- bash -euo pipefail ./build.sh`.
+
 Ctrl-C detaches and prints resume and cancel commands. It leaves the remote
 command running until completion, cancellation or timeout. To recover a lost ID,
 inspect the result, stop a command, or remove a completed run:
@@ -1017,7 +1021,9 @@ caib workspace run delete my-app <run-id>
 
 List and show return JSON containing status, absolute log offsets, timestamps,
 and exit code when available. List supports `--offset` and `--limit` (1–100),
-ordered newest first. Delete accepts only terminal runs. Cancellation first sends SIGTERM, then SIGKILL
+ordered newest first. Delete accepts terminal runs and directories with unreadable
+or missing records, so corrupt records can be removed through the API. Readable
+live runs must be cancelled first. Cancellation first sends SIGTERM, then SIGKILL
 after five seconds if needed. Runs own their process group; background children
 are stopped when the command finishes. Processes that create their own session
 are outside that group.
@@ -1037,12 +1043,16 @@ The CLI reports skipped bytes on stderr when resuming behind the retained tail.
 Live log storage has at most 1 MiB of segment overhead per run; completion trims
 that overhead. The per-log cap is also limited to the completed-log budget.
 
-Terminal runs expire after **7 days**. Completed logs share a budget of
+Terminal runs expire after **7 days**, with at most the **newest 1,000 terminal
+records** retained. Operators can lower the record cap and configure retention
+up to **30 days**. Completed logs share a budget of
 **min(1 GiB, 10% of the PVC capacity)**. Creation and completion prune expired
-records and then remove the oldest completed logs until the budget is met. Log
+and excess records, oldest first, then remove the oldest completed logs until
+the budget is met. Log
 eviction sets `logsEvicted: true` and advances `logStartOffset` to `logBytes`;
-the result and exit code remain available until retention expires. Live runs
-are never evicted. Explicit deletion and retention leave a small ID tombstone
+the result and exit code remain available until the age or record count limit
+is reached. Live runs are never evicted or counted against the record cap.
+Explicit deletion and retention leave a small ID tombstone
 for 24 hours to protect create retries, after which creation/completion can
 remove it. Use a fresh, single-use ID for each new command.
 
@@ -1054,7 +1064,8 @@ spec:
   workspaces:
     runDefaultTimeoutMinutes: 120
     runMaxTimeoutMinutes: 1440  # Cannot exceed 24 hours
-    runRetentionDays: 7
+    runRetentionDays: 7  # Maximum 30 days
+    runMaxRecords: 1000  # Maximum 1,000 terminal records
     runMaxLogSizeMiB: 100
     runCompletedLogBudgetMiB: 1024  # Also capped at 10% of each PVC
 ```
@@ -1070,12 +1081,9 @@ Images without Python receive an actionable error for runs; their exec/terminal
 activity still participates in auto-pause detection. The helper uses isolated
 Python imports, so workspace files and `PYTHON*` variables cannot replace its
 standard library. Unreadable run records return an explicit error when inspected
-and are skipped by collection and activity checks.
-
-**Behavior changes:** `caib workspace exec` now exits non-zero when the command
-fails, and Ctrl-C detaches instead of stopping the remote command. This CLI
-requires a server with durable-run support. If `/runs` is unavailable, it reports
-that the operator must be upgraded or a caib version matching the operator used.
+and are skipped by collection and activity checks. If the volume cannot persist
+an `Interrupted` transition, reads still report it and activity checks still
+allow auto-pause; a later read retries saving the transition.
 
 API clients can use these owner-scoped endpoints:
 

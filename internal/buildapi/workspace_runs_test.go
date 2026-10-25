@@ -247,7 +247,7 @@ func TestWorkspaceRunPolicyFlowsFromOperatorConfig(t *testing.T) {
 			t.Errorf("wrong config namespace: %s", namespace)
 		}
 		return &automotivev1alpha1.OperatorConfig{Spec: automotivev1alpha1.OperatorConfigSpec{Workspaces: &automotivev1alpha1.WorkspacesConfig{
-			RunDefaultTimeoutMinutes: 10, RunMaxTimeoutMinutes: 20, RunMaxLogSizeMiB: 5, RunRetentionDays: 3, RunCompletedLogBudgetMiB: 200,
+			RunDefaultTimeoutMinutes: 10, RunMaxTimeoutMinutes: 20, RunMaxLogSizeMiB: 5, RunRetentionDays: 3, RunMaxRecords: 50, RunCompletedLogBudgetMiB: 200,
 		}}}, nil
 	}
 	a.exec.newExecutor = func(_ *rest.Config, _, _, _ string, argv []string) (remotecommand.Executor, error) {
@@ -256,7 +256,7 @@ func TestWorkspaceRunPolicyFlowsFromOperatorConfig(t *testing.T) {
 			if err := json.Unmarshal([]byte(argv[len(argv)-1]), &options); err != nil {
 				return err
 			}
-			for key, want := range map[string]int64{"timeoutSeconds": 90, "requestedTimeoutSeconds": 90, "maxLogBytes": 5 << 20, "retentionSeconds": 3 * 86400, "completedLogBudgetBytes": 200 << 20} {
+			for key, want := range map[string]int64{"timeoutSeconds": 90, "requestedTimeoutSeconds": 90, "maxLogBytes": 5 << 20, "retentionSeconds": 3 * 86400, "maxRecords": 50, "completedLogBudgetBytes": 200 << 20} {
 				if options[key] != want {
 					t.Errorf("%s: got %d, want %d", key, options[key], want)
 				}
@@ -268,7 +268,7 @@ func TestWorkspaceRunPolicyFlowsFromOperatorConfig(t *testing.T) {
 	rec := httptest.NewRecorder()
 	// Only timeout is user-controlled; unknown retention/log fields cannot
 	// override the operator policy even if a hand-written client supplies them.
-	router.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/workspaces/dev/runs", strings.NewReader(`{"id":"policy","command":"true","timeoutSeconds":90,"maxLogBytes":99999999,"retentionSeconds":99999999}`)))
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/workspaces/dev/runs", strings.NewReader(`{"id":"policy","command":"true","timeoutSeconds":90,"maxLogBytes":99999999,"retentionSeconds":99999999,"maxRecords":99999999}`)))
 	if rec.Code != http.StatusAccepted {
 		t.Fatalf("policy create: %d %s", rec.Code, rec.Body.String())
 	}

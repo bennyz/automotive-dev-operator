@@ -112,7 +112,10 @@ def read_state(directory):
     if state["status"] in LIVE and identity(state["pid"]) != state["identity"]:
         state.update(status="Interrupted", finishedAt=now(),
                      message="The workspace container or run supervisor stopped before recording an exit code")
-        save(directory, state)
+        # Reads must remain usable when the volume cannot persist recovery.
+        # Launch and cancellation still require their explicit saves to succeed.
+        with contextlib.suppress(OSError):
+            save(directory, state)
     return state
 
 
@@ -312,12 +315,17 @@ def tombstoned(run_id):
 
 
 def erase(directory):
-    state = read_state(directory)
-    if state["status"] in LIVE:
-        raise RunError(409, "cancel the run and wait for it to finish before deleting it")
+    try:
+        state = read_state(directory)
+    except RunError as error:
+        if error.code not in (404, 422):
+            raise
+    else:
+        if state["status"] in LIVE:
+            raise RunError(409, "cancel the run and wait for it to finish before deleting it")
     tombstones = ROOT / ".deleted"
     tombstones.mkdir(exist_ok=True)
-    (tombstones / state["id"]).touch()
+    (tombstones / directory.name).touch()
     shutil.rmtree(directory)
 
 
@@ -361,9 +369,10 @@ def prune(options):
         terminal.append((finished, directory))
     retained = []
     total = 0
-    for finished, directory in sorted(terminal):
+    excess = len(terminal) - options["maxRecords"]
+    for index, (finished, directory) in enumerate(sorted(terminal)):
         with locked(directory):
-            if finished < cutoff:
+            if finished < cutoff or index < excess:
                 erase(directory)
             else:
                 _, _, chunks = log_window(directory, read_state(directory))
@@ -472,7 +481,6 @@ def main():
     directory = ROOT / run_id
     if action == "create":
         options = json.loads(sys.argv[6])
-        options["maxLogBytes"] = min(options["maxLogBytes"], options["completedLogBudgetBytes"])
         ROOT.mkdir(parents=True, exist_ok=True)
         with locked(ROOT) as collection_lock:
             if tombstoned(run_id):

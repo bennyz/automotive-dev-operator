@@ -90,7 +90,7 @@ func (a *APIServer) createWorkspaceRun(c *gin.Context, name string) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid JSON request"})
 		return
 	}
-	if strings.TrimSpace(req.Command) == "" || len(req.Command) > 64<<10 || strings.ContainsRune(req.Command, 0) {
+	if strings.TrimSpace(req.Command) == "" || len(req.Command) > buildcontract.MaxWorkspaceRunCommandBytes || strings.ContainsRune(req.Command, 0) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "command must contain 1 to 65536 bytes and no NUL"})
 		return
 	}
