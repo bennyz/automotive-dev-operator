@@ -12,6 +12,83 @@ import (
 	"time"
 )
 
+func TestLaunchRetryRecoversFromInitialStateWriteFailure(t *testing.T) {
+	root, call := localRunner(t)
+	directory := filepath.Join(root, ".runs", "retry")
+	// Prevent the initial record from being written after logs/ is created.
+	// Removing the obstruction must let the same request launch exactly once.
+	if err := os.MkdirAll(filepath.Join(directory, "state.tmp"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	const command = `echo execution >> count; printf recovered; exit 3`
+	if got := call("create", "retry", command, DefaultOptions().JSON()); got.Code != 500 || !strings.Contains(got.Error, "IsADirectoryError") {
+		t.Fatalf("initial state write: %+v", got)
+	}
+	if info, err := os.Stat(filepath.Join(directory, "logs")); err != nil || !info.IsDir() {
+		t.Fatalf("failed launch did not leave a log directory: %v", err)
+	}
+	for _, name := range []string{filepath.Join(directory, "state.json"), filepath.Join(root, "count")} {
+		if _, err := os.Stat(name); !os.IsNotExist(err) {
+			t.Fatalf("failed launch created %s: %v", name, err)
+		}
+	}
+	if err := os.Remove(filepath.Join(directory, "state.tmp")); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if got := call("create", "retry", command, DefaultOptions().JSON()); got.Code != 0 {
+			t.Fatalf("retry after storage recovery: %+v", got)
+		}
+		run := awaitRun(t, call, "retry")
+		if run.Status != "Failed" || run.ExitCode == nil || *run.ExitCode != 3 {
+			t.Fatalf("recovered run: %+v", run)
+		}
+	}
+	if data, err := os.ReadFile(filepath.Join(root, "count")); err != nil || string(data) != "execution\n" {
+		t.Fatalf("retry did not execute exactly once: %q, %v", data, err)
+	}
+	if got := streamRunLog(t, root, "retry", "0"); got.Code != 0 || string(got.Bytes) != "recovered" {
+		t.Fatalf("recovered log: %+v", got)
+	}
+}
+
+func TestDirectorySyncFailurePreventsCommandLaunch(t *testing.T) {
+	root, call := localRunner(t)
+	// Inject an I/O error only when syncing a directory. File writes and the
+	// rename still succeed, but the command must not start without a durable record.
+	const failDirectorySync = `import errno, os, stat
+original_fsync = os.fsync
+def fail_directory_sync(fd):
+    if stat.S_ISDIR(os.fstat(fd).st_mode):
+        raise OSError(errno.EIO, "injected directory sync failure")
+    original_fsync(fd)
+os.fsync = fail_directory_sync
+`
+	argv := Command("create", "sync", "echo started > started", DefaultOptions().JSON())
+	argv[3] = failDirectorySync + argv[3]
+	argv[4], argv[5] = filepath.Join(root, ".runs"), root
+	out, stderr := executeRunner(t, root, argv)
+	var result runnerResult
+	if err := json.Unmarshal(out, &result); err != nil {
+		t.Fatalf("directory sync response: %q, %v", out, err)
+	}
+	if result.Code == 0 {
+		awaitRun(t, call, "sync")
+	}
+	if result.Code != 500 || !strings.Contains(result.Error, "injected directory sync failure") || len(stderr) != 0 {
+		t.Fatalf("directory sync failure was not reported: %+v, stderr=%q", result, stderr)
+	}
+	if _, err := os.Stat(filepath.Join(root, ".runs", "sync", "state.json")); err != nil {
+		t.Fatalf("failure occurred before replacing the state file: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "started")); !os.IsNotExist(err) {
+		t.Fatalf("command started before its record was durable: %v", err)
+	}
+	if got := call("get", "sync"); got.Code != 0 || got.Run.Status != "Interrupted" || got.Run.ExitCode != nil {
+		t.Fatalf("unsynced launch must not invent an exit code: %+v", got)
+	}
+}
+
 func TestUnreadableRecordsDoNotBlockCollectionsOrLaunch(t *testing.T) {
 	root, call := localRunner(t)
 	for _, field := range []string{"truncated", "finishedAt", "maxLogBytes", "exitCode", "message"} {

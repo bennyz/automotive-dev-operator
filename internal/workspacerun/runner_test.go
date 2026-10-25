@@ -32,7 +32,8 @@ func TestRunnerTimeoutRecordsDistinctResult(t *testing.T) {
 	root, call := localRunner(t)
 	options := DefaultOptions()
 	options.TimeoutSeconds, options.RequestedTimeoutSeconds = 1, 1
-	call("create", "timeout", `echo before; sleep 30; echo survived > survived`, options.JSON())
+	const command = `echo before; sleep 30 & echo $! > child-pid; wait; echo survived > survived`
+	call("create", "timeout", command, options.JSON())
 	run := awaitRun(t, call, "timeout")
 	if run.Status != "TimedOut" || run.ExitCode == nil || *run.ExitCode != 124 || !strings.Contains(run.Message, "1 seconds") {
 		t.Fatalf("timeout result: %+v", run)
@@ -43,8 +44,38 @@ func TestRunnerTimeoutRecordsDistinctResult(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(root, "survived")); !os.IsNotExist(err) {
 		t.Fatalf("timed out command continued: %v", err)
 	}
+	data, err := os.ReadFile(filepath.Join(root, "child-pid"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil || pid <= 0 {
+		t.Fatalf("invalid child PID: %q, %v", data, err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+		if os.IsNotExist(err) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, state, ok := strings.Cut(string(data), ") ")
+		if !ok {
+			t.Fatalf("invalid child process state: %q", data)
+		}
+		if strings.HasPrefix(state, "Z ") {
+			break // Terminated, but the test host's PID 1 may not have reaped it.
+		}
+		if time.Now().After(deadline) {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+			t.Fatalf("child %d survived the run timeout: %q", pid, state)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 	options.RequestedTimeoutSeconds = 2
-	if result := call("create", "timeout", `echo before; sleep 30; echo survived > survived`, options.JSON()); result.Code != 409 {
+	if result := call("create", "timeout", command, options.JSON()); result.Code != 409 {
 		t.Fatalf("changed timeout reused ID: %+v", result)
 	}
 }
@@ -239,7 +270,7 @@ func TestWorkspaceInitReapsSupervisorAndBackgroundChildren(t *testing.T) {
 	// this harness nor the Go test can reap the orphaned supervisor/descendant.
 	const harness = `import json, pathlib, subprocess, sys, time
 root = pathlib.Path(sys.argv[2])
-subprocess.run(["python3", "-I", "-c", sys.argv[1], str(root / ".runs"), str(root), "create", "reaping", "sleep 30 & echo $! > child-pid; sleep 0.2", sys.argv[3]], check=True, capture_output=True)
+subprocess.run(["python3", "-I", "-c", sys.argv[1], str(root / ".runs"), str(root), "create", "reaping", "sleep 30 & echo $! > child-pid; sleep 0.2", sys.argv[3]], check=True, capture_output=True, timeout=5)
 deadline = time.monotonic() + 5
 while time.monotonic() < deadline:
     state = json.loads((root / ".runs/reaping/state.json").read_text())
@@ -252,9 +283,10 @@ while time.monotonic() < deadline:
     time.sleep(0.02)
 raise RuntimeError("orphan processes were not reaped: " + str(state))
 `
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, initPath, "--", "python3", "-I", "-c", harness, script, t.TempDir(), DefaultOptions().JSON())
+	cmd.WaitDelay = time.Second
 	out, err := cmd.CombinedOutput()
 	if err != nil || string(out) != "reaped supervisor and child\n" {
 		t.Fatalf("init lifecycle: %q, %v", out, err)

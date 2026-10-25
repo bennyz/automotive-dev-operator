@@ -50,6 +50,12 @@ def save(directory, state):
         stream.flush()
         os.fsync(stream.fileno())
     os.replace(directory / "state.tmp", directory / "state.json")
+    # Persist the rename as well as the contents before acknowledging a save.
+    directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
 
 
 @contextlib.contextmanager
@@ -380,7 +386,7 @@ def launch(directory, run_id, command, options, collection_lock):
             if state["command"] != command or state["requestedTimeoutSeconds"] != options["requestedTimeoutSeconds"]:
                 raise RunError(409, "run ID already belongs to a different command or timeout")
             return public(directory, state)
-        (directory / "logs").mkdir()
+        (directory / "logs").mkdir(exist_ok=True)
         state = dict(id=run_id, command=command, status="Starting", startedAt=now(),
                      pid=os.getpid(), identity=identity(os.getpid()),
                      timeoutSeconds=options["timeoutSeconds"], maxLogBytes=options["maxLogBytes"],
