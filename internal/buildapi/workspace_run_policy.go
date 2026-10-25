@@ -88,5 +88,6 @@ func resolveWorkspaceRunOptions(settings *automotivev1alpha1.WorkspacesConfig, r
 	if options.CompletedLogBudgetBytes <= 0 {
 		return options, fmt.Errorf("workspace PVC capacity is too small for retained logs")
 	}
+	options.MaxLogBytes = min(options.MaxLogBytes, options.CompletedLogBudgetBytes)
 	return options, nil
 }

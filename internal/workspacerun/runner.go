@@ -39,10 +39,7 @@ func (o Options) JSON() string {
 // Command returns an argv, never shell-interpolated user input. Python is part
 // of the workspace toolchain image. The command and supervisor each use setsid.
 func Command(action string, args ...string) []string {
-	if action == "create" && len(args) == 2 {
-		args = append(args, DefaultOptions().JSON())
-	}
-	return append([]string{"python3", "-c", script, "/workspace/.runs", "/workspace/src", action}, args...)
+	return append([]string{"python3", "-I", "-c", script, "/workspace/.runs", "/workspace/src", action}, args...)
 }
 
 // ActivityCommand uses /proc for legacy exec sessions as well as recorded runs.
@@ -52,7 +49,6 @@ func ActivityCommand() []string {
 }
 
 const activityLauncher = `proc=$1; pts=$2; shift 2
-if command -v python3 >/dev/null 2>&1; then exec "$@"; fi
 for entry in "$pts"/[0-9]*; do
     if [ -e "$entry" ]; then printf '{"active":true}\n'; exit 0; fi
 done
@@ -62,8 +58,9 @@ for file in "$proc"/[0-9]*/stat; do
     [ "$pid" = "$$" ] && continue
     IFS= read -r stat 2>/dev/null < "$file" || continue
     stat=${stat##*) }
-    set -- $stat
-    if [ "$1" != Z ] && [ "$2" = 0 ]; then printf '{"active":true}\n'; exit 0; fi
+    state=${stat%% *}; stat=${stat#* }; ppid=${stat%% *}
+    if [ "$state" != Z ] && [ "$ppid" = 0 ]; then printf '{"active":true}\n'; exit 0; fi
 done
+if command -v python3 >/dev/null 2>&1; then exec "$@"; fi
 printf '{"active":false}\n'
 `

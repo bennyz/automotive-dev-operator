@@ -532,13 +532,15 @@ type WorkspacesConfig struct {
 	RunRetentionDays int32 `json:"runRetentionDays,omitempty"`
 
 	// RunMaxLogSizeMiB bounds each retained log tail; commands continue when full.
+	// The effective cap cannot exceed the workspace's completed-log budget.
 	// +kubebuilder:default=100
 	// +kubebuilder:validation:Minimum=1
 	// +optional
 	RunMaxLogSizeMiB int32 `json:"runMaxLogSizeMiB,omitempty"`
 
 	// RunCompletedLogBudgetMiB bounds completed logs, additionally capped at 10%
-	// of the workspace PVC. Oldest terminal runs are evicted first.
+	// of the workspace PVC. Oldest terminal logs are evicted first; their result
+	// records remain until RunRetentionDays expires. Live logs are never evicted.
 	// +kubebuilder:default=1024
 	// +kubebuilder:validation:Minimum=1
 	// +optional

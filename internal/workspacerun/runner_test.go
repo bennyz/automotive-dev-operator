@@ -23,8 +23,7 @@ import (
 type runnerResult struct {
 	Run    buildcontract.WorkspaceRun   `json:"run"`
 	Runs   []buildcontract.WorkspaceRun `json:"runs"`
-	Data   []byte                       `json:"data"`
-	Offset int64                        `json:"offset"`
+	Error  string                       `json:"error"`
 	Active bool                         `json:"active"`
 	Code   int                          `json:"code"`
 }
@@ -38,7 +37,7 @@ func TestRunnerTimeoutRecordsDistinctResult(t *testing.T) {
 	if run.Status != "TimedOut" || run.ExitCode == nil || *run.ExitCode != 124 || !strings.Contains(run.Message, "1 seconds") {
 		t.Fatalf("timeout result: %+v", run)
 	}
-	if run.TimeoutSeconds != 1 || string(call("logs", "timeout", "0").Data) != "before\n" {
+	if run.TimeoutSeconds != 1 || string(streamRunLog(t, root, "timeout", "0").Bytes) != "before\n" {
 		t.Fatalf("timeout lost its policy or output: %+v", run)
 	}
 	if _, err := os.Stat(filepath.Join(root, "survived")); !os.IsNotExist(err) {
@@ -68,12 +67,12 @@ func TestRunnerKeepsLogTailWithAbsoluteOffsets(t *testing.T) {
 		want[i] = byte(9240 + i)
 	}
 	for _, offset := range []string{"0", "9240"} {
-		got := call("logs", "tail", offset)
-		if got.Offset != 9240 || !bytes.Equal(got.Data, want) {
-			t.Fatalf("read at %s: offset=%d bytes=%d", offset, got.Offset, len(got.Data))
+		got := streamRunLog(t, root, "tail", offset)
+		if got.Offset != 9240 || !bytes.Equal(got.Bytes, want) {
+			t.Fatalf("read at %s: offset=%d bytes=%d", offset, got.Offset, len(got.Bytes))
 		}
 	}
-	if got := call("logs", "tail", "10235"); got.Offset != 10235 || !bytes.Equal(got.Data, want[995:]) {
+	if got := streamRunLog(t, root, "tail", "10235"); got.Offset != 10235 || !bytes.Equal(got.Bytes, want[995:]) {
 		t.Fatalf("absolute resume: %+v", got)
 	}
 	files, err := filepath.Glob(filepath.Join(root, ".runs", "tail", "logs", "*.log"))
@@ -88,67 +87,70 @@ func TestRunnerKeepsLogTailWithAbsoluteOffsets(t *testing.T) {
 		}
 		physical += info.Size()
 	}
-	if physical > 2*options.MaxLogBytes {
+	if physical != options.MaxLogBytes {
 		t.Fatalf("unbounded physical log size: %d", physical)
 	}
 }
 
-func TestRunnerRetentionBudgetAndDeletionPreserveLiveRunsAndIDs(t *testing.T) {
+func TestRunnerRetentionAndBudgetPreserveResultsAndLiveRuns(t *testing.T) {
 	root, call := localRunner(t)
-	call("create", "live", `printf live-output-larger-than-budget; sleep 30`)
+	call("create", "live", `printf live-output-larger-than-budget; sleep 30`, DefaultOptions().JSON())
 	t.Cleanup(func() { call("cancel", "live"); awaitRun(t, call, "live") })
 	for id, age := range map[string]time.Duration{"expired": 8 * 24 * time.Hour, "oldest": 24 * time.Hour, "newer": time.Hour} {
-		directory := filepath.Join(root, ".runs", id)
-		if err := os.MkdirAll(directory, 0o700); err != nil {
-			t.Fatal(err)
-		}
-		state, err := json.Marshal(buildcontract.WorkspaceRun{ID: id, Command: "echo fixture", Status: "Succeeded", StartedAt: time.Now().Add(-age - time.Second).Format(time.RFC3339), FinishedAt: time.Now().Add(-age).Format(time.RFC3339)})
-		if err != nil {
-			t.Fatal(err)
-		}
-		for name, data := range map[string][]byte{"state.json": state, "output.log": []byte("12345678")} {
-			if err := os.WriteFile(filepath.Join(directory, name), data, 0o600); err != nil {
-				t.Fatal(err)
-			}
-		}
+		writeTerminalRun(t, root, id, age, []byte("12345678"))
 	}
 	options := DefaultOptions()
 	options.CompletedLogBudgetBytes = 10
 	call("create", "trigger", "sleep 30", options.JSON())
 	t.Cleanup(func() { call("cancel", "trigger"); awaitRun(t, call, "trigger") })
-	for _, id := range []string{"expired", "oldest"} {
-		if result := call("get", id); result.Code != 410 {
-			t.Fatalf("%s was not evicted: %+v", id, result)
-		}
-		if _, err := os.Stat(filepath.Join(root, ".runs", id, "output.log")); !os.IsNotExist(err) {
-			t.Fatalf("evicted log still occupies disk: %v", err)
-		}
-		if result := call("create", id, "echo duplicate > duplicate"); result.Code != 410 {
-			t.Fatalf("expired ID was executable: %+v", result)
-		}
+	if result := call("get", "expired"); result.Code != 410 {
+		t.Fatalf("expired result retained: %+v", result)
 	}
-	if got := call("get", "newer").Run; got.Status != "Succeeded" || got.LogBytes != 8 {
-		t.Fatalf("newer terminal run evicted first: %+v", got)
+	if _, err := os.Stat(filepath.Join(root, ".runs", "expired")); !os.IsNotExist(err) {
+		t.Fatalf("expired run still occupies disk: %v", err)
+	}
+	if result := call("create", "expired", "echo duplicate > duplicate", DefaultOptions().JSON()); result.Code != 410 {
+		t.Fatalf("expired ID was executable: %+v", result)
+	}
+	if got := call("get", "oldest").Run; !got.LogsEvicted || got.Status != "Failed" || got.ExitCode == nil || *got.ExitCode != 3 || got.LogBytes != 8 || got.LogStartOffset != 8 || !got.LogTruncated {
+		t.Fatalf("budget eviction lost result or offsets: %+v", got)
+	}
+	if _, err := os.Stat(filepath.Join(root, ".runs", "oldest", "logs")); !os.IsNotExist(err) {
+		t.Fatalf("budget did not reclaim log storage: %v", err)
+	}
+	if got := streamRunLog(t, root, "oldest", "0"); len(got.Bytes) != 0 || got.Offset != 8 || got.Code != 0 || !got.Run.LogsEvicted {
+		t.Fatalf("evicted log resume: %+v", got)
+	}
+	if got := call("get", "newer").Run; got.LogsEvicted || got.Status != "Failed" || got.LogBytes != 8 {
+		t.Fatalf("newer terminal log evicted first: %+v", got)
 	}
 	if got := call("get", "live").Run; got.Status != "Running" || got.LogBytes <= 10 {
 		t.Fatalf("live run was evicted or truncated by completed budget: %+v", got)
 	}
-	if got := call("delete", "live"); got.Code != 409 {
-		t.Fatalf("live deletion accepted: %+v", got)
-	}
+
 	page := call("list", "0", "2").Runs
 	if len(page) != 2 || page[0].ID != "trigger" || page[1].ID != "live" {
 		t.Fatalf("list order/page: %+v", page)
 	}
-	if page = call("list", "2", "2").Runs; len(page) != 1 || page[0].ID != "newer" {
+	if page = call("list", "2", "2").Runs; len(page) != 2 || page[0].ID != "newer" || page[1].ID != "oldest" {
 		t.Fatalf("list next page: %+v", page)
+	}
+}
+
+func TestRunnerDeletionPreservesLiveRunsAndIDs(t *testing.T) {
+	root, call := localRunner(t)
+	call("create", "live", "sleep 30", DefaultOptions().JSON())
+	t.Cleanup(func() { call("cancel", "live"); awaitRun(t, call, "live") })
+	writeTerminalRun(t, root, "newer", time.Hour, []byte("12345678"))
+	if got := call("delete", "live"); got.Code != 409 {
+		t.Fatalf("live deletion accepted: %+v", got)
 	}
 	for range 2 {
 		if got := call("delete", "newer"); got.Code != 0 {
 			t.Fatalf("terminal deletion not idempotent: %+v", got)
 		}
 	}
-	if got := call("create", "newer", "echo duplicate > duplicate"); got.Code != 410 {
+	if got := call("create", "newer", "echo duplicate > duplicate", DefaultOptions().JSON()); got.Code != 410 {
 		t.Fatalf("deleted ID was executable: %+v", got)
 	}
 	if _, err := os.Stat(filepath.Join(root, "duplicate")); !os.IsNotExist(err) {
@@ -156,16 +158,41 @@ func TestRunnerRetentionBudgetAndDeletionPreserveLiveRunsAndIDs(t *testing.T) {
 	}
 }
 
+func writeTerminalRun(t *testing.T, root, id string, age time.Duration, output []byte) string {
+	t.Helper()
+	directory := filepath.Join(root, ".runs", id)
+	if err := os.MkdirAll(filepath.Join(directory, "logs"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	state, err := json.Marshal(map[string]any{
+		"id": id, "command": "echo fixture", "status": "Failed", "exitCode": 3,
+		"startedAt":   time.Now().Add(-age - time.Second).Format(time.RFC3339),
+		"finishedAt":  time.Now().Add(-age).Format(time.RFC3339),
+		"maxLogBytes": DefaultOptions().MaxLogBytes, "timeoutSeconds": 7200, "requestedTimeoutSeconds": 0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, data := range map[string][]byte{"state.json": state, "logs/00000000000000000000.log": output} {
+		if err := os.WriteFile(filepath.Join(directory, name), data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return filepath.Join(directory, "state.json")
+}
+
 func TestActivityWithoutPythonUsesProcAndPTYs(t *testing.T) {
 	for _, tc := range []struct {
-		name, stat string
-		pty, want  bool
+		name, stat        string
+		pty, python, want bool
 	}{
 		{name: "idle"},
 		{name: "exec", stat: "123 (shell command) S 0", want: true},
 		{name: "orphan", stat: "123 (background) S 1"},
 		{name: "zombie", stat: "123 (dead) Z 0"},
 		{name: "terminal", pty: true, want: true},
+		{name: "exec skips Python", stat: "123 (shell command) S 0", python: true, want: true},
+		{name: "terminal skips Python", pty: true, python: true, want: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			root := t.TempDir()
@@ -185,10 +212,15 @@ func TestActivityWithoutPythonUsesProcAndPTYs(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
+			if tc.python {
+				if err := os.WriteFile(filepath.Join(root, "python3"), []byte("#!/bin/sh\nexit 99\n"), 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
 			argv := ActivityCommand()
 			argv[4], argv[5] = proc, pts
 			cmd := exec.Command(argv[0], argv[1:]...)
-			cmd.Env = []string{"PATH=" + root} // Neither Python nor procps is available.
+			cmd.Env = []string{"PATH=" + root} // No procps; Python must not run when the shell detects activity.
 			out, err := cmd.CombinedOutput()
 			if err != nil || string(out) != fmt.Sprintf("{\"active\":%t}\n", tc.want) {
 				t.Fatalf("activity: %q, %v", out, err)
@@ -207,7 +239,7 @@ func TestWorkspaceInitReapsSupervisorAndBackgroundChildren(t *testing.T) {
 	// this harness nor the Go test can reap the orphaned supervisor/descendant.
 	const harness = `import json, pathlib, subprocess, sys, time
 root = pathlib.Path(sys.argv[2])
-subprocess.run(["python3", "-c", sys.argv[1], str(root / ".runs"), str(root), "create", "reaping", "sleep 30 & echo $! > child-pid; sleep 0.2", sys.argv[3]], check=True, capture_output=True)
+subprocess.run(["python3", "-I", "-c", sys.argv[1], str(root / ".runs"), str(root), "create", "reaping", "sleep 30 & echo $! > child-pid; sleep 0.2", sys.argv[3]], check=True, capture_output=True)
 deadline = time.monotonic() + 5
 while time.monotonic() < deadline:
     state = json.loads((root / ".runs/reaping/state.json").read_text())
@@ -222,7 +254,7 @@ raise RuntimeError("orphan processes were not reaped: " + str(state))
 `
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, initPath, "--", "python3", "-c", harness, script, t.TempDir(), DefaultOptions().JSON())
+	cmd := exec.CommandContext(ctx, initPath, "--", "python3", "-I", "-c", harness, script, t.TempDir(), DefaultOptions().JSON())
 	out, err := cmd.CombinedOutput()
 	if err != nil || string(out) != "reaped supervisor and child\n" {
 		t.Fatalf("init lifecycle: %q, %v", out, err)
@@ -250,19 +282,19 @@ if pid == 0:
     time.sleep(30)
     os._exit(0)
 Path("escaped-pid").write_text(str(pid))
-print("parent complete")'`)
+print("parent complete")'`, DefaultOptions().JSON())
 	run := awaitRun(t, call, "escaped")
-	if run.Status != "Succeeded" || string(call("logs", "escaped", "0").Data) != "parent complete\n" {
+	if run.Status != "Succeeded" || string(streamRunLog(t, root, "escaped", "0").Bytes) != "parent complete\n" {
 		t.Fatalf("escaped pipe holder prevented completion: %+v", run)
 	}
 }
 
 func TestIdleLogFollowerExitsAtItsCapWithoutStoppingRun(t *testing.T) {
 	root, call := localRunner(t)
-	call("create", "idle", "sleep 30")
+	call("create", "idle", "sleep 30", DefaultOptions().JSON())
 	t.Cleanup(func() { call("cancel", "idle"); awaitRun(t, call, "idle") })
 	argv := Command("stream", "idle", "0", "0", "true", "0.2")
-	argv[3], argv[4] = filepath.Join(root, ".runs"), root
+	argv[4], argv[5] = filepath.Join(root, ".runs"), root
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
@@ -282,16 +314,8 @@ func localRunner(t *testing.T) (string, func(string, ...string) runnerResult) {
 	return root, func(action string, args ...string) runnerResult {
 		t.Helper()
 		argv := Command(action, args...)
-		argv[3], argv[4] = filepath.Join(root, ".runs"), root
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		cmd := exec.CommandContext(ctx, "/bin/sh", append([]string{"-c", `umask 022; exec "$@"`, "--"}, argv...)...)
-		var stderr bytes.Buffer
-		cmd.Stderr = &stderr
-		out, err := cmd.Output()
-		if err != nil {
-			t.Fatalf("runner %s: %v: %s", action, err, stderr.String())
-		}
+		argv[4], argv[5] = filepath.Join(root, ".runs"), root
+		out, _ := executeRunner(t, root, argv)
 		var result runnerResult
 		if err := json.Unmarshal(out, &result); err != nil {
 			t.Fatalf("runner %s: %v: %s", action, err, out)
@@ -300,9 +324,56 @@ func localRunner(t *testing.T) (string, func(string, ...string) runnerResult) {
 	}
 }
 
+// executeRunner exercises the embedded protocol in the same untrusted working
+// directory as the command, with the container's ordinary umask.
+func executeRunner(t *testing.T, root string, argv []string) ([]byte, []byte) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "/bin/sh", append([]string{"-c", `umask 022; exec "$@"`, "--"}, argv...)...)
+	cmd.Dir = root
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("runner: %v: %s", err, stderr.String())
+	}
+	return out, stderr.Bytes()
+}
+
+type runnerLog struct {
+	runnerResult
+	Bytes  []byte
+	Offset int64
+}
+
+func streamRunLog(t *testing.T, root, id, offset string) runnerLog {
+	t.Helper()
+	argv := Command("get", id)
+	argv[4], argv[5] = filepath.Join(root, ".runs"), root
+	out, _ := executeRunner(t, root, argv)
+	var result runnerLog
+	if err := json.Unmarshal(out, &result.runnerResult); err != nil || result.Code != 0 {
+		t.Fatalf("get before stream: %s, %v", out, err)
+	}
+	requested, err := strconv.ParseInt(offset, 10, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result.Offset = max(requested, result.Run.LogStartOffset)
+	argv = Command("stream", id, strconv.FormatInt(result.Offset, 10), strconv.FormatInt(result.Run.LogBytes, 10), "false", "1")
+	argv[4], argv[5] = filepath.Join(root, ".runs"), root
+	output, metadata := executeRunner(t, root, argv)
+	if err := json.Unmarshal(metadata, &result.runnerResult); err != nil {
+		t.Fatalf("stream metadata: %s, %v", metadata, err)
+	}
+	result.Bytes = output
+	return result
+}
+
 func TestRunnerPreservesCommandUmaskAndSignals(t *testing.T) {
 	root, call := localRunner(t)
-	call("create", "permissions", `echo artifact > artifact; mkdir objects; python3 -c 'import signal; print(signal.getsignal(signal.SIGHUP))'`)
+	call("create", "permissions", `echo artifact > artifact; mkdir objects; python3 -c 'import signal; print(signal.getsignal(signal.SIGHUP))'`, DefaultOptions().JSON())
 	run := awaitRun(t, call, "permissions")
 	if run.Status != "Succeeded" {
 		t.Fatalf("run: %+v", run)
@@ -313,7 +384,7 @@ func TestRunnerPreservesCommandUmaskAndSignals(t *testing.T) {
 			t.Fatalf("%s permissions: %v, %v; want %o", filename, info, err, mode)
 		}
 	}
-	if output := string(call("logs", "permissions", "0").Data); output != "0\n" {
+	if output := string(streamRunLog(t, root, "permissions", "0").Bytes); output != "0\n" {
 		t.Fatalf("SIGHUP should have its normal disposition: %q", output)
 	}
 }
@@ -335,20 +406,20 @@ func awaitRun(t *testing.T, call func(string, ...string) runnerResult, id string
 func TestRunnerRetainsOutputAndResultAfterLauncherExits(t *testing.T) {
 	root, call := localRunner(t)
 	command := `printf 'one\000'; while [ ! -f release ]; do sleep 0.05; done; printf '\377two' >&2; exit 23`
-	run := call("create", "durable", command).Run
+	run := call("create", "durable", command, DefaultOptions().JSON()).Run
 	if run.ID != "durable" || run.Status != "Running" {
 		t.Fatalf("create: %+v", run)
 	}
 	t.Cleanup(func() { call("cancel", "durable"); awaitRun(t, call, "durable") })
-	if !call("active-runs").Active {
+	if !call("active").Active {
 		t.Fatal("detached command did not count as activity")
 	}
 	// Repeating a request after the launch connection was lost must not execute
 	// another command, and a different payload must not overwrite its output.
-	if got := call("create", "durable", command).Run; got.StartedAt != run.StartedAt {
+	if got := call("create", "durable", command, DefaultOptions().JSON()).Run; got.StartedAt != run.StartedAt {
 		t.Fatalf("duplicate creation: %+v", got)
 	}
-	if got := call("create", "durable", "echo duplicate").Code; got != 409 {
+	if got := call("create", "durable", "echo duplicate", DefaultOptions().JSON()).Code; got != 409 {
 		t.Fatalf("conflicting command: %d", got)
 	}
 	if err := os.WriteFile(filepath.Join(root, "release"), nil, 0o600); err != nil {
@@ -358,16 +429,16 @@ func TestRunnerRetainsOutputAndResultAfterLauncherExits(t *testing.T) {
 	if run.Status != "Failed" || run.ExitCode == nil || *run.ExitCode != 23 || run.FinishedAt == "" {
 		t.Fatalf("result: %+v", run)
 	}
-	if got := call("logs", "durable", "2").Data; !bytes.Equal(got, []byte{'e', 0, 255, 't', 'w', 'o'}) {
+	if got := streamRunLog(t, root, "durable", "2").Bytes; !bytes.Equal(got, []byte{'e', 0, 255, 't', 'w', 'o'}) {
 		t.Fatalf("resumed bytes: %q", got)
 	}
-	if got := call("logs", "durable", "8"); len(got.Data) != 0 || got.Code != 0 {
+	if got := streamRunLog(t, root, "durable", "8"); len(got.Bytes) != 0 || got.Code != 0 {
 		t.Fatalf("EOF: %+v", got)
 	}
-	if got := call("logs", "durable", "9").Code; got != 416 {
+	if got := streamRunLog(t, root, "durable", "9").Code; got != 416 {
 		t.Fatalf("offset beyond EOF: %d", got)
 	}
-	if call("active-runs").Active {
+	if call("active").Active {
 		t.Fatal("finished run counted as activity")
 	}
 	if got := call("cancel", "durable").Run; got.Status != "Failed" || *got.ExitCode != 23 {
@@ -379,7 +450,7 @@ func TestRunnerConcurrentCreationExecutesOnce(t *testing.T) {
 	root, call := localRunner(t)
 	var group sync.WaitGroup
 	for range 6 {
-		group.Go(func() { call("create", "once", "echo execution >> count; sleep 0.2") })
+		group.Go(func() { call("create", "once", "echo execution >> count; sleep 0.2", DefaultOptions().JSON()) })
 	}
 	group.Wait()
 	awaitRun(t, call, "once")
@@ -391,7 +462,7 @@ func TestRunnerConcurrentCreationExecutesOnce(t *testing.T) {
 
 func TestRunnerCancellationKillsTERMResistantDescendants(t *testing.T) {
 	root, call := localRunner(t)
-	call("create", "cancel", `trap '' TERM; sh -c 'trap "" TERM; echo ready > ready; while :; do echo tick >> ticks; sleep 0.05; done' & wait`)
+	call("create", "cancel", `trap '' TERM; sh -c 'trap "" TERM; echo ready > ready; while :; do echo tick >> ticks; sleep 0.05; done' & wait`, DefaultOptions().JSON())
 	t.Cleanup(func() { call("cancel", "cancel"); awaitRun(t, call, "cancel") })
 	deadline := time.Now().Add(5 * time.Second)
 	for {
@@ -424,7 +495,7 @@ func TestRunnerCancellationKillsTERMResistantDescendants(t *testing.T) {
 
 func TestRunnerRecoversStaleIdentityWithoutInventingExitCode(t *testing.T) {
 	root, call := localRunner(t)
-	call("create", "stale", "printf retained")
+	call("create", "stale", "printf retained", DefaultOptions().JSON())
 	awaitRun(t, call, "stale")
 	filename := filepath.Join(root, ".runs", "stale", "state.json")
 	data, err := os.ReadFile(filename)
@@ -445,14 +516,14 @@ func TestRunnerRecoversStaleIdentityWithoutInventingExitCode(t *testing.T) {
 	if err := os.WriteFile(filename, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if call("active-runs").Active {
+	if call("active").Active {
 		t.Fatal("stale run prevents auto-pause")
 	}
 	run := call("cancel", "stale").Run
 	if run.Status != "Interrupted" || run.ExitCode != nil || !strings.Contains(run.Message, "exit code") {
 		t.Fatalf("stale result: %+v", run)
 	}
-	if got := string(call("logs", "stale", "0").Data); got != "retained" {
+	if got := string(streamRunLog(t, root, "stale", "0").Bytes); got != "retained" {
 		t.Fatalf("lost persisted log: %q", got)
 	}
 	if got := call("get", "../stale").Code; got != 400 {

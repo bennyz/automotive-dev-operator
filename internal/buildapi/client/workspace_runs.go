@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"path"
 	"strconv"
+	"time"
 
 	"github.com/centos-automotive-suite/automotive-dev-operator/internal/buildcontract"
 )
@@ -77,9 +78,14 @@ func (c *Client) CancelWorkspaceRun(ctx context.Context, name, id string) (*buil
 // Trailers are populated when Read reaches EOF.
 type WorkspaceRunLogStream struct {
 	io.ReadCloser
-	Offset   int64
-	Trailers http.Header
+	Offset         int64
+	Trailers       http.Header
+	StreamDuration time.Duration
 }
+
+// DefaultWorkspaceRunStreamDuration is used only with servers that do not
+// announce their stream cap. New servers own the timing via the response header.
+const DefaultWorkspaceRunStreamDuration = 40 * time.Second
 
 // WorkspaceRunLogs reads unmodified log bytes. Resume from stream.Offset plus
 // the number of bytes consumed, including partial reads before an error.
@@ -104,7 +110,17 @@ func (c *Client) WorkspaceRunLogs(ctx context.Context, name, id string, follow b
 		}
 		offset = actual
 	}
-	return &WorkspaceRunLogStream{ReadCloser: resp.Body, Offset: offset, Trailers: resp.Trailer}, nil
+	duration := DefaultWorkspaceRunStreamDuration
+	if value := resp.Header.Get("X-Log-Stream-Seconds"); value != "" {
+		seconds, parseErr := strconv.ParseFloat(value, 64)
+		var durationErr error
+		duration, durationErr = time.ParseDuration(strconv.FormatFloat(seconds, 'f', -1, 64) + "s")
+		if parseErr != nil || durationErr != nil || duration <= 0 {
+			closeBody(resp)
+			return nil, fmt.Errorf("invalid workspace log stream duration %q", value)
+		}
+	}
+	return &WorkspaceRunLogStream{ReadCloser: resp.Body, Offset: offset, Trailers: resp.Trailer, StreamDuration: duration}, nil
 }
 
 // ListWorkspaceRuns returns retained runs, newest first, with bounded pagination.

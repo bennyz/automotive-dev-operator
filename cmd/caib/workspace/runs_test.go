@@ -85,9 +85,9 @@ func TestRunCreationRetriesAreBoundedAndPermanentErrorsVisible(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			legacy, err := startWorkspaceRun(context.Background(), func(fn func(*buildapiclient.Client) error) error { return fn(api) }, "dev", buildcontract.WorkspaceRunRequest{ID: "stable-id", Command: "make", TimeoutSeconds: 90}, true, io.Discard, io.Discard, time.Millisecond)
-			if legacy || err == nil || !strings.Contains(err.Error(), "python3") || int(attempts.Load()) != tc.attempts {
-				t.Fatalf("retry/result: legacy=%v err=%v attempts=%d", legacy, err, attempts.Load())
+			err = startWorkspaceRun(context.Background(), func(fn func(*buildapiclient.Client) error) error { return fn(api) }, "dev", buildcontract.WorkspaceRunRequest{ID: "stable-id", Command: "make", TimeoutSeconds: 90}, time.Millisecond)
+			if err == nil || !strings.Contains(err.Error(), "python3") || int(attempts.Load()) != tc.attempts {
+				t.Fatalf("retry/result: err=%v attempts=%d", err, attempts.Load())
 			}
 			if tc.attempts > 1 && !strings.Contains(err.Error(), "giving up after 6 attempts") {
 				t.Fatalf("missing bounded-retry diagnostic: %v", err)
@@ -116,50 +116,48 @@ func TestRunRetriesBackOffAndRespectCancellation(t *testing.T) {
 	}
 }
 
-func TestOldServerFallbackDoesNotRepeatAmbiguousCommands(t *testing.T) {
+func TestRunCreationReportsOldServerWithoutFallingBack(t *testing.T) {
 	for _, tc := range []struct {
-		name             string
-		ambiguous, allow bool
-		wantLegacy       int32
+		name, body, contentType string
+		ambiguous, upgrade      bool
 	}{
-		{name: "legacy", allow: true, wantLegacy: 1},
-		{name: "explicit durable options", allow: false},
-		{name: "ambiguous launch", ambiguous: true, allow: true},
+		{name: "missing route", body: "404 page not found", contentType: "text/plain", upgrade: true},
+		{name: "workspace not found", body: `{"error":"workspace not found"}`, contentType: "application/json"},
+		{name: "JSON without content type", body: `{"error":"workspace not found"}`},
+		{name: "ambiguous launch then old server", body: "404 page not found", ambiguous: true, upgrade: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var creates, executions atomic.Int32
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if strings.HasSuffix(r.URL.Path, "/runs") {
-					if creates.Add(1) == 1 && tc.ambiguous {
-						w.WriteHeader(502)
-						return
-					}
-					w.WriteHeader(404)
+				if r.Method != http.MethodPost || r.URL.Path != "/v1/workspaces/dev/runs" {
+					executions.Add(1)
+					t.Errorf("unexpected execution fallback: %s %s", r.Method, r.URL.Path)
+					w.WriteHeader(500)
 					return
 				}
-				if r.Method != http.MethodPost || r.URL.Path != "/v1/workspaces/dev/exec" {
-					t.Errorf("unexpected fallback: %s %s", r.Method, r.URL.Path)
+				if creates.Add(1) == 1 && tc.ambiguous {
+					w.WriteHeader(502)
+					return
 				}
-				executions.Add(1)
-				var request buildcontract.WorkspaceExecRequest
-				if err := json.NewDecoder(r.Body).Decode(&request); err != nil || request.Command != "make" {
-					t.Errorf("legacy request: %+v %v", request, err)
-				}
-				w.Header().Set("Content-Length", "100")
-				_, _ = io.WriteString(w, "partial legacy output")
+				w.Header().Set("Content-Type", tc.contentType)
+				w.WriteHeader(404)
+				_, _ = io.WriteString(w, tc.body)
 			}))
 			defer server.Close()
 			api, err := buildapiclient.New(server.URL)
 			if err != nil {
 				t.Fatal(err)
 			}
-			var output, diagnostics bytes.Buffer
-			legacy, err := startWorkspaceRun(context.Background(), func(fn func(*buildapiclient.Client) error) error { return fn(api) }, "dev", buildcontract.WorkspaceRunRequest{ID: "id", Command: "make"}, tc.allow, &output, &diagnostics, time.Millisecond)
-			if err == nil || executions.Load() != tc.wantLegacy || legacy != (tc.wantLegacy == 1) {
-				t.Fatalf("fallback: legacy=%v err=%v executions=%d", legacy, err, executions.Load())
+			err = startWorkspaceRun(context.Background(), func(fn func(*buildapiclient.Client) error) error { return fn(api) }, "dev", buildcontract.WorkspaceRunRequest{ID: "id", Command: "make"}, time.Millisecond)
+			if err == nil || executions.Load() != 0 || strings.Contains(err.Error(), "upgrade the operator") != tc.upgrade || !strings.Contains(err.Error(), tc.body) {
+				t.Fatalf("old server diagnostic: err=%v executions=%d", err, executions.Load())
 			}
-			if legacy && (output.String() != "partial legacy output" || !strings.Contains(diagnostics.String(), "Exit code and reattachment are unavailable")) {
-				t.Fatalf("legacy output/notice: %q %q", output.String(), diagnostics.String())
+			wantCreates := int32(1)
+			if tc.ambiguous {
+				wantCreates++
+			}
+			if creates.Load() != wantCreates {
+				t.Fatalf("unexpected retries: %d", creates.Load())
 			}
 		})
 	}
@@ -206,6 +204,58 @@ func TestFollowRunGivesUpWhenOnlyLogsFail(t *testing.T) {
 	_, err = followWorkspaceRun(context.Background(), func(fn func(*buildapiclient.Client) error) error { return fn(api) }, "dev", "run", &offset, io.Discard, io.Discard, time.Millisecond)
 	if err == nil || requests.Load() != maxRunAttempts {
 		t.Fatalf("log retry limit: %v, %d requests", err, requests.Load())
+	}
+}
+
+func TestFollowRunUsesServerStreamCapWithoutExhaustingRetries(t *testing.T) {
+	var streams atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/logs") {
+			streams.Add(1)
+			w.Header().Set("X-Log-Stream-Seconds", "0.01")
+			w.WriteHeader(200)
+			w.(http.Flusher).Flush()
+			time.Sleep(20 * time.Millisecond)
+			return
+		}
+		if streams.Load() > maxRunAttempts {
+			_, _ = io.WriteString(w, `{"status":"Succeeded","exitCode":0,"logBytes":0}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"status":"Running","logBytes":0}`)
+	}))
+	defer server.Close()
+	api, err := buildapiclient.New(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	var offset int64
+	code, err := followWorkspaceRun(ctx, func(fn func(*buildapiclient.Client) error) error { return fn(api) }, "dev", "run", &offset, io.Discard, io.Discard, time.Millisecond)
+	if err != nil || code != 0 || streams.Load() != maxRunAttempts+1 {
+		t.Fatalf("normal stream rotations consumed retries: code=%d err=%v streams=%d", code, err, streams.Load())
+	}
+}
+
+func TestFollowRunReturnsResultAfterLogBudgetEviction(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/logs") {
+			w.Header().Set("X-Log-Offset", "2000")
+			return
+		}
+		_, _ = io.WriteString(w, `{"status":"Failed","exitCode":3,"logBytes":2000,"logStartOffset":2000,"logsEvicted":true}`)
+	}))
+	defer server.Close()
+	api, err := buildapiclient.New(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var offset int64
+	var output, diagnostics bytes.Buffer
+	code, err := followWorkspaceRun(context.Background(), func(fn func(*buildapiclient.Client) error) error { return fn(api) }, "dev", "run", &offset, &output, &diagnostics, time.Millisecond)
+	if err != nil || code != 3 || offset != 2000 || output.Len() != 0 || !strings.Contains(diagnostics.String(), "evicted") {
+		t.Fatalf("evicted log lost command result: code=%d err=%v offset=%d output=%q diagnostics=%q", code, err, offset, output.String(), diagnostics.String())
 	}
 }
 

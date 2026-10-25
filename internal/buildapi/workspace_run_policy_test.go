@@ -16,6 +16,8 @@ func TestWorkspaceRunPolicyLimits(t *testing.T) {
 	}{
 		{name: "defaults", capacity: 10 << 30, timeout: 7200, logSize: 100 << 20, retention: 7 * 86400, budget: 1 << 30},
 		{name: "small volume", capacity: 1 << 30, timeout: 7200, logSize: 100 << 20, retention: 7 * 86400, budget: (1 << 30) / 10},
+		{name: "tiny volume clamps log cap", capacity: 512 << 20, timeout: 7200, logSize: (512 << 20) / 10, retention: 7 * 86400, budget: (512 << 20) / 10},
+		{name: "configured budget clamps log cap", settings: &automotivev1alpha1.WorkspacesConfig{RunCompletedLogBudgetMiB: 1}, capacity: 10 << 30, timeout: 7200, logSize: 1 << 20, retention: 7 * 86400, budget: 1 << 20},
 		{name: "large volume", capacity: 100 << 30, timeout: 7200, logSize: 100 << 20, retention: 7 * 86400, budget: 1 << 30},
 		{name: "request", requested: 86400, capacity: 10 << 30, timeout: 86400, logSize: 100 << 20, retention: 7 * 86400, budget: 1 << 30},
 		{name: "too long", requested: 86401, capacity: 10 << 30, invalid: true},

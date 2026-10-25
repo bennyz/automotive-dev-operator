@@ -131,7 +131,9 @@ func (c *Client) doRequest(req *http.Request, action string, isOK func(statusCod
 	}
 	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
 	_ = resp.Body.Close()
-	return nil, newHTTPError(resp.StatusCode, "%s failed: %s: %s", action, resp.Status, string(b))
+	response := newHTTPError(resp.StatusCode, "%s failed: %s: %s", action, resp.Status, string(b))
+	response.missingRoute = resp.StatusCode == http.StatusNotFound && !json.Valid(b) && !strings.Contains(resp.Header.Get("Content-Type"), "json")
+	return nil, response
 }
 
 // closeBody closes resp.Body, logging a warning if closing fails.

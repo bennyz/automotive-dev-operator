@@ -57,7 +57,7 @@ func runTestServer(t *testing.T, root, owner string, stopped bool) (*APIServer, 
 		if namespace != "default" || pod != "workspace-dev" || container != workspaceContainerName {
 			t.Errorf("wrong exec target: %s/%s/%s", namespace, pod, container)
 		}
-		argv[3], argv[4] = filepath.Join(root, ".runs"), root
+		argv[4], argv[5] = filepath.Join(root, ".runs"), root
 		return &fakeRemoteExecutor{streamWithContextFn: func(ctx context.Context, opts remotecommand.StreamOptions) error {
 			cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 			cmd.Stdout, cmd.Stderr = opts.Stdout, opts.Stderr
@@ -77,18 +77,60 @@ func runTestServer(t *testing.T, root, owner string, stopped bool) (*APIServer, 
 	return a, router, calls
 }
 
-func TestWorkspaceRunPermanentExecFailureIsActionable(t *testing.T) {
-	a, router, _ := runTestServer(t, t.TempDir(), "alice", false)
-	a.exec.newExecutor = func(*rest.Config, string, string, string, []string) (remotecommand.Executor, error) {
-		return &fakeRemoteExecutor{streamWithContextFn: func(_ context.Context, opts remotecommand.StreamOptions) error {
-			_, _ = io.WriteString(opts.Stderr, `exec: "python3": executable file not found in $PATH`)
-			return kexec.CodeExitError{Err: errors.New("command terminated with exit code 127"), Code: 127}
-		}}, nil
-	}
-	rec := httptest.NewRecorder()
-	router.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/workspaces/dev/runs", strings.NewReader(`{"id":"run","command":"true"}`)))
-	if rec.Code != http.StatusUnprocessableEntity || !strings.Contains(rec.Body.String(), "Python 3.9") || !strings.Contains(rec.Body.String(), "executable file not found") {
-		t.Fatalf("permanent launch failure: %d %s", rec.Code, rec.Body.String())
+func TestWorkspaceRunExecFailuresPreserveTheirActualCause(t *testing.T) {
+	for _, tc := range []struct {
+		name, stdout, stderr string
+		exit, status         int
+		python               bool
+	}{
+		{name: "missing interpreter", stderr: `exec: "python3": executable file not found in $PATH`, exit: 127, status: 422, python: true},
+		{name: "interpreter not executable", stderr: "python3: permission denied", exit: 126, status: 422, python: true},
+		{name: "traceback", stderr: "Traceback (most recent call last):\n" + strings.Repeat("frame\n", 300) + "PermissionError: volume is read-only", exit: 1, status: 502},
+		{name: "helper killed", stderr: "Killed", exit: 137, status: 502},
+		{name: "exec permission error", stderr: "permission denied by exec transport", exit: -1, status: 502},
+		{name: "runner exception", stdout: `{"code":500,"error":"OSError: no space left on device"}`, status: 500},
+		{name: "corrupt record", stdout: `{"code":422,"error":"unreadable run record: finishedAt"}`, status: 422},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a, router, _ := runTestServer(t, t.TempDir(), "alice", false)
+			a.exec.newExecutor = func(*rest.Config, string, string, string, []string) (remotecommand.Executor, error) {
+				return &fakeRemoteExecutor{streamWithContextFn: func(_ context.Context, opts remotecommand.StreamOptions) error {
+					_, _ = io.WriteString(opts.Stdout, tc.stdout)
+					_, _ = io.WriteString(opts.Stderr, tc.stderr)
+					if tc.exit == -1 {
+						return errors.New(tc.stderr)
+					}
+					if tc.exit != 0 {
+						return kexec.CodeExitError{Err: fmt.Errorf("command terminated with exit code %d", tc.exit), Code: tc.exit}
+					}
+					return nil
+				}}, nil
+			}
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/workspaces/dev/runs", strings.NewReader(`{"id":"run","command":"true"}`)))
+			var response struct {
+				Error string `json:"error"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+				t.Fatal(err)
+			}
+			want := tc.stderr
+			if len(want) > 1024 {
+				want = want[strings.LastIndex(want, "\n")+1:]
+			}
+			if tc.stdout != "" {
+				var protocol struct {
+					Error string `json:"error"`
+				}
+				if err := json.Unmarshal([]byte(tc.stdout), &protocol); err != nil {
+					t.Fatal(err)
+				}
+				want = protocol.Error
+			}
+			if rec.Code != tc.status || strings.Contains(response.Error, "Python 3.9") != tc.python || !strings.Contains(response.Error, want) {
+				t.Fatalf("exec failure: %d %s; want %d with %q", rec.Code, response.Error, tc.status, want)
+			}
+		})
 	}
 }
 
@@ -96,7 +138,7 @@ func TestWorkspaceRunFollowUsesPersistentExecAndStatusTrailers(t *testing.T) {
 	a, router, calls := runTestServer(t, t.TempDir(), "alice", false)
 	newExecutor := a.exec.newExecutor
 	a.exec.newExecutor = func(cfg *rest.Config, ns, pod, container string, argv []string) (remotecommand.Executor, error) {
-		if argv[5] == "stream" && argv[len(argv)-1] != "40" {
+		if argv[6] == "stream" && argv[len(argv)-1] != "40" {
 			t.Errorf("follower can outlive the CLI reconnect cycle: %s seconds", argv[len(argv)-1])
 		}
 		return newExecutor(cfg, ns, pod, container, argv)
@@ -119,7 +161,7 @@ func TestWorkspaceRunFollowUsesPersistentExecAndStatusTrailers(t *testing.T) {
 	}
 	data, err := io.ReadAll(stream)
 	_ = stream.Close()
-	if err != nil || string(data) != "firstsecondlast" || calls.Load() != 3 || stream.Offset != 0 || stream.Trailers.Get("X-Run-Status") != "Failed" || stream.Trailers.Get("X-Run-Exit-Code") != "7" {
+	if err != nil || string(data) != "firstsecondlast" || calls.Load() != 3 || stream.Offset != 0 || stream.StreamDuration != 40*time.Second || stream.Trailers.Get("X-Run-Status") != "Failed" || stream.Trailers.Get("X-Run-Exit-Code") != "7" {
 		t.Fatalf("stream: %q err=%v execs=%d offset=%d trailers=%v", data, err, calls.Load(), stream.Offset, stream.Trailers)
 	}
 }
@@ -131,7 +173,7 @@ func TestWorkspaceRunListDeleteAndTruncatedHTTPLog(t *testing.T) {
 		t.Fatal(err)
 	}
 	for file, data := range map[string]string{
-		"state.json":                    `{"id":"tail","command":"make","status":"Failed","exitCode":7,"maxLogBytes":10,"startedAt":"2026-01-01T00:00:00+00:00","finishedAt":"2026-01-01T00:01:00+00:00"}`,
+		"state.json":                    `{"id":"tail","command":"make","status":"Failed","exitCode":7,"maxLogBytes":10,"timeoutSeconds":7200,"requestedTimeoutSeconds":0,"startedAt":"2026-01-01T00:00:00+00:00","finishedAt":"2026-01-01T00:01:00+00:00"}`,
 		"logs/00000000000000000000.log": "discarded last error",
 	} {
 		if err := os.WriteFile(filepath.Join(directory, file), []byte(data), 0o600); err != nil {
@@ -378,13 +420,13 @@ func TestWorkspaceRunRequiresActivityReservation(t *testing.T) {
 func TestWorkspaceRunLogSnapshotAndOffsets(t *testing.T) {
 	root := t.TempDir()
 	directory := filepath.Join(root, ".runs", "large")
-	if err := os.MkdirAll(directory, 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Join(directory, "logs"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	data := bytes.Repeat([]byte{'a', 0, 255, '\n'}, 40000)
 	for name, content := range map[string][]byte{
-		"state.json": []byte(`{"id":"large","status":"Succeeded","exitCode":0}`),
-		"output.log": data,
+		"state.json":                    []byte(`{"id":"large","command":"make","status":"Succeeded","exitCode":0,"maxLogBytes":104857600,"timeoutSeconds":7200,"requestedTimeoutSeconds":0,"startedAt":"2026-01-01T00:00:00+00:00","finishedAt":"2026-01-01T00:01:00+00:00"}`),
+		"logs/00000000000000000000.log": data,
 	} {
 		if err := os.WriteFile(filepath.Join(directory, name), content, 0o600); err != nil {
 			t.Fatal(err)
@@ -418,7 +460,7 @@ func checkWorkspaceLogRotation(t *testing.T, a *APIServer, api *buildapiclient.C
 	newExecutor := a.exec.newExecutor
 	rotated := false
 	a.exec.newExecutor = func(cfg *rest.Config, ns, pod, container string, argv []string) (remotecommand.Executor, error) {
-		if argv[5] == "stream" && !rotated {
+		if argv[6] == "stream" && !rotated {
 			rotated = true
 			if err := os.WriteFile(filepath.Join(directory, "logs", "00000000000000000000.log"), []byte("discarded last errorFINAL TAIL"), 0o600); err != nil {
 				return nil, err

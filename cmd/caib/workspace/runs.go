@@ -73,14 +73,7 @@ func runExec(cmd *cobra.Command, args []string) {
 		id = uuid.NewString()
 		clilog.Statusf("Run: %s\n", id)
 		req := buildcontract.WorkspaceRunRequest{ID: id, Command: strings.Join(args[1:], " "), TimeoutSeconds: int64(timeout / time.Second)}
-		legacy, err := startWorkspaceRun(ctx, withRunClient, args[0], req, !detach && timeout == 0, os.Stdout, os.Stderr, time.Second)
-		if legacy {
-			stop()
-			if err != nil {
-				handleError(fmt.Errorf("legacy exec: %w", err))
-			}
-			return
-		}
+		err := startWorkspaceRun(ctx, withRunClient, args[0], req, time.Second)
 		if err != nil {
 			stop()
 			handleError(fmt.Errorf("create run %s: %w; inspect with caib workspace exec %s --run %s", id, err, args[0], id))
@@ -164,10 +157,8 @@ func newRunCmd() *cobra.Command {
 	return cmd
 }
 
-func startWorkspaceRun(ctx context.Context, api runClientCall, name string, req buildcontract.WorkspaceRunRequest, allowLegacy bool, out, diagnostics io.Writer, retryDelay time.Duration) (bool, error) {
-	attempts := 0
+func startWorkspaceRun(ctx context.Context, api runClientCall, name string, req buildcontract.WorkspaceRunRequest, retryDelay time.Duration) error {
 	err := retryRunRequest(ctx, retryDelay, func() error {
-		attempts++
 		requestCtx, cancel := context.WithTimeout(ctx, 40*time.Second)
 		defer cancel()
 		return api(func(client *buildapiclient.Client) error {
@@ -175,26 +166,10 @@ func startWorkspaceRun(ctx context.Context, api runClientCall, name string, req 
 			return err
 		})
 	})
-	var response buildapiclient.HTTPError
-	if !errors.As(err, &response) || response.HTTPStatusCode() != http.StatusNotFound {
-		return false, err
+	if buildapiclient.IsRouteNotFound(err) {
+		return fmt.Errorf("this server predates durable runs; upgrade the operator or use the caib version shipped with it: %w", err)
 	}
-	// A retry following an ambiguous failure may already have started a durable
-	// run. Falling back then could execute the command a second time.
-	if !allowLegacy || attempts != 1 {
-		return false, fmt.Errorf("server does not provide durable runs; cannot safely fall back with these options or after an ambiguous launch: %w", err)
-	}
-	_, _ = fmt.Fprintln(diagnostics, "Warning: server lacks durable runs; using legacy exec. Exit code and reattachment are unavailable.")
-	var body io.ReadCloser
-	err = api(func(client *buildapiclient.Client) (err error) {
-		body, err = client.ExecWorkspace(ctx, name, buildcontract.WorkspaceExecRequest{Command: req.Command})
-		return err
-	})
-	if err == nil {
-		_, err = io.Copy(out, body)
-		_ = body.Close()
-	}
-	return true, err
+	return err
 }
 
 func transientRunError(err error) bool {
@@ -259,7 +234,9 @@ func followWorkspaceRun(ctx context.Context, api runClientCall, name, id string,
 			// Rotate streams so a silent VPN black hole cannot leave Read stuck
 			// forever. Successful rotations and delivered output reset retries.
 			started := time.Now()
-			streamCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
+			expectedDuration := buildapiclient.DefaultWorkspaceRunStreamDuration
+			streamCtx, cancel := context.WithCancelCause(ctx)
+			timer := time.AfterFunc(expectedDuration+5*time.Second, func() { cancel(context.DeadlineExceeded) })
 			var body *buildapiclient.WorkspaceRunLogStream
 			streamErr := api(func(client *buildapiclient.Client) (err error) {
 				body, err = client.WorkspaceRunLogs(streamCtx, name, id, true, *offset)
@@ -267,6 +244,9 @@ func followWorkspaceRun(ctx context.Context, api runClientCall, name, id string,
 			})
 			var received int64
 			if streamErr == nil {
+				expectedDuration = body.StreamDuration
+				timer.Reset(expectedDuration + 5*time.Second)
+				started = time.Now()
 				if body.Offset > *offset {
 					_, _ = fmt.Fprintf(diagnostics, "Run %s: log truncated; resuming at byte %d (skipped %d bytes)\n", id, body.Offset, body.Offset-*offset)
 				}
@@ -280,8 +260,9 @@ func followWorkspaceRun(ctx context.Context, api runClientCall, name, id string,
 					streamErr = fmt.Errorf("%s: %w", body.Trailers.Get("X-Log-Error"), io.ErrUnexpectedEOF)
 				}
 			}
-			rotated := errors.Is(streamCtx.Err(), context.DeadlineExceeded)
-			cancel()
+			rotated := errors.Is(context.Cause(streamCtx), context.DeadlineExceeded)
+			timer.Stop()
+			cancel(nil)
 			if outputErr != nil {
 				return fmt.Errorf("writing command output: %v", outputErr)
 			}
@@ -291,8 +272,8 @@ func followWorkspaceRun(ctx context.Context, api runClientCall, name, id string,
 			if streamErr != nil && !rotated && !transientRunError(streamErr) {
 				return streamErr
 			}
-			requestCtx, cancel := context.WithTimeout(ctx, 40*time.Second)
-			defer cancel()
+			requestCtx, cancelRequest := context.WithTimeout(ctx, 40*time.Second)
+			defer cancelRequest()
 			if err := api(func(client *buildapiclient.Client) (err error) {
 				run, err = client.GetWorkspaceRun(requestCtx, name, id)
 				return err
@@ -310,7 +291,7 @@ func followWorkspaceRun(ctx context.Context, api runClientCall, name, id string,
 			if streamErr != nil && !rotated {
 				return streamErr
 			}
-			if received == 0 && time.Since(started) < 40*time.Second {
+			if received == 0 && time.Since(started) < expectedDuration {
 				return io.ErrUnexpectedEOF
 			}
 			return nil
@@ -321,6 +302,9 @@ func followWorkspaceRun(ctx context.Context, api runClientCall, name, id string,
 		if run.Terminal() && *offset >= run.LogBytes {
 			if run.ExitCode == nil {
 				return 0, fmt.Errorf("%s: %s (exit code unavailable)", run.Status, run.Message)
+			}
+			if run.LogsEvicted {
+				_, _ = fmt.Fprintln(diagnostics, "Retained output was evicted by the workspace log budget; the command result is still available.")
 			}
 			if run.Message != "" {
 				_, _ = fmt.Fprintln(diagnostics, run.Message)

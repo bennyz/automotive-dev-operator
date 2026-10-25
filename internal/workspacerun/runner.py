@@ -1,6 +1,5 @@
 """Durable workspace runs. Invoked through pod exec; no daemon is required."""
 
-import base64
 import collections
 import contextlib
 import datetime
@@ -19,6 +18,8 @@ import time
 ROOT = Path(sys.argv[1])
 WORKDIR = sys.argv[2]
 LIVE = ("Starting", "Running", "Cancelling")
+TERMINAL = ("Succeeded", "Failed", "Cancelled", "Interrupted", "TimedOut")
+TOMBSTONE_TTL = 24 * 60 * 60
 ORIGINAL_UMASK = os.umask(0o077)
 
 
@@ -53,18 +54,55 @@ def save(directory, state):
 
 @contextlib.contextmanager
 def locked(directory):
-    with (directory / "lock").open("a") as stream:
+    try:
+        stream = (directory / "lock").open("a")
+    except FileNotFoundError:
+        raise missing_run(directory) from None
+    except OSError as error:
+        raise RunError(422, f"unreadable run record {directory.name}: {error}") from None
+    with stream:
         fcntl.flock(stream, fcntl.LOCK_EX)
         yield stream
+
+
+def missing_run(directory):
+    if tombstoned(directory.name):
+        return RunError(410, "run was deleted or expired; use a new ID for a new command")
+    return RunError(404, "run not found")
 
 
 def read_state(directory):
     try:
         state = json.loads((directory / "state.json").read_text())
+        if not isinstance(state, dict) or state["id"] != directory.name:
+            raise ValueError("invalid record identity")
+        if not isinstance(state["command"], str) or state["status"] not in LIVE + TERMINAL:
+            raise ValueError("invalid command or status")
+        for key in ("startedAt",) + (("finishedAt",) if state["status"] in TERMINAL else ()):
+            if datetime.datetime.fromisoformat(state[key]).tzinfo is None:
+                raise ValueError(f"{key} must include a timezone")
+        for key, minimum in (("maxLogBytes", 1), ("timeoutSeconds", 1), ("requestedTimeoutSeconds", 0)):
+            if type(state[key]) is not int or state[key] < minimum:
+                raise ValueError(f"invalid {key}")
+        if state["status"] in LIVE:
+            if type(state["pid"]) is not int or state["pid"] <= 0:
+                raise ValueError("invalid supervisor PID")
+            if not isinstance(state["identity"], list) or len(state["identity"]) != 3 or not all(isinstance(value, str) for value in state["identity"]):
+                raise ValueError("invalid supervisor identity")
+        if state["status"] in TERMINAL and state["status"] != "Interrupted" and "exitCode" not in state:
+            raise ValueError("missing exit code")
+        if "exitCode" in state and (type(state["exitCode"]) is not int or not 0 <= state["exitCode"] <= 255):
+            raise ValueError("invalid exit code")
+        if not isinstance(state.get("message", ""), str):
+            raise ValueError("invalid message")
+        if type(state.get("logsEvicted", False)) is not bool:
+            raise ValueError("invalid logsEvicted")
+        if state.get("logsEvicted") and (state["status"] in LIVE or type(state["logBytes"]) is not int or state["logBytes"] < 0):
+            raise ValueError("invalid evicted log offsets")
     except FileNotFoundError:
-        raise RunError(404, "run not found") from None
-    if state.get("deleted"):
-        raise RunError(410, "run was deleted or expired; use a new ID for a new command")
+        raise missing_run(directory) from None
+    except (ValueError, KeyError, TypeError, OSError) as error:
+        raise RunError(422, f"unreadable run record {directory.name}: {error}") from None
     if state["status"] in LIVE and identity(state["pid"]) != state["identity"]:
         state.update(status="Interrupted", finishedAt=now(),
                      message="The workspace container or run supervisor stopped before recording an exit code")
@@ -78,22 +116,19 @@ def segments(directory):
 
 
 def log_window(directory, state):
-    if (directory / "logs").is_dir():
-        chunks = segments(directory)
-        end = chunks[-1][0] + chunks[-1][1] if chunks else 0
-        start = max(0, end - state["maxLogBytes"])
-        return start, end, chunks
-    # Read records created by earlier versions of the runner.
-    file = directory / "output.log"
-    end = file.stat().st_size if file.exists() else 0
-    return 0, end, [(0, end, file)] if end else []
+    if state.get("logsEvicted"):
+        return state["logBytes"], state["logBytes"], []
+    chunks = segments(directory)
+    end = chunks[-1][0] + chunks[-1][1] if chunks else 0
+    return max(0, end - state["maxLogBytes"]), end, chunks
 
 
 def public(directory, state):
     private = ("pid", "identity", "maxLogBytes", "requestedTimeoutSeconds")
     result = {key: value for key, value in state.items() if key not in private}
     start, end, _ = log_window(directory, state)
-    result.update(logBytes=end, logStartOffset=start, logTruncated=start > 0)
+    result.update(logBytes=end, logStartOffset=start, logTruncated=start > 0,
+                  logsEvicted=state.get("logsEvicted", False))
     return result
 
 
@@ -130,6 +165,7 @@ class LogWriter:
         self.chunk_size = min(1024 * 1024, limit)
         self.chunks = collections.deque()
         self.position = 0
+        self.output = None
 
     def write(self, data):
         while data:
@@ -137,13 +173,29 @@ class LogWriter:
             file = self.directory / f"{first:020d}.log"
             count = min(len(data), self.chunk_size - (self.position - first))
             if not self.chunks or self.chunks[-1][0] != first:
+                if self.output is not None:
+                    self.output.close()
+                self.output = file.open("ab", buffering=0)
                 self.chunks.append((first, file))
-            with file.open("ab", buffering=0) as output:
-                output.write(data[:count])
+            count = self.output.write(data[:count])
+            if count == 0:
+                raise OSError("log write made no progress")
             self.position += count
             data = data[count:]
             while self.chunks and self.chunks[0][0] + self.chunk_size <= self.position - self.limit:
                 self.chunks.popleft()[1].unlink()
+
+    def close(self):
+        if self.output is not None:
+            self.output.close()
+        # Trim the partial leading segment once, on completion, so completed
+        # logs fit the budget even when the per-log cap equals that budget.
+        start = max(0, self.position - self.limit)
+        if self.chunks and self.chunks[0][0] < start:
+            first, file = self.chunks[0]
+            tail = file.read_bytes()[start - first:]
+            (self.directory / f"{start:020d}.log").write_bytes(tail)
+            file.unlink()
 
 
 def kill_group(process, sig):
@@ -156,44 +208,53 @@ def kill_group(process, sig):
 def pump(directory, process, options):
     writer = LogWriter(directory, options["maxLogBytes"])
     deadline = time.monotonic() + options["timeoutSeconds"]
-    escalation = None
-    reason = None
+    try:
+        with selectors.DefaultSelector() as selector:
+            return pump_output(directory, process, writer, selector, deadline)
+    finally:
+        process.stdout.close()
+        with locked(directory):
+            writer.close()
+
+
+def pump_output(directory, process, writer, selector, deadline):
+    escalation = reason = drain_deadline = None
     pipe_open = True
-    drain_deadline = None
-    with selectors.DefaultSelector() as selector:
-        selector.register(process.stdout, selectors.EVENT_READ)
-        while pipe_open or process.poll() is None:
-            for key, _ in selector.select(timeout=0.1):
-                data = os.read(key.fd, 65536)
-                if data:
-                    with locked(directory):
-                        writer.write(data)
-                else:
-                    selector.unregister(key.fileobj)
-                    pipe_open = False
+    next_check = 0
+    selector.register(process.stdout, selectors.EVENT_READ)
+    while pipe_open or process.poll() is None:
+        for key, _ in selector.select(timeout=max(0, next_check - time.monotonic())):
+            data = os.read(key.fd, 65536)
+            if data:
+                with locked(directory):
+                    writer.write(data)
+            else:
+                selector.unregister(key.fileobj)
+                pipe_open = False
+        if time.monotonic() >= next_check:
             with locked(directory):
                 state = read_state(directory)
                 if reason is None and state["status"] == "Cancelling":
                     reason = "cancel"
                 if reason is None and time.monotonic() >= deadline:
                     reason = "timeout"
-                    state.update(status="Cancelling", message=f"Run timed out after {options['timeoutSeconds']} seconds")
+                    state.update(status="Cancelling", message=f"Run timed out after {state['timeoutSeconds']} seconds")
                     save(directory, state)
-            if reason is not None and escalation is None:
-                escalation = time.monotonic() + 5
-                kill_group(process, signal.SIGTERM)
-            if escalation is not None and time.monotonic() >= escalation:
-                kill_group(process, signal.SIGKILL)
-            if process.poll() is not None and drain_deadline is None:
-                # Background descendants must stop producing output before the
-                # final result is recorded. PID 1's init reaps orphaned children.
-                kill_group(process, signal.SIGKILL)
-                drain_deadline = time.monotonic() + 1
-            if drain_deadline is not None and time.monotonic() >= drain_deadline:
-                # A descendant that escaped the process group may still hold
-                # the pipe open. It must not keep the supervisor alive forever.
-                break
-    process.stdout.close()
+            next_check = time.monotonic() + 0.1
+        if reason is not None and escalation is None:
+            escalation = time.monotonic() + 5
+            kill_group(process, signal.SIGTERM)
+        if escalation is not None and time.monotonic() >= escalation:
+            kill_group(process, signal.SIGKILL)
+        if process.poll() is not None and drain_deadline is None:
+            # Background descendants must stop producing output before the
+            # final result is recorded. PID 1's init reaps orphaned children.
+            kill_group(process, signal.SIGKILL)
+            drain_deadline = time.monotonic() + 1
+        if drain_deadline is not None and time.monotonic() >= drain_deadline:
+            # A descendant that escaped the process group may still hold
+            # the pipe open. It must not keep the supervisor alive forever.
+            break
     return reason
 
 
@@ -237,30 +298,54 @@ def supervise(directory, command, options):
             prune(options)
 
 
+def tombstoned(run_id):
+    try:
+        return (ROOT / ".deleted" / run_id).stat().st_mtime >= time.time() - TOMBSTONE_TTL
+    except FileNotFoundError:
+        return False
+
+
 def erase(directory):
     state = read_state(directory)
     if state["status"] in LIVE:
         raise RunError(409, "cancel the run and wait for it to finish before deleting it")
+    tombstones = ROOT / ".deleted"
+    tombstones.mkdir(exist_ok=True)
+    (tombstones / state["id"]).touch()
+    shutil.rmtree(directory)
+
+
+def evict_logs(directory):
+    state = read_state(directory)
+    if state["status"] in LIVE:
+        return
+    _, end, _ = log_window(directory, state)
+    # Record the absolute end before removing segments. A crash during removal
+    # still leaves a readable result and a truthful empty retained window.
+    state.update(logsEvicted=True, logBytes=end)
+    save(directory, state)
     if (directory / "logs").exists():
         shutil.rmtree(directory / "logs")
-    (directory / "output.log").unlink(missing_ok=True)
-    # Keep a small tombstone so a retried POST can never execute a deleted ID.
-    save(directory, {"id": state["id"], "deleted": True, "deletedAt": now()})
 
 
 def visible_runs():
     for directory in ROOT.glob("*/"):
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", directory.name):
+            continue
         if not (directory / "state.json").is_file():
             continue
         try:
             with locked(directory):
                 yield directory, read_state(directory)
         except RunError as error:
-            if error.code not in (404, 410):
+            if error.code not in (404, 410, 422):
                 raise
 
 
 def prune(options):
+    for tombstone in (ROOT / ".deleted").glob("*"):
+        if tombstone.stat().st_mtime < time.time() - TOMBSTONE_TTL:
+            tombstone.unlink()
     terminal = []
     cutoff = time.time() - options["retentionSeconds"]
     for directory, state in visible_runs():
@@ -283,7 +368,7 @@ def prune(options):
         if total <= options["completedLogBudgetBytes"]:
             break
         with locked(directory):
-            erase(directory)
+            evict_logs(directory)
         total -= size
 
 
@@ -292,7 +377,7 @@ def launch(directory, run_id, command, options, collection_lock):
     with locked(directory) as lock:
         if (directory / "state.json").exists():
             state = read_state(directory)
-            if state["command"] != command or state.get("requestedTimeoutSeconds", 0) != options["requestedTimeoutSeconds"]:
+            if state["command"] != command or state["requestedTimeoutSeconds"] != options["requestedTimeoutSeconds"]:
                 raise RunError(409, "run ID already belongs to a different command or timeout")
             return public(directory, state)
         (directory / "logs").mkdir()
@@ -334,22 +419,6 @@ def active_runs():
     return any(state["status"] in LIVE for _, state in visible_runs())
 
 
-def other_activity():
-    if any(file.name.isdigit() for file in Path("/dev/pts").iterdir()):
-        return True
-    for file in Path("/proc").glob("[0-9]*/stat"):
-        pid = int(file.parent.name)
-        if pid in (1, os.getpid()):
-            continue
-        try:
-            fields = file.read_text().rsplit(")", 1)[1].split()
-        except FileNotFoundError:
-            continue
-        if fields[0] != "Z" and fields[1] == "0":
-            return True
-    return False
-
-
 def stream_log(directory, offset, end, follow, duration):
     deadline = time.monotonic() + duration
     result = {}
@@ -382,8 +451,10 @@ def stream_log(directory, offset, end, follow, duration):
 
 def main():
     action = sys.argv[3]
-    if action in ("active", "active-runs"):
-        return {"active": active_runs() or (action == "active" and other_activity())}
+    if action not in ("active", "list", "create", "get", "delete", "stream", "cancel"):
+        raise RunError(400, "unknown runner action")
+    if action == "active":
+        return {"active": active_runs()}
     if action == "list":
         runs = [public(directory, state) for directory, state in visible_runs()]
         runs.sort(key=lambda run: (datetime.datetime.fromisoformat(run["startedAt"]).timestamp(), run["id"]), reverse=True)
@@ -395,23 +466,23 @@ def main():
     directory = ROOT / run_id
     if action == "create":
         options = json.loads(sys.argv[6])
+        options["maxLogBytes"] = min(options["maxLogBytes"], options["completedLogBudgetBytes"])
         ROOT.mkdir(parents=True, exist_ok=True)
         with locked(ROOT) as collection_lock:
-            # Check for an existing/tombstoned ID before GC, so even a retry of
-            # an expired run cannot accidentally become a fresh execution.
+            if tombstoned(run_id):
+                raise RunError(410, "run was deleted or expired; use a new ID for a new command")
             if not (directory / "state.json").exists():
                 prune(options)
             return {"run": launch(directory, run_id, sys.argv[5], options, collection_lock)}
-    if not directory.is_dir():
-        raise RunError(404, "run not found")
     if action == "delete":
-        with locked(ROOT), locked(directory):
-            try:
+        with locked(ROOT):
+            if tombstoned(run_id) and not directory.is_dir():
+                return {}
+            with locked(directory):
                 erase(directory)
-            except RunError as error:
-                if error.code != 410:
-                    raise
         return {}
+    if not directory.is_dir():
+        raise missing_run(directory)
     if action == "stream":
         stream_log(directory, int(sys.argv[5]), int(sys.argv[6]), sys.argv[7] == "true", float(sys.argv[8]))
         return None
@@ -420,11 +491,7 @@ def main():
         if action == "cancel" and state["status"] in LIVE:
             state["status"] = "Cancelling"
             save(directory, state)
-        result = {"run": public(directory, state)}
-        if action == "logs":
-            offset, data = read_log(directory, state, int(sys.argv[5]))
-            result.update(offset=offset, data=base64.b64encode(data).decode("ascii"))
-        return result
+        return {"run": public(directory, state)}
 
 
 try:
@@ -434,3 +501,6 @@ try:
 except RunError as error:
     output = sys.stderr if sys.argv[3] == "stream" else sys.stdout
     print(json.dumps({"code": error.code, "error": str(error)}), file=output, flush=True)
+except Exception as error:
+    output = sys.stderr if sys.argv[3] == "stream" else sys.stdout
+    print(json.dumps({"code": 500, "error": f"{type(error).__name__}: {error}"}), file=output, flush=True)

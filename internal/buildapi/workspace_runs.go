@@ -26,7 +26,6 @@ import (
 type workspaceRunResult struct {
 	Run   buildcontract.WorkspaceRun   `json:"run"`
 	Runs  []buildcontract.WorkspaceRun `json:"runs"`
-	Data  []byte                       `json:"data"`
 	Code  int                          `json:"code"`
 	Error string                       `json:"error"`
 }
@@ -205,6 +204,10 @@ func (a *APIServer) workspaceRunLogs(c *gin.Context, name string) {
 	if duration <= 0 {
 		duration = 120 * time.Minute
 	}
+	helperDuration := duration
+	if follow {
+		helperDuration = min(duration, 40*time.Second)
+	}
 	ctx, cancel := context.WithTimeout(c.Request.Context(), duration)
 	defer cancel()
 	result, err := a.runWorkspaceOperation(ctx, cfg, ws, "get", c.Param("run"))
@@ -221,17 +224,14 @@ func (a *APIServer) workspaceRunLogs(c *gin.Context, name string) {
 	c.Header("X-Accel-Buffering", "no")
 	c.Header("X-Content-Type-Options", "nosniff")
 	c.Header("X-Log-Offset", strconv.FormatInt(offset, 10))
+	c.Header("X-Log-Stream-Seconds", strconv.FormatFloat(helperDuration.Seconds(), 'f', -1, 64))
 	c.Header("Trailer", "X-Log-Error, X-Run-Status, X-Run-Exit-Code")
 	c.Writer.Flush()
 	var stderr bytes.Buffer
 	// One persistent pod exec streams raw bytes. Polling the local volume happens
 	// in the pod, and never holds a run lock while waiting for HTTP backpressure.
-	// Bound the helper itself below the CLI's 45s rotation: closing a remote exec
-	// stream does not reliably terminate its process in every container runtime.
-	helperDuration := duration
-	if follow {
-		helperDuration = min(duration, 40*time.Second)
-	}
+	// The advertised cap bounds idle helpers even when a remote exec disconnect
+	// does not terminate its process. Clients allow a grace period beyond it.
 	err = a.exec.stream(ctx, cfg, ws.Namespace, ws.Status.PodName, workspaceContainerName,
 		workspacerun.Command("stream", c.Param("run"), strconv.FormatInt(offset, 10),
 			strconv.FormatInt(result.Run.LogBytes, 10), strconv.FormatBool(follow),
@@ -261,16 +261,13 @@ func (a *APIServer) workspaceRunLogs(c *gin.Context, name string) {
 func workspaceRunExecFailure(err error) (int, string) {
 	detail := err.Error()
 	if len(detail) > 1024 {
-		detail = detail[:1024]
+		detail = detail[len(detail)-1024:]
 	}
 	if k8serrors.IsForbidden(err) {
 		return http.StatusForbidden, "workspace execution is not permitted: " + detail
 	}
-	lower := strings.ToLower(detail)
 	var exitError kexec.ExitError
-	if errors.As(err, &exitError) || strings.Contains(lower, "executable file not found") ||
-		strings.Contains(lower, "exec format error") || strings.Contains(lower, "permission denied") ||
-		(strings.Contains(lower, "python3") && (strings.Contains(lower, "not found") || strings.Contains(lower, "no such file"))) {
+	if errors.As(err, &exitError) && (exitError.ExitStatus() == 126 || exitError.ExitStatus() == 127) {
 		return http.StatusUnprocessableEntity, "workspace run helper could not execute; the image requires an executable Python 3.9 or newer: " + detail
 	}
 	return http.StatusBadGateway, "workspace run operation failed: " + detail

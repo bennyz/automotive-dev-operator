@@ -35,7 +35,8 @@ type WorkspaceExecRequest struct {
 
 // WorkspaceRunRequest creates a durable command. Reusing ID with the same
 // command and requested timeout is idempotent, including after an ambiguous
-// network failure. Deleted IDs cannot be reused.
+// network failure. Use a fresh ID for every new command; deleted IDs are retained
+// for a 24-hour retry window, after which idempotency is no longer guaranteed.
 type WorkspaceRunRequest struct {
 	ID             string `json:"id,omitempty"`
 	Command        string `json:"command"`
@@ -54,6 +55,7 @@ type WorkspaceRun struct {
 	LogBytes       int64  `json:"logBytes"`       // Absolute end offset, including discarded output.
 	LogStartOffset int64  `json:"logStartOffset"` // Absolute offset of the first retained byte.
 	LogTruncated   bool   `json:"logTruncated"`
+	LogsEvicted    bool   `json:"logsEvicted"` // The log budget removed output; the result is retained.
 	TimeoutSeconds int64  `json:"timeoutSeconds"`
 	Message        string `json:"message,omitempty"`
 }

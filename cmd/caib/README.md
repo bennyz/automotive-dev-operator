@@ -1016,13 +1016,17 @@ default; reaching the cap never stops the command. `logStartOffset` identifies
 the first retained byte, `logBytes` is the absolute end offset (including
 discarded bytes), and `logTruncated` reports whether earlier bytes were dropped.
 The CLI reports skipped bytes on stderr when resuming behind the retained tail.
-Physical log storage has at most 1 MiB of segment overhead per run.
+Live log storage has at most 1 MiB of segment overhead per run; completion trims
+that overhead. The per-log cap is also limited to the completed-log budget.
 
 Terminal runs expire after **7 days**. Completed logs share a budget of
 **min(1 GiB, 10% of the PVC capacity)**. Creation and completion prune expired
-records and then evict the oldest terminal runs until the budget is met. Live
-runs are never evicted. Deletion and eviction leave only a small ID tombstone,
-preventing an old create retry from executing the command again.
+records and then remove the oldest completed logs until the budget is met. Log
+eviction sets `logsEvicted: true` and advances `logStartOffset` to `logBytes`;
+the result and exit code remain available until retention expires. Live runs
+are never evicted. Explicit deletion and retention leave a small ID tombstone
+for 24 hours to protect create retries, after which creation/completion can
+remove it. Use a fresh, single-use ID for each new command.
 
 Operators configure these defaults under `OperatorConfig.spec.workspaces`;
 only the timeout is configurable per run. Changes apply to newly created runs:
@@ -1044,15 +1048,16 @@ Workspace images must provide Python 3.9 or newer and Linux `/proc` for runs.
 The default toolchain uses catatonit as PID 1 to reap orphaned supervisors and
 children; custom images must provide an init that reaps children too. Existing
 pods need the updated toolchain image and a restart to receive this init change.
-Images without Python receive an actionable error for runs; their legacy
-exec/terminal activity still participates in auto-pause detection.
+Images without Python receive an actionable error for runs; their exec/terminal
+activity still participates in auto-pause detection. The helper uses isolated
+Python imports, so workspace files and `PYTHON*` variables cannot replace its
+standard library. Unreadable run records return an explicit error when inspected
+and are skipped by collection and activity checks.
 
 **Behavior changes:** `caib workspace exec` now exits non-zero when the command
-fails, and Ctrl-C detaches instead of stopping the remote command. On older
-servers that return 404 for `/runs`, ordinary synchronous exec falls back to
-`/exec` with a warning that the exit code and reattachment are unavailable.
-`--detach`, `--timeout` and `--run` require a server with durable-run support.
-An ambiguous create failure never triggers a legacy fallback.
+fails, and Ctrl-C detaches instead of stopping the remote command. This CLI
+requires a server with durable-run support. If `/runs` is unavailable, it reports
+that the operator must be upgraded or a caib version matching the operator used.
 
 API clients can use these owner-scoped endpoints:
 
@@ -1066,17 +1071,20 @@ API clients can use these owner-scoped endpoints:
 | `DELETE /v1/workspaces/{name}/runs/{id}` | Deletes a terminal run and its log; repeated requests are safe. |
 
 Reuse a client-supplied ID, command and requested timeout to retry creation after
-losing the response. A different payload with that ID returns HTTP 409; an
-evicted or deleted ID returns 410. Resume logs by adding the number of received
+losing the response. A different payload with that ID returns HTTP 409; a
+deleted or expired ID returns 410 during its 24-hour tombstone window. Budget
+eviction only removes logs and does not change the run's status. Resume logs by adding the number of received
 bytes to the **`X-Log-Offset` response header**, which advances requests below
 `logStartOffset` to the retained tail. Omitting `follow`
-returns a snapshot; following ends on completion or after at most 40 seconds
-(also bounded by the configured stream limit) and can be reopened. Offsets
-beyond available output return HTTP 416.
+returns a snapshot; following ends on completion or at the cap announced in
+`X-Log-Stream-Seconds` (currently at most 40 seconds) and can be reopened. The CLI
+allows five seconds beyond that cap before reconnecting, with a 40-second cap
+as its fallback when the header is absent. Offsets beyond available output
+return HTTP 416.
 Follow uses a persistent pod exec. If rotation overtakes a reader, the response
 ends with an `X-Log-Error` trailer; reconnect to receive the new starting offset.
 Final `X-Run-Status` and `X-Run-Exit-Code` trailers supplement GET on the run.
-The legacy `/exec` endpoint remains available for older clients.
+The `/exec` endpoint remains available for older clients and the CLI build flow.
 
 ### workspace shell
 

@@ -1209,7 +1209,8 @@ spec:
                     default: 1024
                     description: |-
                       RunCompletedLogBudgetMiB bounds completed logs, additionally capped at 10%
-                      of the workspace PVC. Oldest terminal runs are evicted first.
+                      of the workspace PVC. Oldest terminal logs are evicted first; their result
+                      records remain until RunRetentionDays expires. Live logs are never evicted.
                     format: int32
                     minimum: 1
                     type: integer
@@ -1223,8 +1224,9 @@ spec:
                     type: integer
                   runMaxLogSizeMiB:
                     default: 100
-                    description: RunMaxLogSizeMiB bounds each retained log tail; commands
-                      continue when full.
+                    description: |-
+                      RunMaxLogSizeMiB bounds each retained log tail; commands continue when full.
+                      The effective cap cannot exceed the workspace's completed-log budget.
                     format: int32
                     minimum: 1
                     type: integer
