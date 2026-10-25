@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -26,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/remotecommand"
+	kexec "k8s.io/client-go/util/exec"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
@@ -47,6 +49,7 @@ func runTestServer(t *testing.T, root, owner string, stopped bool) (*APIServer, 
 	a := newTestServer(t, func(deps *apiDependencies) {
 		deps.getClientFromRequest = func(*gin.Context) (client.Client, error) { return kube, nil }
 		deps.getRESTConfigFromRequest = func(*gin.Context) (*rest.Config, error) { return &rest.Config{}, nil }
+		deps.loadOperatorConfig = loadOperatorConfig
 	})
 	calls := &atomic.Int32{}
 	a.exec.newExecutor = func(_ *rest.Config, namespace, pod, container string, argv []string) (remotecommand.Executor, error) {
@@ -66,10 +69,138 @@ func runTestServer(t *testing.T, root, owner string, stopped bool) (*APIServer, 
 	router := gin.New()
 	router.Use(func(c *gin.Context) { c.Set("requester", "alice"); c.Next() })
 	router.POST("/v1/workspaces/:name/runs", a.wrapNamedHandler("create run", a.createWorkspaceRun))
+	router.GET("/v1/workspaces/:name/runs", a.wrapNamedHandler("list runs", a.listWorkspaceRuns))
+	router.DELETE("/v1/workspaces/:name/runs/:run", a.wrapNamedHandler("delete run", a.deleteWorkspaceRun))
 	router.GET("/v1/workspaces/:name/runs/:run", a.wrapNamedHandler("get run", a.getWorkspaceRun))
 	router.GET("/v1/workspaces/:name/runs/:run/logs", a.wrapNamedHandler("run logs", a.workspaceRunLogs))
 	router.POST("/v1/workspaces/:name/runs/:run/cancel", a.wrapNamedHandler("cancel run", a.cancelWorkspaceRun))
 	return a, router, calls
+}
+
+func TestWorkspaceRunPermanentExecFailureIsActionable(t *testing.T) {
+	a, router, _ := runTestServer(t, t.TempDir(), "alice", false)
+	a.exec.newExecutor = func(*rest.Config, string, string, string, []string) (remotecommand.Executor, error) {
+		return &fakeRemoteExecutor{streamWithContextFn: func(_ context.Context, opts remotecommand.StreamOptions) error {
+			_, _ = io.WriteString(opts.Stderr, `exec: "python3": executable file not found in $PATH`)
+			return kexec.CodeExitError{Err: errors.New("command terminated with exit code 127"), Code: 127}
+		}}, nil
+	}
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/workspaces/dev/runs", strings.NewReader(`{"id":"run","command":"true"}`)))
+	if rec.Code != http.StatusUnprocessableEntity || !strings.Contains(rec.Body.String(), "Python 3.9") || !strings.Contains(rec.Body.String(), "executable file not found") {
+		t.Fatalf("permanent launch failure: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestWorkspaceRunFollowUsesPersistentExecAndStatusTrailers(t *testing.T) {
+	_, router, calls := runTestServer(t, t.TempDir(), "alice", false)
+	server := httptest.NewServer(router)
+	defer server.Close()
+	api, err := buildapiclient.New(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, err = api.CreateWorkspaceRun(ctx, "dev", buildcontract.WorkspaceRunRequest{ID: "stream", Command: "printf first; sleep 1.2; printf second; sleep 1.2; printf last; exit 7"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream, err := api.WorkspaceRunLogs(ctx, "dev", "stream", true, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := io.ReadAll(stream)
+	_ = stream.Close()
+	if err != nil || string(data) != "firstsecondlast" || calls.Load() != 3 || stream.Offset != 0 || stream.Trailers.Get("X-Run-Status") != "Failed" || stream.Trailers.Get("X-Run-Exit-Code") != "7" {
+		t.Fatalf("stream: %q err=%v execs=%d offset=%d trailers=%v", data, err, calls.Load(), stream.Offset, stream.Trailers)
+	}
+}
+
+func TestWorkspaceRunListDeleteAndTruncatedHTTPLog(t *testing.T) {
+	root := t.TempDir()
+	directory := filepath.Join(root, ".runs", "tail")
+	if err := os.MkdirAll(filepath.Join(directory, "logs"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for file, data := range map[string]string{
+		"state.json":                    `{"id":"tail","command":"make","status":"Failed","exitCode":7,"maxLogBytes":10,"startedAt":"2026-01-01T00:00:00+00:00","finishedAt":"2026-01-01T00:01:00+00:00"}`,
+		"logs/00000000000000000000.log": "discarded last error",
+	} {
+		if err := os.WriteFile(filepath.Join(directory, file), []byte(data), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	a, router, _ := runTestServer(t, root, "alice", false)
+	server := httptest.NewServer(router)
+	defer server.Close()
+	api, err := buildapiclient.New(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	runs, err := api.ListWorkspaceRuns(ctx, "dev", 0, 10)
+	if err != nil || len(runs) != 1 || runs[0].ID != "tail" || runs[0].LogStartOffset != 10 || !runs[0].LogTruncated {
+		t.Fatalf("list: %+v %v", runs, err)
+	}
+	stream, err := api.WorkspaceRunLogs(ctx, "dev", "tail", false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := io.ReadAll(stream)
+	_ = stream.Close()
+	if err != nil || stream.Offset != 10 || string(data) != "last error" {
+		t.Fatalf("tail: %q offset=%d err=%v", data, stream.Offset, err)
+	}
+	checkWorkspaceLogRotation(t, a, api, ctx, directory)
+	for range 2 {
+		if err := api.DeleteWorkspaceRun(ctx, "dev", "tail"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if runs, err = api.ListWorkspaceRuns(ctx, "dev", 0, 10); err != nil || len(runs) != 0 {
+		t.Fatalf("deleted run still listed: %+v %v", runs, err)
+	}
+	_, err = api.CreateWorkspaceRun(ctx, "dev", buildcontract.WorkspaceRunRequest{ID: "tail", Command: "true"})
+	var response buildapiclient.HTTPError
+	if !errors.As(err, &response) || response.HTTPStatusCode() != http.StatusGone {
+		t.Fatalf("deleted ID can run again: %v", err)
+	}
+}
+
+func TestWorkspaceRunPolicyFlowsFromOperatorConfig(t *testing.T) {
+	a, router, _ := runTestServer(t, t.TempDir(), "alice", false)
+	a.deps.loadOperatorConfig = func(_ context.Context, _ client.Client, namespace string) (*automotivev1alpha1.OperatorConfig, error) {
+		if namespace != "default" {
+			t.Errorf("wrong config namespace: %s", namespace)
+		}
+		return &automotivev1alpha1.OperatorConfig{Spec: automotivev1alpha1.OperatorConfigSpec{Workspaces: &automotivev1alpha1.WorkspacesConfig{
+			RunDefaultTimeoutMinutes: 10, RunMaxTimeoutMinutes: 20, RunMaxLogSizeMiB: 5, RunRetentionDays: 3, RunCompletedLogBudgetMiB: 200,
+		}}}, nil
+	}
+	a.exec.newExecutor = func(_ *rest.Config, _, _, _ string, argv []string) (remotecommand.Executor, error) {
+		return &fakeRemoteExecutor{streamWithContextFn: func(_ context.Context, opts remotecommand.StreamOptions) error {
+			var options map[string]int64
+			if err := json.Unmarshal([]byte(argv[len(argv)-1]), &options); err != nil {
+				return err
+			}
+			for key, want := range map[string]int64{"timeoutSeconds": 90, "requestedTimeoutSeconds": 90, "maxLogBytes": 5 << 20, "retentionSeconds": 3 * 86400, "completedLogBudgetBytes": 200 << 20} {
+				if options[key] != want {
+					t.Errorf("%s: got %d, want %d", key, options[key], want)
+				}
+			}
+			_, err := fmt.Fprint(opts.Stdout, `{"run":{"id":"policy","status":"Running","timeoutSeconds":90}}`)
+			return err
+		}}, nil
+	}
+	rec := httptest.NewRecorder()
+	// Only timeout is user-controlled; unknown retention/log fields cannot
+	// override the operator policy even if a hand-written client supplies them.
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/workspaces/dev/runs", strings.NewReader(`{"id":"policy","command":"true","timeoutSeconds":90,"maxLogBytes":99999999,"retentionSeconds":99999999}`)))
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("policy create: %d %s", rec.Code, rec.Body.String())
+	}
 }
 
 func TestWorkspaceRunHTTPDisconnectAndAPIRecreation(t *testing.T) {
@@ -139,6 +270,8 @@ func TestWorkspaceRunHTTPDisconnectAndAPIRecreation(t *testing.T) {
 func TestWorkspaceRunAuthorizationAndValidation(t *testing.T) {
 	requests := []struct{ method, path, body string }{
 		{http.MethodPost, "/v1/workspaces/dev/runs", `{"id":"run","command":"echo hello"}`},
+		{http.MethodGet, "/v1/workspaces/dev/runs", ""},
+		{http.MethodDelete, "/v1/workspaces/dev/runs/run", ""},
 		{http.MethodGet, "/v1/workspaces/dev/runs/run", ""},
 		{http.MethodGet, "/v1/workspaces/dev/runs/run/logs?follow&offset=0", ""},
 		{http.MethodPost, "/v1/workspaces/dev/runs/run/cancel", ""},
@@ -169,6 +302,9 @@ func TestWorkspaceRunAuthorizationAndValidation(t *testing.T) {
 		{http.MethodGet, "/v1/workspaces/dev/runs/run/logs?offset=-1", ""},
 		{http.MethodGet, "/v1/workspaces/dev/runs/run/logs?offset=no", ""},
 		{http.MethodGet, "/v1/workspaces/dev/runs/run/logs?follow=nope", ""},
+		{http.MethodGet, "/v1/workspaces/dev/runs?limit=101", ""},
+		{http.MethodGet, "/v1/workspaces/dev/runs?offset=-1", ""},
+		{http.MethodPost, "/v1/workspaces/dev/runs", `{"command":"true","timeoutSeconds":86401}`},
 	} {
 		rec := httptest.NewRecorder()
 		router.ServeHTTP(rec, httptest.NewRequest(request.method, request.path, strings.NewReader(request.body)))
@@ -220,7 +356,7 @@ func TestWorkspaceRunRequiresActivityReservation(t *testing.T) {
 	requests := 0
 	a.deps.getClientFromRequest = func(c *gin.Context) (client.Client, error) {
 		requests++
-		if requests == 2 {
+		if requests == 3 {
 			return nil, errors.New("API unavailable while recording activity")
 		}
 		return getClient(c)
@@ -265,5 +401,40 @@ func TestWorkspaceRunLogSnapshotAndOffsets(t *testing.T) {
 		if rec.Code != status {
 			t.Errorf("%s: %d %s", path, rec.Code, rec.Body.String())
 		}
+	}
+}
+
+func checkWorkspaceLogRotation(t *testing.T, a *APIServer, api *buildapiclient.Client, ctx context.Context, directory string) {
+	t.Helper()
+	// Force retention to advance between the API's preflight and the streaming
+	// exec. The first response must stop rather than silently skipping bytes.
+	newExecutor := a.exec.newExecutor
+	rotated := false
+	a.exec.newExecutor = func(cfg *rest.Config, ns, pod, container string, argv []string) (remotecommand.Executor, error) {
+		if argv[5] == "stream" && !rotated {
+			rotated = true
+			if err := os.WriteFile(filepath.Join(directory, "logs", "00000000000000000000.log"), []byte("discarded last errorFINAL TAIL"), 0o600); err != nil {
+				return nil, err
+			}
+		}
+		return newExecutor(cfg, ns, pod, container, argv)
+	}
+	stream, err := api.WorkspaceRunLogs(ctx, "dev", "tail", true, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := io.ReadAll(stream)
+	_ = stream.Close()
+	if err != nil || len(data) != 0 || stream.Offset != 10 || !strings.Contains(stream.Trailers.Get("X-Log-Error"), "tail advanced") {
+		t.Fatalf("rotation gap was hidden: %q offset=%d trailers=%v err=%v", data, stream.Offset, stream.Trailers, err)
+	}
+	stream, err = api.WorkspaceRunLogs(ctx, "dev", "tail", true, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err = io.ReadAll(stream)
+	_ = stream.Close()
+	if err != nil || stream.Offset != 20 || string(data) != "FINAL TAIL" {
+		t.Fatalf("rotation resume: %q offset=%d err=%v", data, stream.Offset, err)
 	}
 }

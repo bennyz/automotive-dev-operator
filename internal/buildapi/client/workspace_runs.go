@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -71,9 +72,18 @@ func (c *Client) CancelWorkspaceRun(ctx context.Context, name, id string) (*buil
 	return c.workspaceRunResult(req)
 }
 
-// WorkspaceRunLogs reads unmodified log bytes from offset. Callers resume by
-// adding the number of bytes consumed, including partial reads before an error.
-func (c *Client) WorkspaceRunLogs(ctx context.Context, name, id string, follow bool, offset int64) (io.ReadCloser, error) {
+// WorkspaceRunLogStream reports the actual absolute start offset, which may
+// advance past the requested offset when the retained tail has been truncated.
+// Trailers are populated when Read reaches EOF.
+type WorkspaceRunLogStream struct {
+	io.ReadCloser
+	Offset   int64
+	Trailers http.Header
+}
+
+// WorkspaceRunLogs reads unmodified log bytes. Resume from stream.Offset plus
+// the number of bytes consumed, including partial reads before an error.
+func (c *Client) WorkspaceRunLogs(ctx context.Context, name, id string, follow bool, offset int64) (*WorkspaceRunLogStream, error) {
 	req, err := c.workspaceRunRequest(ctx, http.MethodGet, name, id, "logs", nil)
 	if err != nil {
 		return nil, err
@@ -86,5 +96,49 @@ func (c *Client) WorkspaceRunLogs(ctx context.Context, name, id string, follow b
 	if err != nil {
 		return nil, err
 	}
-	return resp.Body, nil
+	if value := resp.Header.Get("X-Log-Offset"); value != "" {
+		actual, err := strconv.ParseInt(value, 10, 64)
+		if err != nil || actual < offset {
+			closeBody(resp)
+			return nil, fmt.Errorf("invalid workspace log offset %q", value)
+		}
+		offset = actual
+	}
+	return &WorkspaceRunLogStream{ReadCloser: resp.Body, Offset: offset, Trailers: resp.Trailer}, nil
+}
+
+// ListWorkspaceRuns returns retained runs, newest first, with bounded pagination.
+func (c *Client) ListWorkspaceRuns(ctx context.Context, name string, offset, limit int) ([]buildcontract.WorkspaceRun, error) {
+	req, err := c.workspaceRunRequest(ctx, http.MethodGet, name, "", "", nil)
+	if err != nil {
+		return nil, err
+	}
+	query := req.URL.Query()
+	query.Set("offset", strconv.Itoa(offset))
+	query.Set("limit", strconv.Itoa(limit))
+	req.URL.RawQuery = query.Encode()
+	resp, err := c.doRequest(req, "list workspace runs", statusIn(http.StatusOK))
+	if err != nil {
+		return nil, err
+	}
+	defer closeBody(resp)
+	var runs []buildcontract.WorkspaceRun
+	if err := json.NewDecoder(resp.Body).Decode(&runs); err != nil {
+		return nil, err
+	}
+	return runs, nil
+}
+
+// DeleteWorkspaceRun removes a terminal run's command, result and log.
+func (c *Client) DeleteWorkspaceRun(ctx context.Context, name, id string) error {
+	req, err := c.workspaceRunRequest(ctx, http.MethodDelete, name, id, "", nil)
+	if err != nil {
+		return err
+	}
+	resp, err := c.doRequest(req, "delete workspace run", statusIn(http.StatusNoContent))
+	if err != nil {
+		return err
+	}
+	closeBody(resp)
+	return nil
 }

@@ -1205,6 +1205,44 @@ spec:
                           More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
                         type: object
                     type: object
+                  runCompletedLogBudgetMiB:
+                    default: 1024
+                    description: |-
+                      RunCompletedLogBudgetMiB bounds completed logs, additionally capped at 10%
+                      of the workspace PVC. Oldest terminal runs are evicted first.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  runDefaultTimeoutMinutes:
+                    default: 120
+                    description: RunDefaultTimeoutMinutes bounds commands without
+                      a per-run timeout.
+                    format: int32
+                    maximum: 1440
+                    minimum: 1
+                    type: integer
+                  runMaxLogSizeMiB:
+                    default: 100
+                    description: RunMaxLogSizeMiB bounds each retained log tail; commands
+                      continue when full.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  runMaxTimeoutMinutes:
+                    default: 1440
+                    description: RunMaxTimeoutMinutes caps per-run timeout requests,
+                      up to 24 hours.
+                    format: int32
+                    maximum: 1440
+                    minimum: 1
+                    type: integer
+                  runRetentionDays:
+                    default: 7
+                    description: RunRetentionDays retains terminal runs for this many
+                      days.
+                    format: int32
+                    minimum: 1
+                    type: integer
                   storageClass:
                     description: |-
                       StorageClass specifies the storage class for workspace PVCs

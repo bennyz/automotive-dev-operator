@@ -87,6 +87,8 @@ func (a *APIServer) registerWorkspaceRoutes(v1 *gin.RouterGroup) {
 		workspaceGroup.POST("/:name/sync/plan", a.wrapNamedHandler("sync plan workspace", a.syncPlanWorkspace))
 		workspaceGroup.POST("/:name/sync/delete", a.wrapNamedHandler("delete workspace files", a.syncDeleteWorkspace))
 		workspaceGroup.POST("/:name/exec", a.wrapNamedHandler("exec workspace", a.execWorkspace))
+		workspaceGroup.GET("/:name/runs", a.wrapNamedHandler("list workspace runs", a.listWorkspaceRuns))
+		workspaceGroup.DELETE("/:name/runs/:run", a.wrapNamedHandler("delete workspace run", a.deleteWorkspaceRun))
 		workspaceGroup.POST("/:name/runs", a.wrapNamedHandler("create workspace run", a.createWorkspaceRun))
 		workspaceGroup.GET("/:name/runs/:run", a.wrapNamedHandler("get workspace run", a.getWorkspaceRun))
 		workspaceGroup.GET("/:name/runs/:run/logs", a.wrapNamedHandler("workspace run logs", a.workspaceRunLogs))

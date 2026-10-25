@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 
@@ -717,7 +716,7 @@ func (r *Reconciler) getClientset() (kubernetes.Interface, error) {
 func (r *Reconciler) isWorkspaceActive(ctx context.Context, ws *automotivev1alpha1.Workspace) (bool, error) {
 	// Recorded live runs survive detachment from pod exec. Check their supervisor
 	// identities first; stale records from a previous container are not activity.
-	output, err := r.runActivityCommand(ctx, ws, workspacerun.Command("active"))
+	output, err := r.runActivityCommand(ctx, ws, workspacerun.ActivityCommand())
 	if err != nil {
 		return false, err
 	}
@@ -731,25 +730,7 @@ func (r *Reconciler) isWorkspaceActive(ctx context.Context, ws *automotivev1alph
 	if runs.Error != "" {
 		return false, fmt.Errorf("run activity check: %s", runs.Error)
 	}
-	if runs.Active {
-		return true, nil
-	}
-
-	// Detect other user activity via two signals:
-	// 1. Active pts sessions (caib workspace shell connections)
-	// 2. Exec'd processes: in Kubernetes, exec'd processes have PPID=0 inside the
-	//    container PID namespace (their real parent is outside). PID 1 is the
-	//    entrypoint. Any other PPID=0 process (besides this check) is user activity.
-	cmd := []string{"/bin/sh", "-c",
-		`pts=$(ls /dev/pts/ 2>/dev/null | grep -cE '^[0-9]+$'); ` +
-			`if [ "$pts" -gt 0 ]; then echo active; exit 0; fi; ` +
-			`extra=$(ps -eo pid,ppid --no-headers | awk '$1 != 1 && $2 == 0 {c++} END {print c+0}'); ` +
-			`if [ "$extra" -gt 1 ]; then echo active; exit 0; fi; ` +
-			`echo idle`,
-	}
-
-	output, err = r.runActivityCommand(ctx, ws, cmd)
-	return strings.TrimSpace(output) == "active", err
+	return runs.Active, nil
 }
 
 func (r *Reconciler) runActivityCommand(ctx context.Context, ws *automotivev1alpha1.Workspace, cmd []string) (string, error) {

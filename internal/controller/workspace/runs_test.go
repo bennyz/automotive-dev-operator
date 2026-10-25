@@ -25,8 +25,8 @@ func TestActiveRunPreventsAutoPause(t *testing.T) {
 		if target.Namespace != "developer-project" {
 			t.Fatalf("wrong activity target namespace: %s", target.Namespace)
 		}
-		if argv[0] != "python3" || argv[len(argv)-1] != "active" {
-			t.Fatal("live run fell back to ps heuristics")
+		if argv[0] != "/bin/sh" || argv[len(argv)-1] != "active" {
+			t.Fatal("activity check did not use the combined runner")
 		}
 		return `{"active":true}`, nil
 	}
@@ -67,9 +67,6 @@ func TestAutoPauseConflictsWithNewRunActivity(t *testing.T) {
 		t.Fatal(err)
 	}
 	r.execActivity = func(_ context.Context, _ *automotivev1alpha1.Workspace, argv []string) (string, error) {
-		if argv[0] == "python3" {
-			return `{"active":false}`, nil
-		}
 		// Simulate POST /runs updating activity after the controller read idle.
 		current := &automotivev1alpha1.Workspace{}
 		if err := kube.Get(context.Background(), client.ObjectKeyFromObject(ws), current); err != nil {
@@ -81,7 +78,7 @@ func TestAutoPauseConflictsWithNewRunActivity(t *testing.T) {
 		if err := kube.Status().Patch(context.Background(), current, patch); err != nil {
 			return "", err
 		}
-		return "idle", nil
+		return `{"active":false}`, nil
 	}
 	_, err := r.checkAutoPause(context.Background(), ws, logr.Discard())
 	if !k8serrors.IsConflict(err) {

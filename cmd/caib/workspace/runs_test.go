@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -53,9 +55,157 @@ func TestFollowWorkspaceRunResumesPartialReadsAndDrainsTerminalLogs(t *testing.T
 	defer cancel()
 	var output bytes.Buffer
 	var offset int64
-	code, err := followWorkspaceRun(ctx, func(fn func(*buildapiclient.Client) error) error { return fn(api) }, "dev", "run", &offset, &output, time.Millisecond)
+	code, err := followWorkspaceRun(ctx, func(fn func(*buildapiclient.Client) error) error { return fn(api) }, "dev", "run", &offset, &output, io.Discard, time.Millisecond)
 	if err != nil || code != 37 || !bytes.Equal(output.Bytes(), data) || offset != int64(len(data)) || len(offsets) != 2 {
 		t.Fatalf("follow: code=%d err=%v output=%q offset=%d attempts=%v", code, err, output.Bytes(), offset, offsets)
+	}
+}
+
+func TestRunCreationRetriesAreBoundedAndPermanentErrorsVisible(t *testing.T) {
+	for _, tc := range []struct {
+		status, attempts int
+	}{
+		{http.StatusBadGateway, maxRunAttempts},
+		{http.StatusUnprocessableEntity, 1},
+		{http.StatusNotImplemented, 1},
+	} {
+		t.Run(strconv.Itoa(tc.status), func(t *testing.T) {
+			var attempts atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				attempts.Add(1)
+				var request buildcontract.WorkspaceRunRequest
+				if err := json.NewDecoder(r.Body).Decode(&request); err != nil || request.ID != "stable-id" || request.TimeoutSeconds != 90 {
+					t.Errorf("creation changed across retries: %+v, %v", request, err)
+				}
+				w.WriteHeader(tc.status)
+				_, _ = io.WriteString(w, `{"error":"python3 is unavailable in the workspace image"}`)
+			}))
+			defer server.Close()
+			api, err := buildapiclient.New(server.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			legacy, err := startWorkspaceRun(context.Background(), func(fn func(*buildapiclient.Client) error) error { return fn(api) }, "dev", buildcontract.WorkspaceRunRequest{ID: "stable-id", Command: "make", TimeoutSeconds: 90}, true, io.Discard, io.Discard, time.Millisecond)
+			if legacy || err == nil || !strings.Contains(err.Error(), "python3") || int(attempts.Load()) != tc.attempts {
+				t.Fatalf("retry/result: legacy=%v err=%v attempts=%d", legacy, err, attempts.Load())
+			}
+			if tc.attempts > 1 && !strings.Contains(err.Error(), "giving up after 6 attempts") {
+				t.Fatalf("missing bounded-retry diagnostic: %v", err)
+			}
+		})
+	}
+}
+
+func TestRunRetriesBackOffAndRespectCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	var starts []time.Time
+	err := retryRunRequest(ctx, 5*time.Millisecond, func() error {
+		starts = append(starts, time.Now())
+		if len(starts) == 4 {
+			cancel()
+		}
+		return io.ErrUnexpectedEOF
+	})
+	if !errors.Is(err, context.Canceled) || len(starts) != 4 {
+		t.Fatalf("retry cancellation: %v, %d calls", err, len(starts))
+	}
+	for i := 1; i < len(starts); i++ {
+		if delay := starts[i].Sub(starts[i-1]); delay < (5 * time.Millisecond << (i - 1)) {
+			t.Fatalf("retry %d did not back off: %s", i, delay)
+		}
+	}
+}
+
+func TestOldServerFallbackDoesNotRepeatAmbiguousCommands(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		ambiguous, allow bool
+		wantLegacy       int32
+	}{
+		{name: "legacy", allow: true, wantLegacy: 1},
+		{name: "explicit durable options", allow: false},
+		{name: "ambiguous launch", ambiguous: true, allow: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var creates, executions atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if strings.HasSuffix(r.URL.Path, "/runs") {
+					if creates.Add(1) == 1 && tc.ambiguous {
+						w.WriteHeader(502)
+						return
+					}
+					w.WriteHeader(404)
+					return
+				}
+				if r.Method != http.MethodPost || r.URL.Path != "/v1/workspaces/dev/exec" {
+					t.Errorf("unexpected fallback: %s %s", r.Method, r.URL.Path)
+				}
+				executions.Add(1)
+				var request buildcontract.WorkspaceExecRequest
+				if err := json.NewDecoder(r.Body).Decode(&request); err != nil || request.Command != "make" {
+					t.Errorf("legacy request: %+v %v", request, err)
+				}
+				w.Header().Set("Content-Length", "100")
+				_, _ = io.WriteString(w, "partial legacy output")
+			}))
+			defer server.Close()
+			api, err := buildapiclient.New(server.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var output, diagnostics bytes.Buffer
+			legacy, err := startWorkspaceRun(context.Background(), func(fn func(*buildapiclient.Client) error) error { return fn(api) }, "dev", buildcontract.WorkspaceRunRequest{ID: "id", Command: "make"}, tc.allow, &output, &diagnostics, time.Millisecond)
+			if err == nil || executions.Load() != tc.wantLegacy || legacy != (tc.wantLegacy == 1) {
+				t.Fatalf("fallback: legacy=%v err=%v executions=%d", legacy, err, executions.Load())
+			}
+			if legacy && (output.String() != "partial legacy output" || !strings.Contains(diagnostics.String(), "Exit code and reattachment are unavailable")) {
+				t.Fatalf("legacy output/notice: %q %q", output.String(), diagnostics.String())
+			}
+		})
+	}
+}
+
+func TestFollowRunUsesTruncatedOffsetAndPrintsTimeoutMessage(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/logs") {
+			w.Header().Set("X-Log-Offset", "1000")
+			_, _ = io.WriteString(w, "last error\n")
+			return
+		}
+		_, _ = io.WriteString(w, `{"status":"TimedOut","exitCode":124,"logBytes":1011,"logStartOffset":1000,"logTruncated":true,"message":"Run timed out after 7200 seconds"}`)
+	}))
+	defer server.Close()
+	api, err := buildapiclient.New(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var output, diagnostics bytes.Buffer
+	var offset int64
+	code, err := followWorkspaceRun(context.Background(), func(fn func(*buildapiclient.Client) error) error { return fn(api) }, "dev", "run", &offset, &output, &diagnostics, time.Millisecond)
+	if err != nil || code != 124 || offset != 1011 || output.String() != "last error\n" || !strings.Contains(diagnostics.String(), "skipped 1000 bytes") || !strings.Contains(diagnostics.String(), "Run timed out after 7200 seconds") {
+		t.Fatalf("tail/timeout: %d %v offset=%d output=%q diagnostics=%q", code, err, offset, output.String(), diagnostics.String())
+	}
+}
+
+func TestFollowRunGivesUpWhenOnlyLogsFail(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/logs") {
+			requests.Add(1)
+			w.WriteHeader(502)
+			return
+		}
+		_, _ = io.WriteString(w, `{"status":"Running","logBytes":0}`)
+	}))
+	defer server.Close()
+	api, err := buildapiclient.New(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var offset int64
+	_, err = followWorkspaceRun(context.Background(), func(fn func(*buildapiclient.Client) error) error { return fn(api) }, "dev", "run", &offset, io.Discard, io.Discard, time.Millisecond)
+	if err == nil || requests.Load() != maxRunAttempts {
+		t.Fatalf("log retry limit: %v, %d requests", err, requests.Load())
 	}
 }
 
@@ -71,7 +221,7 @@ func TestFollowWorkspaceRunReportsUnavailableExitCode(t *testing.T) {
 		t.Fatal(err)
 	}
 	var offset int64
-	_, err = followWorkspaceRun(context.Background(), func(fn func(*buildapiclient.Client) error) error { return fn(api) }, "dev", "run", &offset, io.Discard, time.Millisecond)
+	_, err = followWorkspaceRun(context.Background(), func(fn func(*buildapiclient.Client) error) error { return fn(api) }, "dev", "run", &offset, io.Discard, io.Discard, time.Millisecond)
 	if err == nil || !strings.Contains(err.Error(), "exit code unavailable") {
 		t.Fatalf("interruption was treated as success: %v", err)
 	}
@@ -80,7 +230,7 @@ func TestFollowWorkspaceRunReportsUnavailableExitCode(t *testing.T) {
 func TestWorkspaceExecExitCode(t *testing.T) {
 	if os.Getenv("CAIB_RUN_EXIT_HELPER") == "1" {
 		cmd := NewWorkspaceCmd(nil)
-		cmd.SetArgs([]string{"exec", "dev", "--server", os.Getenv("CAIB_RUN_TEST_SERVER"), "--token", "test-token", "--", "exit 42"})
+		cmd.SetArgs([]string{"exec", "dev", "--timeout", "90s", "--server", os.Getenv("CAIB_RUN_TEST_SERVER"), "--token", "test-token", "--", "exit 42"})
 		if err := cmd.Execute(); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(99)
@@ -97,7 +247,7 @@ func TestWorkspaceExecExitCode(t *testing.T) {
 				t.Error(err)
 			}
 			creates++
-			if request.ID == "" || (id != "" && id != request.ID) || request.Command != "exit 42" {
+			if request.ID == "" || (id != "" && id != request.ID) || request.Command != "exit 42" || request.TimeoutSeconds != 90 {
 				t.Errorf("invalid or changed create request: %+v", request)
 			}
 			id = request.ID
@@ -111,7 +261,7 @@ func TestWorkspaceExecExitCode(t *testing.T) {
 		case strings.HasSuffix(r.URL.Path, "/logs"):
 			_, _ = io.WriteString(w, "command output\n")
 		default:
-			_, _ = fmt.Fprintf(w, `{"id":%q,"status":"Failed","exitCode":42,"logBytes":15}`, id)
+			_, _ = fmt.Fprintf(w, `{"id":%q,"status":"Failed","exitCode":42,"logBytes":15,"message":"recorded failure detail"}`, id)
 		}
 	}))
 	defer server.Close()
@@ -122,7 +272,56 @@ func TestWorkspaceExecExitCode(t *testing.T) {
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	output, err := cmd.Output()
-	if exit, ok := err.(*exec.ExitError); !ok || exit.ExitCode() != 42 || string(output) != "command output\n" || creates != 2 {
+	if exit, ok := err.(*exec.ExitError); !ok || exit.ExitCode() != 42 || string(output) != "command output\n" || creates != 2 || !strings.Contains(stderr.String(), "recorded failure detail") {
 		t.Fatalf("CLI exit: %v, stdout=%q stderr=%q creates=%d", err, output, stderr.String(), creates)
+	}
+}
+
+func TestWorkspaceExecInterruptPrintsResumeAndCancel(t *testing.T) {
+	if os.Getenv("CAIB_RUN_INTERRUPT_HELPER") == "1" {
+		cmd := NewWorkspaceCmd(nil)
+		cmd.SetArgs([]string{"exec", "dev", "--run", "still-running", "--server", os.Getenv("CAIB_RUN_TEST_SERVER"), "--token", "test-token"})
+		if err := cmd.Execute(); err != nil {
+			os.Exit(99)
+		}
+		return
+	}
+	following := make(chan struct{})
+	var cancellations atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/cancel") {
+			cancellations.Add(1)
+		}
+		if strings.HasSuffix(r.URL.Path, "/logs") {
+			w.WriteHeader(200)
+			w.(http.Flusher).Flush()
+			close(following)
+			<-r.Context().Done()
+			return
+		}
+		_, _ = io.WriteString(w, `{"status":"Running","logBytes":0}`)
+	}))
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestWorkspaceExecInterruptPrintsResumeAndCancel$")
+	cmd.Env = append(os.Environ(), "CAIB_RUN_INTERRUPT_HELPER=1", "CAIB_RUN_TEST_SERVER="+server.URL)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-following:
+		if err := cmd.Process.Signal(os.Interrupt); err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal("CLI did not begin following")
+	}
+	err := cmd.Wait()
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) || exit.ExitCode() != 130 || cancellations.Load() != 0 || !strings.Contains(stderr.String(), "caib workspace exec dev --run still-running --offset 0") || !strings.Contains(stderr.String(), "caib workspace run cancel dev still-running") {
+		t.Fatalf("interrupt: %v, cancellations=%d stderr=%q", err, cancellations.Load(), stderr.String())
 	}
 }

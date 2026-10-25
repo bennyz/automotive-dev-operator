@@ -962,7 +962,8 @@ If no directory is specified, the current directory is used.
 Execute a durable command in `/workspace/src`. Everything after `--` is joined
 as a shell command. Output streams to stdout, and the CLI returns the command's
 exit code. Temporary network failures automatically reconnect at the last
-received byte, without restarting the command or repeating output.
+received byte. Requests use exponential backoff (1–8 seconds) and give up after
+six consecutive failures, printing the run ID and a resume command.
 
 ```bash
 caib workspace exec <name> -- <command...>
@@ -973,54 +974,107 @@ caib workspace exec <name> -- <command...>
 ```bash
 caib workspace exec my-app -- make -j4
 caib workspace exec my-app -- cargo build --release
+caib workspace exec my-app --timeout 4h -- make -j4
 
 # Start without following; prints the run ID
 caib workspace exec my-app --detach -- make -j4
 
-# Reattach after closing the terminal (replays output from the beginning)
+# Reattach after closing the terminal (replays the retained output)
 caib workspace exec my-app --run <run-id>
 
 # Resume from a known byte offset
 caib workspace exec my-app --run <run-id> --offset 4096
 ```
 
-Ctrl-C detaches and prints a resume command with the current offset. It leaves the
-remote command running. To stop the command and its process group, cancel the run:
+Ctrl-C detaches and prints resume and cancel commands. It leaves the remote
+command running until completion, cancellation or timeout. To recover a lost ID,
+inspect the result, stop a command, or remove a completed run:
 
 ```bash
+caib workspace run list my-app
 caib workspace run show my-app <run-id>
 caib workspace run cancel my-app <run-id>
+caib workspace run delete my-app <run-id>
 ```
 
-Both commands return JSON containing the run ID, status, log size, timestamps,
-and exit code when available. Cancellation first sends SIGTERM, then SIGKILL
+List and show return JSON containing status, absolute log offsets, timestamps,
+and exit code when available. List supports `--offset` and `--limit` (1–100),
+ordered newest first. Delete accepts only terminal runs. Cancellation first sends SIGTERM, then SIGKILL
 after five seconds if needed. Runs own their process group; background children
 are stopped when the command finishes. Processes that create their own session
 are outside that group.
 
 Live runs count as activity and prevent auto-pause even with no attached client.
-Output and results are stored in `/workspace/.runs/<id>/output.log` and
-`state.json` on the workspace PVC. Records remain until removed from the volume
-or the workspace is deleted. Manually stopping or replacing the pod interrupts
+Commands default to a **2-hour timeout**, with a **24-hour maximum**. Use
+`--timeout` to request a different duration within the operator's cap. Expiry
+terminates the process group and records `TimedOut`, exit code **124**, and a
+message that the CLI prints to stderr.
+
+Output segments and results are stored in `/workspace/.runs/<id>/logs/` and
+`state.json` on the workspace PVC. Each log retains the **last 100 MiB** by
+default; reaching the cap never stops the command. `logStartOffset` identifies
+the first retained byte, `logBytes` is the absolute end offset (including
+discarded bytes), and `logTruncated` reports whether earlier bytes were dropped.
+The CLI reports skipped bytes on stderr when resuming behind the retained tail.
+Physical log storage has at most 1 MiB of segment overhead per run.
+
+Terminal runs expire after **7 days**. Completed logs share a budget of
+**min(1 GiB, 10% of the PVC capacity)**. Creation and completion prune expired
+records and then evict the oldest terminal runs until the budget is met. Live
+runs are never evicted. Deletion and eviction leave only a small ID tombstone,
+preventing an old create retry from executing the command again.
+
+Operators configure these defaults under `OperatorConfig.spec.workspaces`;
+only the timeout is configurable per run. Changes apply to newly created runs:
+
+```yaml
+spec:
+  workspaces:
+    runDefaultTimeoutMinutes: 120
+    runMaxTimeoutMinutes: 1440  # Cannot exceed 24 hours
+    runRetentionDays: 7
+    runMaxLogSizeMiB: 100
+    runCompletedLogBudgetMiB: 1024  # Also capped at 10% of each PVC
+```
+
+Manually stopping or replacing the pod interrupts
 live commands; after restart they report `Interrupted` with no exit code unless
 one was recorded. Start a stopped workspace before reading retained runs or logs.
-Workspace images must provide Python 3 and Linux `/proc`, as the default
-toolchain image does.
+Workspace images must provide Python 3.9 or newer and Linux `/proc` for runs.
+The default toolchain uses catatonit as PID 1 to reap orphaned supervisors and
+children; custom images must provide an init that reaps children too. Existing
+pods need the updated toolchain image and a restart to receive this init change.
+Images without Python receive an actionable error for runs; their legacy
+exec/terminal activity still participates in auto-pause detection.
+
+**Behavior changes:** `caib workspace exec` now exits non-zero when the command
+fails, and Ctrl-C detaches instead of stopping the remote command. On older
+servers that return 404 for `/runs`, ordinary synchronous exec falls back to
+`/exec` with a warning that the exit code and reattachment are unavailable.
+`--detach`, `--timeout` and `--run` require a server with durable-run support.
+An ambiguous create failure never triggers a legacy fallback.
 
 API clients can use these owner-scoped endpoints:
 
 | Request | Result |
 | --- | --- |
-| `POST /v1/workspaces/{name}/runs` | Accepts `{"command":"make -j4","id":"optional-client-id"}` and returns the run with HTTP 202. |
+| `POST /v1/workspaces/{name}/runs` | Accepts `{"command":"make -j4","id":"optional-client-id","timeoutSeconds":7200}` and returns the run with HTTP 202. |
+| `GET /v1/workspaces/{name}/runs?offset=0&limit=100` | Lists retained runs, newest first. |
 | `GET /v1/workspaces/{name}/runs/{id}` | Returns status and the recorded exit code. |
-| `GET /v1/workspaces/{name}/runs/{id}/logs?follow&offset=0` | Streams raw combined stdout/stderr from a zero-based byte offset. |
+| `GET /v1/workspaces/{name}/runs/{id}/logs?follow&offset=0` | Streams raw combined stdout/stderr from an absolute byte offset. |
 | `POST /v1/workspaces/{name}/runs/{id}/cancel` | Requests cancellation; repeated requests are safe. |
+| `DELETE /v1/workspaces/{name}/runs/{id}` | Deletes a terminal run and its log; repeated requests are safe. |
 
-Reuse a client-supplied ID and the same command to retry creation after losing
-the response. A different command with that ID returns HTTP 409. Resume logs by
-adding the number of received bytes to the requested offset. Omitting `follow`
+Reuse a client-supplied ID, command and requested timeout to retry creation after
+losing the response. A different payload with that ID returns HTTP 409; an
+evicted or deleted ID returns 410. Resume logs by adding the number of received
+bytes to the **`X-Log-Offset` response header**, which advances requests below
+`logStartOffset` to the retained tail. Omitting `follow`
 returns a snapshot; following ends on completion or the configured stream time
 limit and can be reopened. Offsets beyond available output return HTTP 416.
+Follow uses a persistent pod exec. If rotation overtakes a reader, the response
+ends with an `X-Log-Error` trailer; reconnect to receive the new starting offset.
+Final `X-Run-Status` and `X-Run-Exit-Code` trailers supplement GET on the run.
 The legacy `/exec` endpoint remains available for older clients.
 
 ### workspace shell

@@ -34,29 +34,34 @@ type WorkspaceExecRequest struct {
 }
 
 // WorkspaceRunRequest creates a durable command. Reusing ID with the same
-// command is idempotent, including after an ambiguous network failure.
+// command and requested timeout is idempotent, including after an ambiguous
+// network failure. Deleted IDs cannot be reused.
 type WorkspaceRunRequest struct {
-	ID      string `json:"id,omitempty"`
-	Command string `json:"command"`
+	ID             string `json:"id,omitempty"`
+	Command        string `json:"command"`
+	TimeoutSeconds int64  `json:"timeoutSeconds,omitempty"`
 }
 
 // WorkspaceRun records a command and its result on the workspace volume.
 // ExitCode is absent when the command is live or was interrupted without a result.
 type WorkspaceRun struct {
-	ID         string `json:"id"`
-	Command    string `json:"command"`
-	Status     string `json:"status"`
-	ExitCode   *int   `json:"exitCode,omitempty"`
-	StartedAt  string `json:"startedAt"`
-	FinishedAt string `json:"finishedAt,omitempty"`
-	LogBytes   int64  `json:"logBytes"`
-	Message    string `json:"message,omitempty"`
+	ID             string `json:"id"`
+	Command        string `json:"command"`
+	Status         string `json:"status"`
+	ExitCode       *int   `json:"exitCode,omitempty"`
+	StartedAt      string `json:"startedAt"`
+	FinishedAt     string `json:"finishedAt,omitempty"`
+	LogBytes       int64  `json:"logBytes"`       // Absolute end offset, including discarded output.
+	LogStartOffset int64  `json:"logStartOffset"` // Absolute offset of the first retained byte.
+	LogTruncated   bool   `json:"logTruncated"`
+	TimeoutSeconds int64  `json:"timeoutSeconds"`
+	Message        string `json:"message,omitempty"`
 }
 
 // Terminal reports whether the run has stopped producing output.
 func (r WorkspaceRun) Terminal() bool {
 	switch r.Status {
-	case "Succeeded", "Failed", "Cancelled", "Interrupted":
+	case "Succeeded", "Failed", "Cancelled", "Interrupted", "TimedOut":
 		return true
 	default:
 		return false
