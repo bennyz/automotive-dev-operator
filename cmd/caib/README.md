@@ -1082,9 +1082,26 @@ activity still participates in auto-pause detection. The helper uses isolated
 Python imports, so workspace files and `PYTHON*` variables cannot replace its
 standard library. The runner and request data travel over pod exec stdin, keeping
 commands and script contents out of Kubernetes exec request URLs.
-Run records use format version 1. Unknown versions return an explicit error and
-prevent auto-pause until a compatible operator can read them; they are never
-silently skipped or pruned. Existing unversioned records use the version 1 layout.
+Run records use format version 1; existing unversioned records use the same layout.
+All future versions must preserve a common envelope: `id`, `version`, `status`,
+`startedAt`, the live supervisor's `pid` and `identity`, and terminal `finishedAt`.
+The current status values and their live/terminal meanings are fixed. Identity
+remains `[boot ID, PID namespace, process start time]`. Records keep the same
+`state.json` location, root-then-run lock order and atomic replacement protocol, and each run
+owns its directory exclusively. Payload changes require a new version and readers
+for older versions; supervisors keep writing the version they started with.
+
+After a rollback, newer records still participate in activity checks and appear
+in `run list` and `run show` with a compatibility message. Finished records can be
+deleted or pruned by age and count. A stale supervisor appears as `Interrupted`
+without rewriting its newer record. Logs, cancellation and retries using that
+record's ID return HTTP 409; fresh IDs still work. Newer log layouts are excluded
+from log-budget eviction until a compatible operator is restored. Command, exit
+code, timeout and log metadata are unavailable for these records; zero or empty
+fields in the response do not describe their payload. An invalid newer envelope
+appears as `Unknown`, without timestamps, and prevents auto-pause and deletion
+without blocking other runs. These entries sort after records with known start
+times. Older readers never rewrite newer records or their logs.
 Unreadable run records return an explicit error when inspected
 and are skipped by collection and activity checks. If the volume cannot persist
 an `Interrupted` transition, reads still report it and activity checks still

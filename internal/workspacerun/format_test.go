@@ -3,7 +3,9 @@
 package workspacerun
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -87,24 +89,184 @@ func TestUnversionedRecordsRemainReadable(t *testing.T) {
 	}
 }
 
-func TestUnknownRecordVersionFailsClosedWithoutMutation(t *testing.T) {
+func TestNewerRunRecordsDoNotBlockWorkspace(t *testing.T) {
 	root, call := localRunner(t)
-	filename := writeTerminalRun(t, root, "future", time.Hour, nil)
-	// A newer format may have entirely different required fields and statuses.
-	const record = `{"version":2,"status":"NewLiveStatus"}`
-	if err := os.WriteFile(filename, []byte(record), 0o600); err != nil {
-		t.Fatal(err)
+	writeTerminalRun(t, root, "known", time.Hour, []byte("known output"))
+	filename, record := writeNewerRun(t, root, newerEnvelope("future", "Failed", 2*time.Hour))
+	if got := call("active"); got.Code != 0 || got.Active {
+		t.Fatalf("finished newer record prevents auto-pause: %+v", got)
 	}
-	for _, args := range [][]string{
-		{"get", "future"}, {"active"}, {"list", "0", "100"}, {"cancel", "future"}, {"delete", "future"},
-		{"create", "new", "true", DefaultOptions().JSON()},
-	} {
-		got := call(args[0], args[1:]...)
-		if got.Code != 409 || !strings.Contains(got.Error, "unsupported run record version 2") {
-			t.Fatalf("%s did not preserve unknown format: %+v", args[0], got)
+	if got := call("get", "future"); got.Code != 0 || got.Run.Status != "Failed" || got.Run.ExitCode != nil || got.Run.Command != "" || !strings.Contains(got.Run.Message, "newer record format") {
+		t.Fatalf("newer record did not expose only lifecycle metadata: %+v", got)
+	}
+	if got := call("list", "0", "100"); got.Code != 0 || len(got.Runs) != 2 || got.Runs[0].ID != "known" || got.Runs[1].ID != "future" || !strings.Contains(got.Runs[1].Message, "newer record format") {
+		t.Fatalf("mixed-version list/order: %+v", got)
+	}
+	options := DefaultOptions()
+	options.CompletedLogBudgetBytes = 1 // Must not interpret or evict opaque newer logs.
+	if got := call("create", "healthy", "printf healthy", options.JSON()); got.Code != 0 {
+		t.Fatalf("newer record blocked unrelated creation: %+v", got)
+	}
+	if run := awaitRun(t, call, "healthy"); run.Status != "Succeeded" {
+		t.Fatalf("unrelated command failed: %+v", run)
+	}
+	for _, args := range [][]string{{"cancel", "future"}, {"create", "future", "echo duplicate > duplicate", options.JSON()}} {
+		if got := call(args[0], args[1:]...); got.Code != 409 || !strings.Contains(got.Error, "compatible operator") {
+			t.Fatalf("%s interpreted an unsupported payload: %+v", args[0], got)
 		}
 	}
-	if data, err := os.ReadFile(filename); err != nil || string(data) != record {
-		t.Fatalf("unknown format overwritten or removed: %s, %v", data, err)
+	argv, input := Command("stream", "future", "0", "0", "false", "1")
+	out, stderr := executeRunner(t, root, argv, input)
+	var result runnerResult
+	if err := json.Unmarshal(stderr, &result); err != nil || result.Code != 409 || len(out) != 0 {
+		t.Fatalf("stream interpreted unsupported logs: stdout=%q stderr=%q decode=%v", out, stderr, err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "duplicate")); !os.IsNotExist(err) {
+		t.Fatalf("newer run ID executed again: %v", err)
+	}
+	assertNewerRecordUnchanged(t, filename, record)
+	if got := call("delete", "future"); got.Code != 0 {
+		t.Fatalf("finished newer record cannot be deleted: %+v", got)
+	}
+	if got := call("get", "future"); got.Code != 410 {
+		t.Fatalf("deleting newer record lost its tombstone: %+v", got)
+	}
+}
+
+func TestNewerRunLivenessAndAmbiguousEnvelopes(t *testing.T) {
+	for _, tc := range []struct {
+		name, wantStatus string
+		active           bool
+		change           func(map[string]any)
+	}{
+		{name: "live", wantStatus: "Running", active: true},
+		{name: "reused PID", wantStatus: "Interrupted", change: func(state map[string]any) { state["identity"] = []string{"old-boot", "old-container", "old-process"} }},
+		{name: "missing PID", wantStatus: "Unknown", active: true, change: func(state map[string]any) { delete(state, "pid") }},
+		{name: "unknown status", wantStatus: "Unknown", active: true, change: func(state map[string]any) { state["status"] = "FutureStatus" }},
+		{name: "missing start", wantStatus: "Unknown", active: true, change: func(state map[string]any) { delete(state, "startedAt") }},
+		{name: "invalid finish", wantStatus: "Unknown", active: true, change: func(state map[string]any) { state["status"], state["finishedAt"] = "Succeeded", "not-a-date" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root, call := localRunner(t)
+			state := newerEnvelope("future", "Running", time.Hour)
+			state["pid"], state["identity"] = os.Getpid(), currentProcessIdentity(t)
+			if tc.change != nil {
+				tc.change(state)
+			}
+			filename, record := writeNewerRun(t, root, state)
+			if got := call("active"); got.Code != 0 || got.Active != tc.active {
+				t.Fatalf("newer run liveness: %+v", got)
+			}
+			if got := call("get", "future"); got.Code != 0 || got.Run.Status != tc.wantStatus || got.Run.ExitCode != nil || !strings.Contains(got.Run.Message, "newer record format") {
+				t.Fatalf("newer envelope status: %+v", got)
+			}
+			if got := call("list", "0", "100"); got.Code != 0 || len(got.Runs) != 1 || got.Runs[0].Status != tc.wantStatus {
+				t.Fatalf("newer envelope not visible: %+v", got)
+			}
+			if got := call("create", "healthy", "true", DefaultOptions().JSON()); got.Code != 0 {
+				t.Fatalf("uncertain record blocked unrelated command: %+v", got)
+			}
+			awaitRun(t, call, "healthy")
+			assertNewerRecordUnchanged(t, filename, record)
+			wantDelete := 0
+			if tc.active {
+				wantDelete = 409
+			}
+			if got := call("delete", "future"); got.Code != wantDelete {
+				t.Fatalf("unsafe or unavailable deletion: %+v", got)
+			}
+		})
+	}
+}
+
+func TestNewerTerminalRecordsRespectRetentionAndCount(t *testing.T) {
+	for _, kind := range []string{"retention", "count"} {
+		t.Run(kind, func(t *testing.T) {
+			root, call := localRunner(t)
+			options := DefaultOptions()
+			age := 8 * 24 * time.Hour
+			if kind == "count" {
+				age, options.MaxRecords = 2*time.Hour, 1
+			}
+			writeNewerRun(t, root, newerEnvelope("old", "Failed", age))
+			writeTerminalRun(t, root, "recent", time.Hour, nil)
+			live := newerEnvelope("live", "Running", 9*24*time.Hour)
+			live["pid"], live["identity"] = os.Getpid(), currentProcessIdentity(t)
+			filename, record := writeNewerRun(t, root, live)
+			if got := call("create", "trigger", "sleep 30", options.JSON()); got.Code != 0 {
+				t.Fatalf("newer record blocked pruning: %+v", got)
+			}
+			t.Cleanup(func() { call("cancel", "trigger"); awaitRun(t, call, "trigger") })
+			if got := call("get", "old"); got.Code != 410 {
+				t.Fatalf("%s did not remove old newer record: %+v", kind, got)
+			}
+			if got := call("get", "recent"); got.Code != 0 || got.Run.ExitCode == nil || *got.Run.ExitCode != 3 {
+				t.Fatalf("%s removed recent result: %+v", kind, got)
+			}
+			assertNewerRecordUnchanged(t, filename, record)
+		})
+	}
+}
+
+func newerEnvelope(id, status string, age time.Duration) map[string]any {
+	state := map[string]any{
+		"version": 2, "id": id, "status": status,
+		"startedAt": time.Now().Add(-age - time.Second).Format(time.RFC3339),
+	}
+	if status != "Running" {
+		state["finishedAt"] = time.Now().Add(-age).Format(time.RFC3339)
+	}
+	return state
+}
+
+func currentProcessIdentity(t *testing.T) []string {
+	t.Helper()
+	boot, err := os.ReadFile("/proc/sys/kernel/random/boot_id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	namespace, err := os.Readlink(fmt.Sprintf("/proc/%d/ns/pid", os.Getpid()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stat, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", os.Getpid()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fields := strings.Fields(string(stat)[strings.LastIndexByte(string(stat), ')')+1:])
+	return []string{strings.TrimSpace(string(boot)), namespace, fields[19]}
+}
+
+func writeNewerRun(t *testing.T, root string, state map[string]any) (string, []byte) {
+	t.Helper()
+	directory := filepath.Join(root, ".runs", state["id"].(string))
+	if err := os.MkdirAll(filepath.Join(directory, "logs"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Payload fields and log layout deliberately conflict with version 1. Only
+	// the envelope is shared, and an older reader must not expose private data.
+	state["command"], state["maxLogBytes"] = map[string]string{"private": "new payload"}, "not-an-integer"
+	state["exitCode"], state["logsEvicted"] = "new result encoding", "new log encoding"
+	data, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	filename := filepath.Join(directory, "state.json")
+	if err := os.WriteFile(filename, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, "logs", "opaque.log"), []byte("new log encoding"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return filename, data
+}
+
+func assertNewerRecordUnchanged(t *testing.T, filename string, want []byte) {
+	t.Helper()
+	if data, err := os.ReadFile(filename); err != nil || !bytes.Equal(data, want) {
+		t.Fatalf("newer record changed: %s, %v", data, err)
+	}
+	if data, err := os.ReadFile(filepath.Join(filepath.Dir(filename), "logs", "opaque.log")); err != nil || string(data) != "new log encoding" {
+		t.Fatalf("newer logs changed: %q, %v", data, err)
 	}
 }

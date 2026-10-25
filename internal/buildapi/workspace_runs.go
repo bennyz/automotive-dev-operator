@@ -211,7 +211,8 @@ func (a *APIServer) workspaceRunLogs(c *gin.Context, name string) {
 	}
 	ctx, cancel := context.WithTimeout(c.Request.Context(), duration)
 	defer cancel()
-	result, err := a.runWorkspaceOperation(ctx, cfg, ws, "get", c.Param("run"))
+	// Check log format support before committing headers or interpreting offsets.
+	result, err := a.runWorkspaceOperation(ctx, cfg, ws, "log-info", c.Param("run"))
 	if a.workspaceRunError(c, result, err) {
 		return
 	}

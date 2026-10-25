@@ -172,6 +172,41 @@ func TestWorkspaceRunExecFailuresPreserveTheirActualCause(t *testing.T) {
 	}
 }
 
+func TestWorkspaceRunNewerFormatsRejectLogsBeforeStreaming(t *testing.T) {
+	for _, tc := range []struct {
+		name, record, status string
+	}{
+		{"terminal", `{"version":2,"id":"future","status":"Failed","startedAt":"2026-01-01T00:00:00Z","finishedAt":"2026-01-01T00:01:00Z","command":{"private":"payload"}}`, "Failed"},
+		{"ambiguous", `{"version":2,"id":"future","status":"FutureStatus"}`, "Unknown"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			directory := filepath.Join(root, ".runs", "future")
+			if err := os.MkdirAll(directory, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(directory, "state.json"), []byte(tc.record), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, router, calls := runTestServer(t, root, "alice", false)
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/workspaces/dev/runs/future", nil))
+			var run buildcontract.WorkspaceRun
+			if err := json.Unmarshal(rec.Body.Bytes(), &run); err != nil || rec.Code != http.StatusOK || run.Status != tc.status || run.ExitCode != nil || !strings.Contains(run.Message, "newer record format") {
+				t.Fatalf("newer run inspection: %d %s, %v", rec.Code, rec.Body.String(), err)
+			}
+			for _, query := range []string{"", "?follow&offset=100"} {
+				before := calls.Load()
+				rec := httptest.NewRecorder()
+				router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/workspaces/dev/runs/future/logs"+query, nil))
+				if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "compatible operator") || rec.Header().Get("X-Log-Offset") != "" || calls.Load()-before != 1 {
+					t.Fatalf("unsupported logs reached offset validation or streaming: %d %s headers=%v calls=%d", rec.Code, rec.Body.String(), rec.Header(), calls.Load()-before)
+				}
+			}
+		})
+	}
+}
+
 func TestWorkspaceRunFollowUsesPersistentExecAndStatusTrailers(t *testing.T) {
 	a, router, calls := runTestServer(t, t.TempDir(), "alice", false)
 	newExecutor := a.exec.newExecutor

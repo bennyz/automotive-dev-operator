@@ -290,8 +290,13 @@ paths:
         retains status and exit code until the age or record count limit is reached.
         The per-log cap cannot exceed the completed-log budget. Pruning runs during creation and
         after completion. Unreadable records are skipped by collection operations.
-        Unsupported record versions return 409 and prevent auto-pause; they are
-        never silently skipped, modified or pruned. The helper program and request
+        Newer record versions expose only their stable lifecycle envelope. They
+        remain listable, participate in activity checks and, when finished, can
+        be deleted or pruned by age/count. Their payloads are never rewritten and
+        their logs are excluded from log-budget eviction. An invalid newer
+        envelope reports Unknown and prevents auto-pause and deletion without
+        blocking unrelated runs. Reusing a newer record's ID returns 409.
+        The helper program and request
         data use pod exec stdin, keeping command contents out of exec request URLs.
         Stale runs report Interrupted even when persisting that transition fails.
         The request body is limited to 128 KiB and the command to 65536 bytes.
@@ -319,7 +324,7 @@ paths:
         "404":
           description: Workspace not found or owned by another user
         "409":
-          description: Workspace is stopped or ID belongs to another command or timeout
+          description: Workspace is stopped, or ID belongs to another command, timeout or unsupported record version
         "410":
           description: Run ID was deleted or expired; use a new ID for a new command
         "422":
@@ -347,6 +352,9 @@ paths:
         Requires workspace ownership. Start a stopped workspace to read its
         retained records. Runs whose supervisor or container disappeared are
         reported as Interrupted without inventing an exit code.
+        Newer formats return lifecycle metadata with a compatibility message;
+        their command, exit code, timeout and log metadata are unavailable.
+        An invalid newer envelope reports Unknown with no timestamps.
       responses:
         "200":
           description: Run status
@@ -373,6 +381,9 @@ paths:
         be deleted; cancel and wait for completion first. Repeated deletion is
         safe during the 24-hour tombstone window. A small ID tombstone protects
         retried creation during that window, then expires. IDs are single-use.
+        Newer records may be deleted only when their stable envelope confirms
+        they are terminal or their supervisor identity is no longer live.
+        Invalid newer envelopes cannot be deleted.
       responses:
         "204":
           description: Run deleted, or already deleted
@@ -381,7 +392,7 @@ paths:
         "404":
           description: Workspace or run not found, or workspace not owned
         "409":
-          description: Run is still live or workspace must be started
+          description: Run is live, its newer envelope is invalid, or workspace must be started
         "422":
           description: Unreadable run record, or the image cannot execute the run helper
   /v1/workspaces/{name}/runs/{run}/logs:
@@ -415,6 +426,7 @@ paths:
         preserves the result record.
         An error after headers is reported by the X-Log-Error trailer. Final
         metadata is available in X-Run-Status and X-Run-Exit-Code trailers.
+        Unsupported record formats return 409 before starting the stream.
       parameters:
         - in: query
           name: follow
@@ -458,7 +470,7 @@ paths:
         "404":
           description: Workspace or run not found, or workspace not owned
         "409":
-          description: Start the workspace to access retained logs
+          description: Workspace must be started or logs require a compatible operator
         "410":
           description: Run was deleted or expired
         "416":
@@ -485,6 +497,7 @@ paths:
         cancellation request. The supervisor sends SIGTERM, escalating to
         SIGKILL after five seconds. Poll the run for its final result. Repeated
         cancellation is safe and does not change an already completed result.
+        Newer record formats return 409 without modifying the record.
       responses:
         "200":
           description: Cancellation requested, or run already finished
@@ -497,7 +510,7 @@ paths:
         "404":
           description: Workspace or run not found, or workspace not owned
         "409":
-          description: Start the workspace to access retained runs
+          description: Workspace must be started or cancellation requires a compatible operator
         "410":
           description: Run was deleted or expired
         "422":
@@ -525,7 +538,12 @@ components:
           description: Positive command timeout within the operator cap; omitted or zero uses the operator default (normally 7200 seconds)
     WorkspaceRun:
       type: object
-      required: [id, command, status, startedAt, logBytes, logStartOffset, logTruncated, logsEvicted, timeoutSeconds]
+      description: |
+        Newer record formats expose only lifecycle metadata with a compatibility
+        message. Empty command and zero timeout/log fields are placeholders, not
+        payload metadata. Unknown indicates an invalid newer envelope; it prevents
+        auto-pause and has no timestamps or exit code.
+      required: [id, command, status, logBytes, logStartOffset, logTruncated, logsEvicted, timeoutSeconds]
       properties:
         id:
           type: string
@@ -533,13 +551,14 @@ components:
           type: string
         status:
           type: string
-          enum: [Starting, Running, Cancelling, Succeeded, Failed, Cancelled, Interrupted, TimedOut]
+          enum: [Starting, Running, Cancelling, Succeeded, Failed, Cancelled, Interrupted, TimedOut, Unknown]
         exitCode:
           type: integer
-          description: Omitted while live or when interrupted without a recorded result; timeout always records 124
+          description: Omitted while live, interrupted without a recorded result, or when the record format is unsupported; a supported timeout records 124
         startedAt:
           type: string
           format: date-time
+          description: Omitted when a newer record's envelope is invalid
         finishedAt:
           type: string
           format: date-time

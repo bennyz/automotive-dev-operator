@@ -716,7 +716,7 @@ func (r *Reconciler) getClientset() (kubernetes.Interface, error) {
 // Returns true if active sessions or build processes are detected.
 func (r *Reconciler) isWorkspaceActive(ctx context.Context, ws *automotivev1alpha1.Workspace) (bool, error) {
 	// Check shell sessions and recorded supervisors. Stale records from a previous
-	// container are not activity; unsupported record formats fail closed.
+	// container are not activity; ambiguous newer envelopes count as activity.
 	command, input := workspacerun.ActivityCommand()
 	output, err := r.runActivityCommand(ctx, ws, command, input)
 	if err != nil {
