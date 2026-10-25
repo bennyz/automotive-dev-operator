@@ -166,6 +166,28 @@ func TestWorkspaceRunFollowUsesPersistentExecAndStatusTrailers(t *testing.T) {
 	}
 }
 
+func TestWorkspaceRunClientReceivesTracebackCause(t *testing.T) {
+	a, router, _ := runTestServer(t, t.TempDir(), "alice", false)
+	const cause = "PermissionError: workspace volume is read-only"
+	a.exec.newExecutor = func(*rest.Config, string, string, string, []string) (remotecommand.Executor, error) {
+		return &fakeRemoteExecutor{streamWithContextFn: func(_ context.Context, opts remotecommand.StreamOptions) error {
+			_, _ = io.WriteString(opts.Stderr, "Traceback (most recent call last):\n"+strings.Repeat("  stack frame\n", 300)+cause)
+			return kexec.CodeExitError{Err: errors.New("command exited"), Code: 1}
+		}}, nil
+	}
+	server := httptest.NewServer(router)
+	defer server.Close()
+	api, err := buildapiclient.New(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = api.CreateWorkspaceRun(context.Background(), "dev", buildcontract.WorkspaceRunRequest{ID: "run", Command: "true"})
+	var response buildapiclient.HTTPError
+	if !errors.As(err, &response) || response.HTTPStatusCode() != 502 || !strings.Contains(err.Error(), cause) {
+		t.Fatalf("client lost actual cause: %v", err)
+	}
+}
+
 func TestWorkspaceRunListDeleteAndTruncatedHTTPLog(t *testing.T) {
 	root := t.TempDir()
 	directory := filepath.Join(root, ".runs", "tail")

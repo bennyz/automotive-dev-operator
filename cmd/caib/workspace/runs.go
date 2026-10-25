@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
@@ -30,16 +29,18 @@ func withRunClient(fn func(*buildapiclient.Client) error) error {
 
 func newExecCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "exec <name> -- <command...>",
+		Use:   "exec <name> [--script <file>] [-- <command...>]",
 		Short: "Execute a durable command in a workspace",
 		Long: `Run a command in /workspace/src and follow its retained output.
 Network failures reconnect automatically. The CLI returns the command's exit code.
 Ctrl-C detaches without stopping the command; use workspace run cancel to stop it.
 
-Everything after -- is joined as a shell command, as with the legacy exec API.
+Arguments after -- are preserved literally. Use sh -c for shell syntax, or
+--script to upload a local script and run it with Bash and set -euo pipefail.
 
 Examples:
   caib workspace exec my-app -- make -j4
+  caib workspace exec my-app --script build.sh
   caib workspace exec my-app --detach -- cargo build --release
   caib workspace exec my-app --run <run-id>
   caib workspace exec my-app --run <run-id> --offset 4096`,
@@ -50,6 +51,8 @@ Examples:
 	cmd.Flags().Int64("offset", 0, "resume at this log byte offset (with --run)")
 	cmd.Flags().Bool("detach", false, "start a run and print its ID without following output")
 	cmd.Flags().Duration("timeout", 0, "command timeout, up to 24h (default: operator policy, normally 2h)")
+	cmd.Flags().String("script", "", "upload and run a local Bash script with set -euo pipefail")
+	cmd.MarkFlagsMutuallyExclusive("run", "script")
 	return cmd
 }
 
@@ -65,15 +68,20 @@ func runExec(cmd *cobra.Command, args []string) {
 	if offset < 0 || (id == "" && offset != 0) {
 		handleError(fmt.Errorf("--offset must be non-negative and requires --run"))
 	}
-	if (id == "" && len(args) < 2) || (id != "" && (len(args) != 1 || detach)) {
+	if (id == "" && len(args) < 2 && !cmd.Flags().Changed("script")) || (id != "" && (len(args) != 1 || detach)) {
 		handleError(fmt.Errorf("specify a command, or use --run <id> to reattach"))
 	}
 	ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 	if id == "" {
+		command, err := workspaceRunCommand(cmd, args[1:])
+		if err != nil {
+			stop()
+			handleError(err)
+		}
 		id = uuid.NewString()
 		clilog.Statusf("Run: %s\n", id)
-		req := buildcontract.WorkspaceRunRequest{ID: id, Command: strings.Join(args[1:], " "), TimeoutSeconds: int64(timeout / time.Second)}
-		err := startWorkspaceRun(ctx, withRunClient, args[0], req, time.Second)
+		req := buildcontract.WorkspaceRunRequest{ID: id, Command: command, TimeoutSeconds: int64(timeout / time.Second)}
+		err = startWorkspaceRun(ctx, withRunClient, args[0], req, time.Second)
 		if err != nil {
 			stop()
 			handleError(fmt.Errorf("create run %s: %w; inspect with caib workspace exec %s --run %s", id, err, args[0], id))
@@ -84,7 +92,11 @@ func runExec(cmd *cobra.Command, args []string) {
 		fmt.Println(id)
 		return
 	}
-	code, err := followWorkspaceRun(ctx, withRunClient, args[0], id, &offset, os.Stdout, os.Stderr, time.Second)
+	var output io.Writer = os.Stdout
+	if clilog.IsQuiet() {
+		output = io.Discard
+	}
+	code, err := followWorkspaceRun(ctx, withRunClient, args[0], id, &offset, output, os.Stderr, time.Second)
 	stop()
 	if err != nil {
 		if errors.Is(err, context.Canceled) {

@@ -280,7 +280,7 @@ func TestFollowWorkspaceRunReportsUnavailableExitCode(t *testing.T) {
 func TestWorkspaceExecExitCode(t *testing.T) {
 	if os.Getenv("CAIB_RUN_EXIT_HELPER") == "1" {
 		cmd := NewWorkspaceCmd(nil)
-		cmd.SetArgs([]string{"exec", "dev", "--timeout", "90s", "--server", os.Getenv("CAIB_RUN_TEST_SERVER"), "--token", "test-token", "--", "exit 42"})
+		cmd.SetArgs([]string{"exec", "dev", "--timeout", "90s", "--server", os.Getenv("CAIB_RUN_TEST_SERVER"), "--token", "test-token", "--", "sh", "-c", "exit 42"})
 		if err := cmd.Execute(); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(99)
@@ -297,7 +297,7 @@ func TestWorkspaceExecExitCode(t *testing.T) {
 				t.Error(err)
 			}
 			creates++
-			if request.ID == "" || (id != "" && id != request.ID) || request.Command != "exit 42" || request.TimeoutSeconds != 90 {
+			if request.ID == "" || (id != "" && id != request.ID) || request.Command != "'sh' '-c' 'exit 42'" || request.TimeoutSeconds != 90 {
 				t.Errorf("invalid or changed create request: %+v", request)
 			}
 			id = request.ID

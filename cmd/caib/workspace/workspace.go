@@ -86,7 +86,7 @@ Examples:
   # Sync source, build, and deploy
   caib workspace sync my-app ./src
   caib workspace exec my-app -- make -j4
-  caib workspace deploy my-app --artifact /workspace/src/build/app --dest /usr/local/bin/app`,
+  caib workspace deploy my-app --artifact /workspace/src/build/app:/usr/local/bin/app`,
 		PersistentPreRunE: func(_ *cobra.Command, _ []string) error {
 			if strings.TrimSpace(serverURL) == "" {
 				serverURL = config.DefaultServerWithDerive()
@@ -860,7 +860,9 @@ func runDeploy(_ *cobra.Command, args []string) {
 	}
 	defer func() { _ = body.Close() }()
 
-	streamToStdout(body)
+	if err := streamToStdout(body); err != nil {
+		handleError(err)
+	}
 }
 
 func waitForRunning(name string) {
@@ -979,15 +981,16 @@ func handleError(err error) {
 	os.Exit(1)
 }
 
-func streamToStdout(r io.Reader) {
+func streamToStdout(r io.Reader) error {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	for scanner.Scan() {
 		clilog.Infoln(scanner.Text())
 	}
 	if err := scanner.Err(); err != nil {
-		fmt.Fprintf(os.Stderr, "stream error: %v\n", err)
+		return fmt.Errorf("stream error: %w", err)
 	}
+	return nil
 }
 
 // progressReader wraps an io.Reader and renders an upload progress bar

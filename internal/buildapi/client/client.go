@@ -119,7 +119,7 @@ func statusIn(codes ...int) func(int) bool {
 // errors.
 //
 // On success the response is returned with its body open for the caller to read
-// and close. On failure the body is drained (up to 1KB) and closed here, and the
+// and close. On failure the body is drained (up to 8 KiB) and closed here, and the
 // failure is returned as an HTTPError describing action, the status, and body.
 func (c *Client) doRequest(req *http.Request, action string, isOK func(statusCode int) bool) (*http.Response, error) {
 	resp, err := c.httpClient.Do(req)
@@ -129,7 +129,9 @@ func (c *Client) doRequest(req *http.Request, action string, isOK func(statusCod
 	if isOK(resp.StatusCode) {
 		return resp, nil
 	}
-	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+	// Leave room for JSON escaping around the run helper's 1 KiB diagnostic
+	// tail; truncating that response again can hide the exception's final line.
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
 	_ = resp.Body.Close()
 	response := newHTTPError(resp.StatusCode, "%s failed: %s: %s", action, resp.Status, string(b))
 	response.missingRoute = resp.StatusCode == http.StatusNotFound && !json.Valid(b) && !strings.Contains(resp.Header.Get("Content-Type"), "json")
@@ -904,8 +906,8 @@ func (c *Client) SyncDelete(ctx context.Context, name string, req buildapi.SyncD
 	return nil
 }
 
-// workspaceStreamRequest performs a POST with a JSON body and returns the streaming response body.
-func (c *Client) workspaceStreamRequest(ctx context.Context, name, action string, reqBody any) (io.ReadCloser, error) {
+// workspaceStreamRequest performs a POST with a JSON body and returns the streaming response.
+func (c *Client) workspaceStreamRequest(ctx context.Context, name, action string, reqBody any) (*http.Response, error) {
 	body, err := json.Marshal(reqBody)
 	if err != nil {
 		return nil, err
@@ -916,6 +918,9 @@ func (c *Client) workspaceStreamRequest(ctx context.Context, name, action string
 		return nil, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	if action == "exec" {
+		httpReq.Header.Set("TE", "trailers")
+	}
 	if c.authToken != "" {
 		httpReq.Header.Set("Authorization", "Bearer "+c.authToken)
 	}
@@ -923,17 +928,26 @@ func (c *Client) workspaceStreamRequest(ctx context.Context, name, action string
 	if err != nil {
 		return nil, err
 	}
-	return resp.Body, nil
+	return resp, nil
 }
 
 // ExecWorkspace executes a command in a workspace and returns the streaming output.
+// Reading the stream reports a nonzero exit or missing completion status as an error.
 func (c *Client) ExecWorkspace(ctx context.Context, name string, req buildapi.WorkspaceExecRequest) (io.ReadCloser, error) {
-	return c.workspaceStreamRequest(ctx, name, "exec", req)
+	resp, err := c.workspaceStreamRequest(ctx, name, "exec", req)
+	if err != nil {
+		return nil, err
+	}
+	return &workspaceExecStream{ReadCloser: resp.Body, response: resp}, nil
 }
 
 // DeployWorkspace deploys an artifact from a workspace to a board and returns the streaming output.
 func (c *Client) DeployWorkspace(ctx context.Context, name string, req buildapi.WorkspaceDeployRequest) (io.ReadCloser, error) {
-	return c.workspaceStreamRequest(ctx, name, "deploy", req)
+	resp, err := c.workspaceStreamRequest(ctx, name, "deploy", req)
+	if err != nil {
+		return nil, err
+	}
+	return resp.Body, nil
 }
 
 // ShellWorkspace opens an interactive shell via WebSocket.

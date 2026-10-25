@@ -121,7 +121,7 @@ func PullOCIArtifactWithContext(ctx context.Context, ociRef, destPath, username,
 	}
 
 	if info.IsDir() {
-		clilog.Infof("Downloaded multi-layer artifact to %s/\n", destPath)
+		clilog.Infof("Downloaded artifact to %s\n", destPath)
 		return nil
 	}
 
@@ -243,6 +243,18 @@ func extractOCIArtifactBlob(ociLayoutPath, destPath string) error {
 		return nil
 	}
 
+	info, err := os.Stat(destPath)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("stat destination: %w", err)
+	}
+	if strings.HasSuffix(destPath, string(os.PathSeparator)) || (info != nil && info.IsDir()) {
+		if err := os.MkdirAll(destPath, 0755); err != nil {
+			return fmt.Errorf("create destination directory: %w", err)
+		}
+		filename := sanitizeFilename(manifest.Layers[0].Annotations["org.opencontainers.image.title"], 0)
+		destPath = filepath.Join(destPath, filename)
+	}
+
 	layerDigest := strings.TrimPrefix(manifest.Layers[0].Digest, "sha256:")
 	layerPath := filepath.Join(ociLayoutPath, "blobs", "sha256", layerDigest)
 	return copyFile(layerPath, destPath)
@@ -288,18 +300,33 @@ func copyFile(srcPath, dstPath string) error {
 		}
 	}()
 
-	dst, err := os.Create(dstPath)
+	// A private staging directory preserves os.Create's umask-based file mode.
+	tempDir, err := os.MkdirTemp(filepath.Dir(dstPath), ".caib-download-*")
+	if err != nil {
+		return fmt.Errorf("create temporary destination directory: %w", err)
+	}
+	defer func() {
+		if err := os.RemoveAll(tempDir); err != nil {
+			clilog.Warnf("failed to remove temporary destination directory: %v\n", err)
+		}
+	}()
+	tempPath := filepath.Join(tempDir, "artifact")
+	dst, err := os.Create(tempPath)
 	if err != nil {
 		return fmt.Errorf("create destination: %w", err)
 	}
 	defer func() {
-		if err := dst.Close(); err != nil {
-			clilog.Warnf("failed to close destination file: %v\n", err)
-		}
+		_ = dst.Close()
 	}()
 
 	if _, err := io.Copy(dst, src); err != nil {
 		return fmt.Errorf("copy data: %w", err)
+	}
+	if err := dst.Close(); err != nil {
+		return fmt.Errorf("close destination: %w", err)
+	}
+	if err := os.Rename(tempPath, dstPath); err != nil {
+		return fmt.Errorf("rename destination: %w", err)
 	}
 
 	return nil

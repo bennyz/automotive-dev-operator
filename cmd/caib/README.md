@@ -91,10 +91,15 @@ Many flags are automatically inferred from context:
 | `--disk` | Implied by `-o`, `--push-disk`, or `--flash` |
 | `--client` | Auto-detected from `~/.config/jumpstarter/` |
 | `--extra-args` | Prepended from OperatorConfig target defaults (user args appended) |
-| `--follow` | Defaults to `true` for build commands, `false` for flash |
-| `--wait` | Defaults to `false` for build commands, `true` for flash and workspace |
+| `--follow` | Defaults to `false` for `image build`, `image build-dev`, `image disk`, and `image flash`; use `--follow` for full logs instead of progress |
+| `--wait` | Defaults to `true` for `image build`, `image build-dev`, `image flash`, and workspace create/start; `false` for `image disk` |
 
 For example, `--target ride4_sa8775p_sx_r3` automatically sets `--arch arm64`, `--format simg`, and adds `--separate-partitions` to extra-args. Explicitly setting a flag always overrides the inferred value.
+
+For `image build`, `image build-dev`, and `image disk`, requesting `--follow`,
+`--output`, or `--flash` requires waiting, even with `--wait=false`. To submit
+without waiting, use `--wait=false` without these options, then reconnect with
+`caib image logs <build-name>`.
 
 ## Commands
 
@@ -137,8 +142,8 @@ caib image build <manifest.aib.yml> [flags]
 | `--aib-image` | `quay.io/.../automotive-image-builder:1.3.5` | AIB container image |
 | `-D`, `--define` | | Custom definition `KEY=VALUE` (repeatable) |
 | `--timeout` | `60` | Timeout in minutes |
-| `-w`, `--wait` | `false` | Wait for build to complete |
-| `-f`, `--follow` | `true` | Follow build logs |
+| `-w`, `--wait` | `true` | Wait for build to complete |
+| `-f`, `--follow` | `false` | Follow build logs instead of showing progress |
 | `--internal-registry` | `false` | Push to OpenShift internal registry (no credentials needed) |
 | `--image-name` | (build name) | Override image name in internal registry |
 | `--image-tag` | (build name) | Override tag in internal registry |
@@ -256,7 +261,7 @@ caib image disk <container-ref> [flags]
 | `--extra-args` | | Extra arguments to pass to AIB (repeatable) |
 | `--timeout` | `60` | Timeout in minutes |
 | `-w`, `--wait` | `false` | Wait for build to complete |
-| `-f`, `--follow` | `true` | Follow build logs |
+| `-f`, `--follow` | `false` | Follow build logs instead of showing progress |
 | `--flash` | `false` | Flash image to device after build completes (via Jumpstarter) |
 | `--client` | (auto-detected) | Path to Jumpstarter client config file |
 | `--exporter` | | Direct exporter selector (alternative to `--target` lookup) |
@@ -320,8 +325,8 @@ caib image build-dev <manifest.aib.yml> [flags]
 | `--extra-repo` | | Serve RPMs from workspace as extra repo (`workspace:path`, repeatable) |
 | `--workspace` | | Workspace name for build caching and lease forwarding |
 | `--timeout` | `60` | Timeout in minutes |
-| `-w`, `--wait` | `false` | Wait for build to complete |
-| `-f`, `--follow` | `true` | Follow build logs |
+| `-w`, `--wait` | `true` | Wait for build to complete |
+| `-f`, `--follow` | `false` | Follow build logs instead of showing progress |
 | `--flash` | `false` | Flash image to device after build completes (via Jumpstarter) |
 | `--client` | (auto-detected) | Path to Jumpstarter client config file |
 | `--exporter` | | Direct exporter selector (alternative to `--target` lookup) |
@@ -959,14 +964,15 @@ If no directory is specified, the current directory is used.
 
 ### workspace exec
 
-Execute a durable command in `/workspace/src`. Everything after `--` is joined
-as a shell command. Output streams to stdout, and the CLI returns the command's
+Execute a durable command in `/workspace/src`. Everything after `--` is passed
+as literal arguments. Output streams to stdout, and the CLI returns the command's
 exit code. Temporary network failures automatically reconnect at the last
 received byte. Requests use exponential backoff (1–8 seconds) and give up after
 six consecutive failures, printing the run ID and a resume command.
 
 ```bash
 caib workspace exec <name> -- <command...>
+caib workspace exec <name> --script <local-file>
 ```
 
 **Examples:**
@@ -975,6 +981,13 @@ caib workspace exec <name> -- <command...>
 caib workspace exec my-app -- make -j4
 caib workspace exec my-app -- cargo build --release
 caib workspace exec my-app --timeout 4h -- make -j4
+
+# Use an explicit shell for expansion inside the workspace. Single quotes keep
+# the local shell from running nproc (including on macOS).
+caib workspace exec my-app -- sh -c 'make -j$(nproc --ignore=2)'
+
+# Upload a local script and run it with Bash and set -euo pipefail.
+caib workspace exec my-app --script build.sh
 
 # Start without following; prints the run ID
 caib workspace exec my-app --detach -- make -j4
@@ -985,6 +998,11 @@ caib workspace exec my-app --run <run-id>
 # Resume from a known byte offset
 caib workspace exec my-app --run <run-id> --offset 4096
 ```
+
+For multiple build steps, put them in `build.sh`. Script mode stops on a failed
+command, an unset variable, or a failed pipeline. Shell operators such as `&&`,
+pipes, and substitutions require an explicit `sh -c '...'` or a script; a single
+quoted command string is not split into arguments.
 
 Ctrl-C detaches and prints resume and cancel commands. It leaves the remote
 command running until completion, cancellation or timeout. To recover a lost ID,
