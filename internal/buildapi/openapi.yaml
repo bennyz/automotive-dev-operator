@@ -290,6 +290,9 @@ paths:
         retains status and exit code until the age or record count limit is reached.
         The per-log cap cannot exceed the completed-log budget. Pruning runs during creation and
         after completion. Unreadable records are skipped by collection operations.
+        Unsupported record versions return 409 and prevent auto-pause; they are
+        never silently skipped, modified or pruned. The helper program and request
+        data use pod exec stdin, keeping command contents out of exec request URLs.
         Stale runs report Interrupted even when persisting that transition fails.
         The request body is limited to 128 KiB and the command to 65536 bytes.
       requestBody:

@@ -20,6 +20,9 @@ WORKDIR = sys.argv[2]
 LIVE = ("Starting", "Running", "Cancelling")
 TERMINAL = ("Succeeded", "Failed", "Cancelled", "Interrupted", "TimedOut")
 TOMBSTONE_TTL = 24 * 60 * 60
+# Bump for incompatible fields or statuses, retaining readers for older versions.
+# Supervisors from the previous operator keep writing their original format.
+RECORD_VERSION = 1
 ORIGINAL_UMASK = os.umask(0o077)
 
 
@@ -80,7 +83,16 @@ def missing_run(directory):
 def read_state(directory):
     try:
         state = json.loads((directory / "state.json").read_text())
-        if not isinstance(state, dict) or state["id"] != directory.name:
+        if not isinstance(state, dict):
+            raise ValueError("invalid record")
+        # Unversioned records from before release have the version 1 layout.
+        version = state.setdefault("version", 1)
+        if type(version) is not int or version < 1:
+            raise ValueError("invalid record version")
+        if version != RECORD_VERSION:
+            # Do not skip, prune or reinterpret a possibly live newer record.
+            raise RunError(409, f"unsupported run record version {version} for {directory.name}; upgrade the operator to read this run")
+        if state["id"] != directory.name:
             raise ValueError("invalid record identity")
         if not isinstance(state["command"], str) or state["status"] not in LIVE + TERMINAL:
             raise ValueError("invalid command or status")
@@ -133,7 +145,7 @@ def log_window(directory, state):
 
 
 def public(directory, state):
-    private = ("pid", "identity", "maxLogBytes", "requestedTimeoutSeconds")
+    private = ("version", "pid", "identity", "maxLogBytes", "requestedTimeoutSeconds")
     result = {key: value for key, value in state.items() if key not in private}
     start, end, _ = log_window(directory, state)
     result.update(logBytes=end, logStartOffset=start, logTruncated=start > 0,
@@ -396,7 +408,7 @@ def launch(directory, run_id, command, options, collection_lock):
                 raise RunError(409, "run ID already belongs to a different command or timeout")
             return public(directory, state)
         (directory / "logs").mkdir(exist_ok=True)
-        state = dict(id=run_id, command=command, status="Starting", startedAt=now(),
+        state = dict(version=RECORD_VERSION, id=run_id, command=command, status="Starting", startedAt=now(),
                      pid=os.getpid(), identity=identity(os.getpid()),
                      timeoutSeconds=options["timeoutSeconds"], maxLogBytes=options["maxLogBytes"],
                      requestedTimeoutSeconds=options["requestedTimeoutSeconds"])

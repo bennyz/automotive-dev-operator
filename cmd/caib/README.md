@@ -1080,7 +1080,12 @@ pods need the updated toolchain image and a restart to receive this init change.
 Images without Python receive an actionable error for runs; their exec/terminal
 activity still participates in auto-pause detection. The helper uses isolated
 Python imports, so workspace files and `PYTHON*` variables cannot replace its
-standard library. Unreadable run records return an explicit error when inspected
+standard library. The runner and request data travel over pod exec stdin, keeping
+commands and script contents out of Kubernetes exec request URLs.
+Run records use format version 1. Unknown versions return an explicit error and
+prevent auto-pause until a compatible operator can read them; they are never
+silently skipped or pruned. Existing unversioned records use the version 1 layout.
+Unreadable run records return an explicit error when inspected
 and are skipped by collection and activity checks. If the volume cannot persist
 an `Interrupted` transition, reads still report it and activity checks still
 allow auto-pause; a later read retries saving the transition.
@@ -1094,7 +1099,7 @@ API clients can use these owner-scoped endpoints:
 | `GET /v1/workspaces/{name}/runs/{id}` | Returns status and the recorded exit code. |
 | `GET /v1/workspaces/{name}/runs/{id}/logs?follow&offset=0` | Streams raw combined stdout/stderr from an absolute byte offset. |
 | `POST /v1/workspaces/{name}/runs/{id}/cancel` | Requests cancellation; repeated requests are safe. |
-| `DELETE /v1/workspaces/{name}/runs/{id}` | Deletes a terminal run and its log; repeated requests are safe. |
+| `DELETE /v1/workspaces/{name}/runs/{id}` | Deletes a terminal or unreadable run and its log; repeated requests are safe. |
 
 Reuse a client-supplied ID, command and requested timeout to retry creation after
 losing the response. A different payload with that ID returns HTTP 409; a

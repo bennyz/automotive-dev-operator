@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -57,7 +58,7 @@ type Reconciler struct {
 	clientset     kubernetes.Interface
 	clientsetErr  error
 	clientsetOnce sync.Once
-	execActivity  func(context.Context, *automotivev1alpha1.Workspace, []string) (string, error)
+	execActivity  func(context.Context, *automotivev1alpha1.Workspace, []string, string) (string, error)
 }
 
 // +kubebuilder:rbac:groups=automotive.sdv.cloud.redhat.com,namespace=system,resources=workspaces,verbs=get;list;watch;create;update;patch;delete
@@ -714,9 +715,10 @@ func (r *Reconciler) getClientset() (kubernetes.Interface, error) {
 // isWorkspaceActive execs into the workspace pod to check for user activity.
 // Returns true if active sessions or build processes are detected.
 func (r *Reconciler) isWorkspaceActive(ctx context.Context, ws *automotivev1alpha1.Workspace) (bool, error) {
-	// Recorded live runs survive detachment from pod exec. Check their supervisor
-	// identities first; stale records from a previous container are not activity.
-	output, err := r.runActivityCommand(ctx, ws, workspacerun.ActivityCommand())
+	// Check shell sessions and recorded supervisors. Stale records from a previous
+	// container are not activity; unsupported record formats fail closed.
+	command, input := workspacerun.ActivityCommand()
+	output, err := r.runActivityCommand(ctx, ws, command, input)
 	if err != nil {
 		return false, err
 	}
@@ -733,9 +735,9 @@ func (r *Reconciler) isWorkspaceActive(ctx context.Context, ws *automotivev1alph
 	return runs.Active, nil
 }
 
-func (r *Reconciler) runActivityCommand(ctx context.Context, ws *automotivev1alpha1.Workspace, cmd []string) (string, error) {
+func (r *Reconciler) runActivityCommand(ctx context.Context, ws *automotivev1alpha1.Workspace, cmd []string, input string) (string, error) {
 	if r.execActivity != nil {
-		return r.execActivity(ctx, ws, cmd)
+		return r.execActivity(ctx, ws, cmd, input)
 	}
 	podName := "workspace-" + ws.Name
 	clientset, err := r.getClientset()
@@ -748,7 +750,7 @@ func (r *Reconciler) runActivityCommand(ctx context.Context, ws *automotivev1alp
 		VersionedParams(&corev1.PodExecOptions{
 			Container: containerName,
 			Command:   cmd,
-			Stdin:     false,
+			Stdin:     true,
 			Stdout:    true,
 			Stderr:    true,
 			TTY:       false,
@@ -764,6 +766,7 @@ func (r *Reconciler) runActivityCommand(ctx context.Context, ws *automotivev1alp
 	defer cancel()
 
 	if err := executor.StreamWithContext(execCtx, remotecommand.StreamOptions{
+		Stdin:  strings.NewReader(input),
 		Stdout: &stdout,
 		Stderr: &stderr,
 	}); err != nil {

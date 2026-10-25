@@ -197,7 +197,7 @@ func writeTerminalRun(t *testing.T, root, id string, age time.Duration, output [
 		t.Fatal(err)
 	}
 	state, err := json.Marshal(map[string]any{
-		"id": id, "command": "echo fixture", "status": "Failed", "exitCode": 3,
+		"version": 1, "id": id, "command": "echo fixture", "status": "Failed", "exitCode": 3,
 		"startedAt":   time.Now().Add(-age - time.Second).Format(time.RFC3339),
 		"finishedAt":  time.Now().Add(-age).Format(time.RFC3339),
 		"maxLogBytes": DefaultOptions().MaxLogBytes, "timeoutSeconds": 7200, "requestedTimeoutSeconds": 0,
@@ -249,9 +249,10 @@ func TestActivityWithoutPythonUsesProcAndPTYs(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			argv := ActivityCommand()
+			argv, input := ActivityCommand()
 			argv[4], argv[5] = proc, pts
 			cmd := exec.Command(argv[0], argv[1:]...)
+			cmd.Stdin = strings.NewReader(input)
 			cmd.Env = []string{"PATH=" + root} // No procps; Python must not run when the shell detects activity.
 			out, err := cmd.CombinedOutput()
 			if err != nil || string(out) != fmt.Sprintf("{\"active\":%t}\n", tc.want) {
@@ -270,8 +271,8 @@ func TestWorkspaceInitReapsSupervisorAndBackgroundChildren(t *testing.T) {
 	// its direct child alive while the actual runner forks and exits; neither
 	// this harness nor the Go test can reap the orphaned supervisor/descendant.
 	const harness = `import json, pathlib, subprocess, sys, time
-root = pathlib.Path(sys.argv[2])
-subprocess.run(["python3", "-I", "-c", sys.argv[1], str(root / ".runs"), str(root), "create", "reaping", "sleep 30 & echo $! > child-pid; sleep 0.2", sys.argv[3]], check=True, capture_output=True, timeout=5)
+root = pathlib.Path(sys.argv[1])
+subprocess.run(json.loads(sys.argv[2]), input=sys.stdin.read(), text=True, check=True, capture_output=True, timeout=5)
 deadline = time.monotonic() + 5
 while time.monotonic() < deadline:
     state = json.loads((root / ".runs/reaping/state.json").read_text())
@@ -286,7 +287,14 @@ raise RuntimeError("orphan processes were not reaped: " + str(state))
 `
 	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, initPath, "--", "python3", "-I", "-c", harness, script, t.TempDir(), DefaultOptions().JSON())
+	root := t.TempDir()
+	argv, input := Command("create", "reaping", "sleep 30 & echo $! > child-pid; sleep 0.2", DefaultOptions().JSON())
+	encodedArgv, err := json.Marshal(argv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.CommandContext(ctx, initPath, "--", "python3", "-I", "-c", harness, root, string(encodedArgv))
+	cmd.Stdin = strings.NewReader(localRunnerInput(root, input))
 	cmd.WaitDelay = time.Second
 	out, err := cmd.CombinedOutput()
 	if err != nil || string(out) != "reaped supervisor and child\n" {
@@ -326,11 +334,11 @@ func TestIdleLogFollowerExitsAtItsCapWithoutStoppingRun(t *testing.T) {
 	root, call := localRunner(t)
 	call("create", "idle", "sleep 30", DefaultOptions().JSON())
 	t.Cleanup(func() { call("cancel", "idle"); awaitRun(t, call, "idle") })
-	argv := Command("stream", "idle", "0", "0", "true", "0.2")
-	argv[4], argv[5] = filepath.Join(root, ".runs"), root
+	argv, input := Command("stream", "idle", "0", "0", "true", "0.2")
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	cmd.Stdin = strings.NewReader(localRunnerInput(root, input))
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
@@ -346,9 +354,8 @@ func localRunner(t *testing.T) (string, func(string, ...string) runnerResult) {
 	root := t.TempDir()
 	return root, func(action string, args ...string) runnerResult {
 		t.Helper()
-		argv := Command(action, args...)
-		argv[4], argv[5] = filepath.Join(root, ".runs"), root
-		out, _ := executeRunner(t, root, argv)
+		argv, input := Command(action, args...)
+		out, _ := executeRunner(t, root, argv, input)
 		var result runnerResult
 		if err := json.Unmarshal(out, &result); err != nil {
 			t.Fatalf("runner %s: %v: %s", action, err, out)
@@ -359,12 +366,13 @@ func localRunner(t *testing.T) (string, func(string, ...string) runnerResult) {
 
 // executeRunner exercises the embedded protocol in the same untrusted working
 // directory as the command, with the container's ordinary umask.
-func executeRunner(t *testing.T, root string, argv []string) ([]byte, []byte) {
+func executeRunner(t *testing.T, root string, argv []string, input string) ([]byte, []byte) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "/bin/sh", append([]string{"-c", `umask 022; exec "$@"`, "--"}, argv...)...)
 	cmd.Dir = root
+	cmd.Stdin = strings.NewReader(localRunnerInput(root, input))
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
@@ -372,6 +380,11 @@ func executeRunner(t *testing.T, root string, argv []string) ([]byte, []byte) {
 		t.Fatalf("runner: %v: %s", err, stderr.String())
 	}
 	return out, stderr.Bytes()
+}
+
+func localRunnerInput(root, input string) string {
+	input = strings.Replace(input, `"/workspace/.runs"`, strconv.Quote(filepath.Join(root, ".runs")), 1)
+	return strings.Replace(input, `"/workspace/src"`, strconv.Quote(root), 1)
 }
 
 type runnerLog struct {
@@ -382,9 +395,8 @@ type runnerLog struct {
 
 func streamRunLog(t *testing.T, root, id, offset string) runnerLog {
 	t.Helper()
-	argv := Command("get", id)
-	argv[4], argv[5] = filepath.Join(root, ".runs"), root
-	out, _ := executeRunner(t, root, argv)
+	argv, input := Command("get", id)
+	out, _ := executeRunner(t, root, argv, input)
 	var result runnerLog
 	if err := json.Unmarshal(out, &result.runnerResult); err != nil || result.Code != 0 {
 		t.Fatalf("get before stream: %s, %v", out, err)
@@ -394,9 +406,8 @@ func streamRunLog(t *testing.T, root, id, offset string) runnerLog {
 		t.Fatal(err)
 	}
 	result.Offset = max(requested, result.Run.LogStartOffset)
-	argv = Command("stream", id, strconv.FormatInt(result.Offset, 10), strconv.FormatInt(result.Run.LogBytes, 10), "false", "1")
-	argv[4], argv[5] = filepath.Join(root, ".runs"), root
-	output, metadata := executeRunner(t, root, argv)
+	argv, input = Command("stream", id, strconv.FormatInt(result.Offset, 10), strconv.FormatInt(result.Run.LogBytes, 10), "false", "1")
+	output, metadata := executeRunner(t, root, argv, input)
 	if err := json.Unmarshal(metadata, &result.runnerResult); err != nil {
 		t.Fatalf("stream metadata: %s, %v", metadata, err)
 	}

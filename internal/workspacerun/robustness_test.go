@@ -120,10 +120,9 @@ def fail_recovery_write(path, *args, **kwargs):
 Path.open = fail_recovery_write
 `
 	for _, args := range [][]string{{"get", "stale"}, {"active"}, {"list", "0", "100"}, {"create", "healthy", "printf healthy", DefaultOptions().JSON()}} {
-		argv := Command(args[0], args[1:]...)
-		argv[3] = failRecoveryWrite + argv[3]
-		argv[4], argv[5] = filepath.Join(root, ".runs"), root
-		out, stderr := executeRunner(t, root, argv)
+		argv, input := Command(args[0], args[1:]...)
+		input = failRecoveryWrite + input
+		out, stderr := executeRunner(t, root, argv, input)
 		var result runnerResult
 		if err := json.Unmarshal(out, &result); err != nil || result.Code != 0 || len(stderr) != 0 {
 			t.Fatalf("%s blocked by recovery write: %q, stderr=%q, decode=%v", args[0], out, stderr, err)
@@ -207,10 +206,9 @@ def fail_directory_sync(fd):
     original_fsync(fd)
 os.fsync = fail_directory_sync
 `
-	argv := Command("create", "sync", "echo started > started", DefaultOptions().JSON())
-	argv[3] = failDirectorySync + argv[3]
-	argv[4], argv[5] = filepath.Join(root, ".runs"), root
-	out, stderr := executeRunner(t, root, argv)
+	argv, input := Command("create", "sync", "echo started > started", DefaultOptions().JSON())
+	input = failDirectorySync + input
+	out, stderr := executeRunner(t, root, argv, input)
 	var result runnerResult
 	if err := json.Unmarshal(out, &result); err != nil {
 		t.Fatalf("directory sync response: %q, %v", out, err)
@@ -234,7 +232,7 @@ os.fsync = fail_directory_sync
 
 func TestUnreadableRecordsDoNotBlockCollectionsOrLaunch(t *testing.T) {
 	root, call := localRunner(t)
-	for _, field := range []string{"truncated", "finishedAt", "maxLogBytes", "exitCode", "message"} {
+	for _, field := range []string{"truncated", "version", "finishedAt", "maxLogBytes", "exitCode", "message"} {
 		filename := writeTerminalRun(t, root, strings.ToLower(field), time.Hour, nil)
 		data, err := os.ReadFile(filename)
 		if err != nil {
@@ -288,9 +286,8 @@ func TestUnexpectedRunnerFailuresPreserveJSONProtocol(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, ".runs"), nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	argv := Command("create", "run", "true", DefaultOptions().JSON())
-	argv[4], argv[5] = filepath.Join(root, ".runs"), root
-	out, stderr := executeRunner(t, root, argv)
+	argv, input := Command("create", "run", "true", DefaultOptions().JSON())
+	out, stderr := executeRunner(t, root, argv, input)
 	var result runnerResult
 	if err := json.Unmarshal(out, &result); err != nil || result.Code != 500 || !strings.Contains(result.Error, "FileExistsError") || len(stderr) != 0 {
 		t.Fatalf("unexpected create error: %q stderr=%q decode=%v", out, stderr, err)
@@ -299,9 +296,8 @@ func TestUnexpectedRunnerFailuresPreserveJSONProtocol(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeTerminalRun(t, root, "run", time.Hour, nil)
-	argv = Command("stream", "run", "0", "0", "true", "invalid-duration")
-	argv[4], argv[5] = filepath.Join(root, ".runs"), root
-	out, stderr = executeRunner(t, root, argv)
+	argv, input = Command("stream", "run", "0", "0", "true", "invalid-duration")
+	out, stderr = executeRunner(t, root, argv, input)
 	if err := json.Unmarshal(stderr, &result); err != nil || result.Code != 500 || !strings.Contains(result.Error, "ValueError") || len(out) != 0 {
 		t.Fatalf("unexpected stream error: %q stderr=%q decode=%v", out, stderr, err)
 	}
@@ -336,9 +332,9 @@ func TestRunnerIsolatedFromWorkspaceAndPythonEnvironment(t *testing.T) {
 	}
 	// A non-matching /proc entry must preserve the Python argv, and activity
 	// must use the same isolated interpreter as every other action.
-	argv := ActivityCommand()
-	argv[4], argv[5], argv[10], argv[11] = proc, pts, filepath.Join(root, ".runs"), root
-	out, stderr := executeRunner(t, root, argv)
+	argv, input := ActivityCommand()
+	argv[4], argv[5] = proc, pts
+	out, stderr := executeRunner(t, root, argv, input)
 	if string(out) != "{\"active\": false}\n" || len(stderr) != 0 {
 		t.Fatalf("isolated activity: %q, %q", out, stderr)
 	}

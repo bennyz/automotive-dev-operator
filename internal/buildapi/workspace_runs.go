@@ -36,8 +36,9 @@ func (a *APIServer) runWorkspaceOperation(ctx context.Context, cfg *rest.Config,
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	var stdout, stderr bytes.Buffer
+	command, input := workspacerun.Command(action, args...)
 	err := a.exec.stream(ctx, cfg, ws.Namespace, ws.Status.PodName, workspaceContainerName,
-		workspacerun.Command(action, args...), strings.NewReader(""), &stdout, &stderr)
+		command, strings.NewReader(input), &stdout, &stderr)
 	if err != nil {
 		return workspaceRunResult{}, wrapPodStreamError("workspace run "+action, err, &stderr)
 	}
@@ -232,11 +233,11 @@ func (a *APIServer) workspaceRunLogs(c *gin.Context, name string) {
 	// in the pod, and never holds a run lock while waiting for HTTP backpressure.
 	// The advertised cap bounds idle helpers even when a remote exec disconnect
 	// does not terminate its process. Clients allow a grace period beyond it.
+	command, input := workspacerun.Command("stream", c.Param("run"), strconv.FormatInt(offset, 10),
+		strconv.FormatInt(result.Run.LogBytes, 10), strconv.FormatBool(follow),
+		strconv.FormatFloat(helperDuration.Seconds(), 'f', -1, 64))
 	err = a.exec.stream(ctx, cfg, ws.Namespace, ws.Status.PodName, workspaceContainerName,
-		workspacerun.Command("stream", c.Param("run"), strconv.FormatInt(offset, 10),
-			strconv.FormatInt(result.Run.LogBytes, 10), strconv.FormatBool(follow),
-			strconv.FormatFloat(helperDuration.Seconds(), 'f', -1, 64)),
-		strings.NewReader(""), newFlushWriter(c.Writer), &stderr)
+		command, strings.NewReader(input), newFlushWriter(c.Writer), &stderr)
 	if ctx.Err() != nil {
 		return
 	}

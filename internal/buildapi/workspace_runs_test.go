@@ -14,6 +14,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -57,9 +59,21 @@ func runTestServer(t *testing.T, root, owner string, stopped bool) (*APIServer, 
 		if namespace != "default" || pod != "workspace-dev" || container != workspaceContainerName {
 			t.Errorf("wrong exec target: %s/%s/%s", namespace, pod, container)
 		}
-		argv[4], argv[5] = filepath.Join(root, ".runs"), root
+		if !slices.Equal(argv, []string{"python3", "-I", "-"}) {
+			t.Errorf("runner payload leaked into exec argv: %d arguments", len(argv))
+		}
 		return &fakeRemoteExecutor{streamWithContextFn: func(ctx context.Context, opts remotecommand.StreamOptions) error {
+			if opts.Stdin == nil {
+				return fmt.Errorf("runner stdin is missing")
+			}
+			input, err := io.ReadAll(opts.Stdin)
+			if err != nil {
+				return err
+			}
+			program := strings.Replace(string(input), `"/workspace/.runs"`, strconv.Quote(filepath.Join(root, ".runs")), 1)
+			program = strings.Replace(program, `"/workspace/src"`, strconv.Quote(root), 1)
 			cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+			cmd.Stdin = strings.NewReader(program)
 			cmd.Stdout, cmd.Stderr = opts.Stdout, opts.Stderr
 			return cmd.Run()
 		}}, nil
@@ -75,6 +89,30 @@ func runTestServer(t *testing.T, root, owner string, stopped bool) (*APIServer, 
 	router.GET("/v1/workspaces/:name/runs/:run/logs", a.wrapNamedHandler("run logs", a.workspaceRunLogs))
 	router.POST("/v1/workspaces/:name/runs/:run/cancel", a.wrapNamedHandler("cancel run", a.cancelWorkspaceRun))
 	return a, router, calls
+}
+
+// runnerInputArgs inspects the transmitted request while preserving its stdin
+// for the actual helper invocation. Request arguments must never be in exec argv.
+func runnerInputArgs(t *testing.T, opts *remotecommand.StreamOptions) []string {
+	t.Helper()
+	if opts.Stdin == nil {
+		t.Fatal("runner stdin is missing")
+	}
+	input, err := io.ReadAll(opts.Stdin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts.Stdin = bytes.NewReader(input)
+	_, request, ok := strings.Cut(string(input), "sys.argv = ")
+	if !ok {
+		t.Fatal("runner request missing from stdin")
+	}
+	line, _, _ := strings.Cut(request, "\n")
+	var args []string
+	if err := json.Unmarshal([]byte(line), &args); err != nil {
+		t.Fatal(err)
+	}
+	return args
 }
 
 func TestWorkspaceRunExecFailuresPreserveTheirActualCause(t *testing.T) {
@@ -138,10 +176,17 @@ func TestWorkspaceRunFollowUsesPersistentExecAndStatusTrailers(t *testing.T) {
 	a, router, calls := runTestServer(t, t.TempDir(), "alice", false)
 	newExecutor := a.exec.newExecutor
 	a.exec.newExecutor = func(cfg *rest.Config, ns, pod, container string, argv []string) (remotecommand.Executor, error) {
-		if argv[6] == "stream" && argv[len(argv)-1] != "40" {
-			t.Errorf("follower can outlive the CLI reconnect cycle: %s seconds", argv[len(argv)-1])
+		executor, err := newExecutor(cfg, ns, pod, container, argv)
+		if err != nil {
+			return nil, err
 		}
-		return newExecutor(cfg, ns, pod, container, argv)
+		return &fakeRemoteExecutor{streamWithContextFn: func(ctx context.Context, opts remotecommand.StreamOptions) error {
+			args := runnerInputArgs(t, &opts)
+			if args[3] == "stream" && args[len(args)-1] != "40" {
+				t.Errorf("follower can outlive the CLI reconnect cycle: %s seconds", args[len(args)-1])
+			}
+			return executor.StreamWithContext(ctx, opts)
+		}}, nil
 	}
 	server := httptest.NewServer(router)
 	defer server.Close()
@@ -252,8 +297,9 @@ func TestWorkspaceRunPolicyFlowsFromOperatorConfig(t *testing.T) {
 	}
 	a.exec.newExecutor = func(_ *rest.Config, _, _, _ string, argv []string) (remotecommand.Executor, error) {
 		return &fakeRemoteExecutor{streamWithContextFn: func(_ context.Context, opts remotecommand.StreamOptions) error {
+			args := runnerInputArgs(t, &opts)
 			var options map[string]int64
-			if err := json.Unmarshal([]byte(argv[len(argv)-1]), &options); err != nil {
+			if err := json.Unmarshal([]byte(args[len(args)-1]), &options); err != nil {
 				return err
 			}
 			for key, want := range map[string]int64{"timeoutSeconds": 90, "requestedTimeoutSeconds": 90, "maxLogBytes": 5 << 20, "retentionSeconds": 3 * 86400, "maxRecords": 50, "completedLogBudgetBytes": 200 << 20} {
@@ -482,13 +528,20 @@ func checkWorkspaceLogRotation(t *testing.T, a *APIServer, api *buildapiclient.C
 	newExecutor := a.exec.newExecutor
 	rotated := false
 	a.exec.newExecutor = func(cfg *rest.Config, ns, pod, container string, argv []string) (remotecommand.Executor, error) {
-		if argv[6] == "stream" && !rotated {
-			rotated = true
-			if err := os.WriteFile(filepath.Join(directory, "logs", "00000000000000000000.log"), []byte("discarded last errorFINAL TAIL"), 0o600); err != nil {
-				return nil, err
-			}
+		executor, err := newExecutor(cfg, ns, pod, container, argv)
+		if err != nil {
+			return nil, err
 		}
-		return newExecutor(cfg, ns, pod, container, argv)
+		return &fakeRemoteExecutor{streamWithContextFn: func(ctx context.Context, opts remotecommand.StreamOptions) error {
+			args := runnerInputArgs(t, &opts)
+			if args[3] == "stream" && !rotated {
+				rotated = true
+				if err := os.WriteFile(filepath.Join(directory, "logs", "00000000000000000000.log"), []byte("discarded last errorFINAL TAIL"), 0o600); err != nil {
+					return err
+				}
+			}
+			return executor.StreamWithContext(ctx, opts)
+		}}, nil
 	}
 	stream, err := api.WorkspaceRunLogs(ctx, "dev", "tail", true, 10)
 	if err != nil {

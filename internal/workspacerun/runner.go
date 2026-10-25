@@ -37,16 +37,20 @@ func (o Options) JSON() string {
 	return string(data)
 }
 
-// Command returns an argv, never shell-interpolated user input. Python is part
-// of the workspace toolchain image. The command and supervisor each use setsid.
-func Command(action string, args ...string) []string {
-	return append([]string{"python3", "-I", "-c", script, "/workspace/.runs", "/workspace/src", action}, args...)
+// Command returns a fixed exec argv and the program to send on stdin. Kubernetes
+// puts argv in the request URI, so the runner and request data must stay in stdin.
+func Command(action string, args ...string) ([]string, string) {
+	// A JSON array of strings is also a Python list literal. Encode every value
+	// together so command contents cannot escape into the runner's source code.
+	data, _ := json.Marshal(append([]string{"workspace-runner", "/workspace/.runs", "/workspace/src", action}, args...))
+	return []string{"python3", "-I", "-"}, "import sys\nsys.argv = " + string(data) + "\n" + script
 }
 
 // ActivityCommand uses /proc for legacy exec sessions as well as recorded runs.
 // Images without Python retain activity detection without depending on procps.
-func ActivityCommand() []string {
-	return append([]string{"/bin/sh", "-c", activityLauncher, "--", "/proc", "/dev/pts"}, Command("active")...)
+func ActivityCommand() ([]string, string) {
+	command, input := Command("active")
+	return append([]string{"/bin/sh", "-c", activityLauncher, "--", "/proc", "/dev/pts"}, command...), input
 }
 
 const activityLauncher = `proc=$1; pts=$2; shift 2
