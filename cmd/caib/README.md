@@ -1070,8 +1070,9 @@ losing the response. A different payload with that ID returns HTTP 409; an
 evicted or deleted ID returns 410. Resume logs by adding the number of received
 bytes to the **`X-Log-Offset` response header**, which advances requests below
 `logStartOffset` to the retained tail. Omitting `follow`
-returns a snapshot; following ends on completion or the configured stream time
-limit and can be reopened. Offsets beyond available output return HTTP 416.
+returns a snapshot; following ends on completion or after at most 40 seconds
+(also bounded by the configured stream limit) and can be reopened. Offsets
+beyond available output return HTTP 416.
 Follow uses a persistent pod exec. If rotation overtakes a reader, the response
 ends with an `X-Log-Error` trailer; reconnect to receive the new starting offset.
 Final `X-Run-Status` and `X-Run-Exit-Code` trailers supplement GET on the run.

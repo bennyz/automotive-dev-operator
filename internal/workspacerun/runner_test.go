@@ -257,6 +257,25 @@ print("parent complete")'`)
 	}
 }
 
+func TestIdleLogFollowerExitsAtItsCapWithoutStoppingRun(t *testing.T) {
+	root, call := localRunner(t)
+	call("create", "idle", "sleep 30")
+	t.Cleanup(func() { call("cancel", "idle"); awaitRun(t, call, "idle") })
+	argv := Command("stream", "idle", "0", "0", "true", "0.2")
+	argv[3], argv[4] = filepath.Join(root, ".runs"), root
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	var result runnerResult
+	decodeErr := json.Unmarshal(stderr.Bytes(), &result)
+	if err != nil || decodeErr != nil || len(out) != 0 || result.Run.Status != "Running" || call("get", "idle").Run.Status != "Running" {
+		t.Fatalf("idle follower: output=%q stderr=%q err=%v decode=%v", out, stderr.String(), err, decodeErr)
+	}
+}
+
 func localRunner(t *testing.T) (string, func(string, ...string) runnerResult) {
 	t.Helper()
 	root := t.TempDir()

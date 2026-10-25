@@ -226,10 +226,16 @@ func (a *APIServer) workspaceRunLogs(c *gin.Context, name string) {
 	var stderr bytes.Buffer
 	// One persistent pod exec streams raw bytes. Polling the local volume happens
 	// in the pod, and never holds a run lock while waiting for HTTP backpressure.
+	// Bound the helper itself below the CLI's 45s rotation: closing a remote exec
+	// stream does not reliably terminate its process in every container runtime.
+	helperDuration := duration
+	if follow {
+		helperDuration = min(duration, 40*time.Second)
+	}
 	err = a.exec.stream(ctx, cfg, ws.Namespace, ws.Status.PodName, workspaceContainerName,
 		workspacerun.Command("stream", c.Param("run"), strconv.FormatInt(offset, 10),
 			strconv.FormatInt(result.Run.LogBytes, 10), strconv.FormatBool(follow),
-			strconv.FormatFloat(duration.Seconds(), 'f', -1, 64)),
+			strconv.FormatFloat(helperDuration.Seconds(), 'f', -1, 64)),
 		strings.NewReader(""), newFlushWriter(c.Writer), &stderr)
 	if ctx.Err() != nil {
 		return

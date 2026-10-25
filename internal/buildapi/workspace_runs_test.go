@@ -93,7 +93,14 @@ func TestWorkspaceRunPermanentExecFailureIsActionable(t *testing.T) {
 }
 
 func TestWorkspaceRunFollowUsesPersistentExecAndStatusTrailers(t *testing.T) {
-	_, router, calls := runTestServer(t, t.TempDir(), "alice", false)
+	a, router, calls := runTestServer(t, t.TempDir(), "alice", false)
+	newExecutor := a.exec.newExecutor
+	a.exec.newExecutor = func(cfg *rest.Config, ns, pod, container string, argv []string) (remotecommand.Executor, error) {
+		if argv[5] == "stream" && argv[len(argv)-1] != "40" {
+			t.Errorf("follower can outlive the CLI reconnect cycle: %s seconds", argv[len(argv)-1])
+		}
+		return newExecutor(cfg, ns, pod, container, argv)
+	}
 	server := httptest.NewServer(router)
 	defer server.Close()
 	api, err := buildapiclient.New(server.URL)

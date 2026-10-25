@@ -396,7 +396,8 @@ paths:
         tail advances past a slow reader during a response, the stream ends with
         X-Log-Error; reconnect to obtain the new starting offset.
         Without follow this returns a snapshot. With follow it ends when the run
-        finishes or the configured log stream duration expires; reconnect to
+        finishes or after at most 40 seconds (also bounded by the configured log
+        stream duration); reconnect to
         continue and GET the run to determine its status and exit code.
         An error after headers is reported by the X-Log-Error trailer. Final
         metadata is available in X-Run-Status and X-Run-Exit-Code trailers.
