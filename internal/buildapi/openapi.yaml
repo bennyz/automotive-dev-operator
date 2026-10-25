@@ -354,6 +354,8 @@ paths:
         reported as Interrupted without inventing an exit code.
         Newer formats return lifecycle metadata with a compatibility message;
         their command, exit code, timeout and log metadata are unavailable.
+        For a stale newer supervisor, finishedAt uses the record's modification
+        time as a stable retention timestamp, not the exact crash time.
         An invalid newer envelope reports Unknown with no timestamps.
       responses:
         "200":

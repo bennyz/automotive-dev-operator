@@ -180,15 +180,40 @@ func TestNewerRunLivenessAndAmbiguousEnvelopes(t *testing.T) {
 }
 
 func TestNewerTerminalRecordsRespectRetentionAndCount(t *testing.T) {
-	for _, kind := range []string{"retention", "count"} {
-		t.Run(kind, func(t *testing.T) {
+	for _, tc := range []struct {
+		kind  string
+		stale bool
+	}{{"retention", false}, {"retention", true}, {"count", false}, {"count", true}} {
+		t.Run(fmt.Sprintf("%s/stale=%t", tc.kind, tc.stale), func(t *testing.T) {
 			root, call := localRunner(t)
 			options := DefaultOptions()
 			age := 8 * 24 * time.Hour
-			if kind == "count" {
+			if tc.kind == "count" {
 				age, options.MaxRecords = 2*time.Hour, 1
 			}
-			writeNewerRun(t, root, newerEnvelope("old", "Failed", age))
+			old := newerEnvelope("old", "Failed", age)
+			if tc.stale {
+				old["status"], old["pid"], old["identity"] = "Running", os.Getpid(), []string{"old-boot", "old-container", "old-process"}
+				delete(old, "finishedAt")
+			}
+			oldFilename, oldRecord := writeNewerRun(t, root, old)
+			if tc.stale {
+				modified := time.Now().Add(-age).Truncate(time.Second)
+				if err := os.Chtimes(oldFilename, modified, modified); err != nil {
+					t.Fatal(err)
+				}
+				for range 2 {
+					got := call("get", "old")
+					finished, err := time.Parse(time.RFC3339Nano, got.Run.FinishedAt)
+					if err != nil || got.Code != 0 || got.Run.Status != "Interrupted" || got.Run.ExitCode != nil || !finished.Equal(modified) {
+						t.Errorf("stale newer run did not retain its modification time %s: %+v, %v", modified, got, err)
+					}
+				}
+				assertNewerRecordUnchanged(t, oldFilename, oldRecord)
+				if info, err := os.Stat(oldFilename); err != nil || !info.ModTime().Equal(modified) {
+					t.Fatalf("read changed newer record modification time: %v, %v", info, err)
+				}
+			}
 			writeTerminalRun(t, root, "recent", time.Hour, nil)
 			live := newerEnvelope("live", "Running", 9*24*time.Hour)
 			live["pid"], live["identity"] = os.Getpid(), currentProcessIdentity(t)
@@ -198,10 +223,10 @@ func TestNewerTerminalRecordsRespectRetentionAndCount(t *testing.T) {
 			}
 			t.Cleanup(func() { call("cancel", "trigger"); awaitRun(t, call, "trigger") })
 			if got := call("get", "old"); got.Code != 410 {
-				t.Fatalf("%s did not remove old newer record: %+v", kind, got)
+				t.Fatalf("%s did not remove old newer record: %+v", tc.kind, got)
 			}
 			if got := call("get", "recent"); got.Code != 0 || got.Run.ExitCode == nil || *got.Run.ExitCode != 3 {
-				t.Fatalf("%s removed recent result: %+v", kind, got)
+				t.Fatalf("%s removed recent result: %+v", tc.kind, got)
 			}
 			assertNewerRecordUnchanged(t, filename, record)
 		})

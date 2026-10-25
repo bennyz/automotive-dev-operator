@@ -155,12 +155,19 @@ def read_state(directory):
         raise RunError(422, f"unreadable run record {directory.name}: {error}") from None
     try:
         stopped = state["status"] in LIVE and identity(state["pid"]) != state["identity"]
+        if stopped:
+            finished_at = now()
+            if version != RECORD_VERSION:
+                # A read-only projection needs a stable retention timestamp.
+                # The last record write is a proxy, not the exact crash time.
+                finished_at = datetime.datetime.fromtimestamp(
+                    (directory / "state.json").stat().st_mtime, datetime.timezone.utc).isoformat()
     except OSError as error:
         if version != RECORD_VERSION:
             return uncertain_newer_record(directory, version, error)
         raise
     if stopped:
-        state.update(status="Interrupted", finishedAt=now(),
+        state.update(status="Interrupted", finishedAt=finished_at,
                      message="The workspace container or run supervisor stopped before recording an exit code")
         # Reads must remain usable when the volume cannot persist recovery.
         # Launch and cancellation still require their explicit saves to succeed.
@@ -189,7 +196,8 @@ def public(directory, state):
     result = {key: value for key, value in state.items() if key not in private}
     if state["version"] != RECORD_VERSION:
         note = f"Run uses newer record format {state['version']}; only lifecycle metadata is available. Command, exit code, logs and cancellation require a compatible operator."
-        result["message"] = (result.get("message", "") + " " + note).strip()
+        message = result.get("message", "").rstrip(". ")
+        result["message"] = message + ". " + note if message else note
         return result
     start, end, _ = log_window(directory, state)
     result.update(logBytes=end, logStartOffset=start, logTruncated=start > 0,

@@ -1094,8 +1094,10 @@ for older versions; supervisors keep writing the version they started with.
 After a rollback, newer records still participate in activity checks and appear
 in `run list` and `run show` with a compatibility message. Finished records can be
 deleted or pruned by age and count. A stale supervisor appears as `Interrupted`
-without rewriting its newer record. Logs, cancellation and retries using that
-record's ID return HTTP 409; fresh IDs still work. Newer log layouts are excluded
+without rewriting its newer record. Its `finishedAt` uses the `state.json`
+modification time as a stable retention timestamp, not the exact crash time.
+Logs, cancellation and retries using that record's ID return HTTP 409; fresh IDs
+still work. Newer log layouts are excluded
 from log-budget eviction until a compatible operator is restored. Command, exit
 code, timeout and log metadata are unavailable for these records; zero or empty
 fields in the response do not describe their payload. An invalid newer envelope
