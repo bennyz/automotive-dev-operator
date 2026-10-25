@@ -224,8 +224,219 @@ paths:
                 type: string
           description: OK
       summary: Health check
+  /v1/workspaces/{name}/runs:
+    parameters:
+      - in: path
+        name: name
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: createWorkspaceRun
+      summary: Start a durable workspace command
+      description: |
+        Requires workspace ownership and a running workspace. The command runs
+        in /workspace/src independently of the HTTP request. An optional client
+        ID makes retries idempotent; reuse with a different command returns 409.
+        The request body is limited to 128 KiB and the command to 65536 bytes.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WorkspaceRunRequest'
+      responses:
+        "202":
+          description: Run accepted, or the existing run for an idempotent retry
+          headers:
+            Location:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkspaceRun'
+        "400":
+          description: Invalid command, ID, or request body
+        "401":
+          description: Authentication required
+        "404":
+          description: Workspace not found or owned by another user
+        "409":
+          description: Workspace is stopped or ID belongs to another command
+        "502":
+          description: Pod operation failed; retry creation with the same ID
+        "503":
+          description: Could not reserve workspace activity; retry with the same ID
+  /v1/workspaces/{name}/runs/{run}:
+    parameters:
+      - in: path
+        name: name
+        required: true
+        schema:
+          type: string
+      - in: path
+        name: run
+        required: true
+        schema:
+          type: string
+    get:
+      operationId: getWorkspaceRun
+      summary: Get a workspace command's retained result
+      description: |
+        Requires workspace ownership. Start a stopped workspace to read its
+        retained records. Runs whose supervisor or container disappeared are
+        reported as Interrupted without inventing an exit code.
+      responses:
+        "200":
+          description: Run status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkspaceRun'
+        "401":
+          description: Authentication required
+        "404":
+          description: Workspace or run not found, or workspace not owned
+        "409":
+          description: Start the workspace to access retained runs
+  /v1/workspaces/{name}/runs/{run}/logs:
+    parameters:
+      - in: path
+        name: name
+        required: true
+        schema:
+          type: string
+      - in: path
+        name: run
+        required: true
+        schema:
+          type: string
+    get:
+      operationId: workspaceRunLogs
+      summary: Read or follow resumable command output
+      description: |
+        Requires workspace ownership and a running workspace. Contains only
+        combined stdout/stderr bytes, with no banners or heartbeat text. Resume
+        after disconnect by adding bytes received to the requested offset.
+        Without follow this returns a snapshot. With follow it ends when the run
+        finishes or the configured log stream duration expires; reconnect to
+        continue and GET the run to determine its status and exit code.
+        An error after headers is reported by the X-Log-Error trailer.
+      parameters:
+        - in: query
+          name: follow
+          allowEmptyValue: true
+          description: Follow new output; an empty value means true
+          schema:
+            type: boolean
+            default: false
+        - in: query
+          name: offset
+          description: Zero-based byte offset in the retained log
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+            default: 0
+      responses:
+        "200":
+          description: Raw log bytes
+          headers:
+            X-Log-Offset:
+              description: Starting byte offset of this response
+              schema:
+                type: integer
+                format: int64
+          content:
+            text/plain:
+              schema:
+                type: string
+                format: binary
+        "400":
+          description: Invalid offset, follow value, or run ID
+        "401":
+          description: Authentication required
+        "404":
+          description: Workspace or run not found, or workspace not owned
+        "409":
+          description: Start the workspace to access retained logs
+        "416":
+          description: Offset exceeds the available log bytes
+  /v1/workspaces/{name}/runs/{run}/cancel:
+    parameters:
+      - in: path
+        name: name
+        required: true
+        schema:
+          type: string
+      - in: path
+        name: run
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: cancelWorkspaceRun
+      summary: Cancel a workspace command and its process group
+      description: |
+        Requires workspace ownership and a running workspace. Records a durable
+        cancellation request. The supervisor sends SIGTERM, escalating to
+        SIGKILL after five seconds. Poll the run for its final result. Repeated
+        cancellation is safe and does not change an already completed result.
+      responses:
+        "200":
+          description: Cancellation requested, or run already finished
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkspaceRun'
+        "401":
+          description: Authentication required
+        "404":
+          description: Workspace or run not found, or workspace not owned
+        "409":
+          description: Start the workspace to access retained runs
 components:
   schemas:
+    WorkspaceRunRequest:
+      type: object
+      required: [command]
+      properties:
+        id:
+          type: string
+          pattern: '^[a-z0-9][a-z0-9-]{0,63}$'
+          description: Optional idempotency ID; generated by the server when omitted
+        command:
+          type: string
+          minLength: 1
+          maxLength: 65536
+          description: Shell command, limited to 65536 bytes and containing no NUL
+    WorkspaceRun:
+      type: object
+      required: [id, command, status, startedAt, logBytes]
+      properties:
+        id:
+          type: string
+        command:
+          type: string
+        status:
+          type: string
+          enum: [Starting, Running, Cancelling, Succeeded, Failed, Cancelled, Interrupted]
+        exitCode:
+          type: integer
+          description: Omitted while live or when interrupted without a recorded result
+        startedAt:
+          type: string
+          format: date-time
+        finishedAt:
+          type: string
+          format: date-time
+        logBytes:
+          type: integer
+          format: int64
+          minimum: 0
+        message:
+          type: string
     ArtifactStatus:
       description: ArtifactStatus describes an output actually published by a build stage.
       properties:

@@ -108,6 +108,7 @@ Examples:
 		newStopCmd(),
 		newSyncCmd(),
 		newExecCmd(),
+		newRunCmd(),
 		newShellCmd(),
 		newDeployCmd(),
 	)
@@ -233,24 +234,6 @@ Examples:
 	cmd.Flags().BoolVar(&gitTrackedOnly, "git-tracked-only", false, "sync only git-tracked files (committed or staged)")
 	cmd.Flags().BoolVar(&syncDelete, "delete", false, "remove files from workspace that no longer exist locally")
 	return cmd
-}
-
-func newExecCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:   "exec <name> -- <command...>",
-		Short: "Execute a command in a workspace",
-		Long: `Execute a command in the workspace pod and stream the output.
-
-Everything after -- is passed as the command to execute inside the workspace.
-
-Examples:
-  caib workspace exec my-app -- make -j4
-  caib workspace exec my-app -- cargo build --release
-  caib workspace exec my-app -- ls -la /workspace/src`,
-		Args:               cobra.MinimumNArgs(1),
-		DisableFlagParsing: false,
-		Run:                runExec,
-	}
 }
 
 func newShellCmd() *cobra.Command {
@@ -763,39 +746,6 @@ func tarTrackedFiles(baseDir string, files []string, w io.Writer) error {
 	}
 
 	return nil
-}
-
-func runExec(_ *cobra.Command, args []string) {
-	requireServer()
-	name := args[0]
-
-	// Everything after the workspace name (or after --) is the command
-	cmdParts := args[1:]
-	if len(cmdParts) == 0 {
-		handleError(fmt.Errorf("no command specified; use: caib workspace exec <name> -- <command>"))
-	}
-	command := strings.Join(cmdParts, " ")
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
-	req := buildcontract.WorkspaceExecRequest{Command: command}
-
-	var body io.ReadCloser
-	err := caibcommon.ExecuteWithReauth(serverURL, &authToken, insecureSkipTLS, func(client *buildapiclient.Client) error {
-		r, cerr := client.ExecWorkspace(ctx, name, req)
-		if cerr != nil {
-			return cerr
-		}
-		body = r
-		return nil
-	})
-	if err != nil {
-		handleError(fmt.Errorf("exec failed: %w", err))
-	}
-	defer func() { _ = body.Close() }()
-
-	streamToStdout(body)
 }
 
 func runShell(_ *cobra.Command, args []string) {

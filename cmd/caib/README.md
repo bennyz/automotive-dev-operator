@@ -959,7 +959,10 @@ If no directory is specified, the current directory is used.
 
 ### workspace exec
 
-Execute a command in the workspace pod. Everything after `--` is the command.
+Execute a durable command in `/workspace/src`. Everything after `--` is joined
+as a shell command. Output streams to stdout, and the CLI returns the command's
+exit code. Temporary network failures automatically reconnect at the last
+received byte, without restarting the command or repeating output.
 
 ```bash
 caib workspace exec <name> -- <command...>
@@ -970,7 +973,55 @@ caib workspace exec <name> -- <command...>
 ```bash
 caib workspace exec my-app -- make -j4
 caib workspace exec my-app -- cargo build --release
+
+# Start without following; prints the run ID
+caib workspace exec my-app --detach -- make -j4
+
+# Reattach after closing the terminal (replays output from the beginning)
+caib workspace exec my-app --run <run-id>
+
+# Resume from a known byte offset
+caib workspace exec my-app --run <run-id> --offset 4096
 ```
+
+Ctrl-C detaches and prints a resume command with the current offset. It leaves the
+remote command running. To stop the command and its process group, cancel the run:
+
+```bash
+caib workspace run show my-app <run-id>
+caib workspace run cancel my-app <run-id>
+```
+
+Both commands return JSON containing the run ID, status, log size, timestamps,
+and exit code when available. Cancellation first sends SIGTERM, then SIGKILL
+after five seconds if needed. Runs own their process group; background children
+are stopped when the command finishes. Processes that create their own session
+are outside that group.
+
+Live runs count as activity and prevent auto-pause even with no attached client.
+Output and results are stored in `/workspace/.runs/<id>/output.log` and
+`state.json` on the workspace PVC. Records remain until removed from the volume
+or the workspace is deleted. Manually stopping or replacing the pod interrupts
+live commands; after restart they report `Interrupted` with no exit code unless
+one was recorded. Start a stopped workspace before reading retained runs or logs.
+Workspace images must provide Python 3 and Linux `/proc`, as the default
+toolchain image does.
+
+API clients can use these owner-scoped endpoints:
+
+| Request | Result |
+| --- | --- |
+| `POST /v1/workspaces/{name}/runs` | Accepts `{"command":"make -j4","id":"optional-client-id"}` and returns the run with HTTP 202. |
+| `GET /v1/workspaces/{name}/runs/{id}` | Returns status and the recorded exit code. |
+| `GET /v1/workspaces/{name}/runs/{id}/logs?follow&offset=0` | Streams raw combined stdout/stderr from a zero-based byte offset. |
+| `POST /v1/workspaces/{name}/runs/{id}/cancel` | Requests cancellation; repeated requests are safe. |
+
+Reuse a client-supplied ID and the same command to retry creation after losing
+the response. A different command with that ID returns HTTP 409. Resume logs by
+adding the number of received bytes to the requested offset. Omitting `follow`
+returns a snapshot; following ends on completion or the configured stream time
+limit and can be reopened. Offsets beyond available output return HTTP 416.
+The legacy `/exec` endpoint remains available for older clients.
 
 ### workspace shell
 

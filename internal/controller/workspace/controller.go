@@ -4,6 +4,7 @@ package workspace
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	automotivev1alpha1 "github.com/centos-automotive-suite/automotive-dev-operator/api/v1alpha1"
 	"github.com/centos-automotive-suite/automotive-dev-operator/internal/common/bundleverify"
 	"github.com/centos-automotive-suite/automotive-dev-operator/internal/controller/controllerutils"
+	"github.com/centos-automotive-suite/automotive-dev-operator/internal/workspacerun"
 	"github.com/go-logr/logr"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 	ociremote "github.com/sigstore/cosign/v3/pkg/oci/remote"
@@ -56,6 +58,7 @@ type Reconciler struct {
 	clientset     kubernetes.Interface
 	clientsetErr  error
 	clientsetOnce sync.Once
+	execActivity  func(context.Context, *automotivev1alpha1.Workspace, []string) (string, error)
 }
 
 // +kubebuilder:rbac:groups=automotive.sdv.cloud.redhat.com,namespace=system,resources=workspaces,verbs=get;list;watch;create;update;patch;delete
@@ -682,7 +685,9 @@ func (r *Reconciler) checkAutoPause(ctx context.Context, ws *automotivev1alpha1.
 			"idleDuration", idleDuration.Truncate(time.Second),
 			"timeout", timeout)
 
-		specPatch := client.MergeFrom(ws.DeepCopy())
+		// Activity updates race with this decision. A resource-version conflict
+		// forces a new check instead of pausing after a command just started.
+		specPatch := client.MergeFromWithOptions(ws.DeepCopy(), client.MergeFromWithOptimisticLock{})
 		ws.Spec.Stopped = true
 		if err := r.Patch(ctx, ws, specPatch); err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to auto-pause workspace: %w", err)
@@ -710,14 +715,27 @@ func (r *Reconciler) getClientset() (kubernetes.Interface, error) {
 // isWorkspaceActive execs into the workspace pod to check for user activity.
 // Returns true if active sessions or build processes are detected.
 func (r *Reconciler) isWorkspaceActive(ctx context.Context, ws *automotivev1alpha1.Workspace) (bool, error) {
-	podName := "workspace-" + ws.Name
-
-	clientset, err := r.getClientset()
+	// Recorded live runs survive detachment from pod exec. Check their supervisor
+	// identities first; stale records from a previous container are not activity.
+	output, err := r.runActivityCommand(ctx, ws, workspacerun.Command("active"))
 	if err != nil {
 		return false, err
 	}
+	var runs struct {
+		Active bool   `json:"active"`
+		Error  string `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(output), &runs); err != nil {
+		return false, fmt.Errorf("invalid run activity response: %w", err)
+	}
+	if runs.Error != "" {
+		return false, fmt.Errorf("run activity check: %s", runs.Error)
+	}
+	if runs.Active {
+		return true, nil
+	}
 
-	// Detect user activity via two signals:
+	// Detect other user activity via two signals:
 	// 1. Active pts sessions (caib workspace shell connections)
 	// 2. Exec'd processes: in Kubernetes, exec'd processes have PPID=0 inside the
 	//    container PID namespace (their real parent is outside). PID 1 is the
@@ -728,6 +746,20 @@ func (r *Reconciler) isWorkspaceActive(ctx context.Context, ws *automotivev1alph
 			`extra=$(ps -eo pid,ppid --no-headers | awk '$1 != 1 && $2 == 0 {c++} END {print c+0}'); ` +
 			`if [ "$extra" -gt 1 ]; then echo active; exit 0; fi; ` +
 			`echo idle`,
+	}
+
+	output, err = r.runActivityCommand(ctx, ws, cmd)
+	return strings.TrimSpace(output) == "active", err
+}
+
+func (r *Reconciler) runActivityCommand(ctx context.Context, ws *automotivev1alpha1.Workspace, cmd []string) (string, error) {
+	if r.execActivity != nil {
+		return r.execActivity(ctx, ws, cmd)
+	}
+	podName := "workspace-" + ws.Name
+	clientset, err := r.getClientset()
+	if err != nil {
+		return "", err
 	}
 
 	execReq := clientset.CoreV1().RESTClient().Post().
@@ -743,7 +775,7 @@ func (r *Reconciler) isWorkspaceActive(ctx context.Context, ws *automotivev1alph
 
 	executor, err := remotecommand.NewSPDYExecutor(r.RestConfig, http.MethodPost, execReq.URL())
 	if err != nil {
-		return false, fmt.Errorf("creating executor: %w", err)
+		return "", fmt.Errorf("creating executor: %w", err)
 	}
 
 	var stdout, stderr bytes.Buffer
@@ -754,10 +786,10 @@ func (r *Reconciler) isWorkspaceActive(ctx context.Context, ws *automotivev1alph
 		Stdout: &stdout,
 		Stderr: &stderr,
 	}); err != nil {
-		return false, fmt.Errorf("exec failed: %w (stderr: %s)", err, stderr.String())
+		return "", fmt.Errorf("exec failed: %w (stderr: %s)", err, stderr.String())
 	}
 
-	return strings.TrimSpace(stdout.String()) == "active", nil
+	return stdout.String(), nil
 }
 
 // SetupWithManager sets up the controller with the Manager.

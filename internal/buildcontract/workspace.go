@@ -33,6 +33,36 @@ type WorkspaceExecRequest struct {
 	Command string `json:"command"`
 }
 
+// WorkspaceRunRequest creates a durable command. Reusing ID with the same
+// command is idempotent, including after an ambiguous network failure.
+type WorkspaceRunRequest struct {
+	ID      string `json:"id,omitempty"`
+	Command string `json:"command"`
+}
+
+// WorkspaceRun records a command and its result on the workspace volume.
+// ExitCode is absent when the command is live or was interrupted without a result.
+type WorkspaceRun struct {
+	ID         string `json:"id"`
+	Command    string `json:"command"`
+	Status     string `json:"status"`
+	ExitCode   *int   `json:"exitCode,omitempty"`
+	StartedAt  string `json:"startedAt"`
+	FinishedAt string `json:"finishedAt,omitempty"`
+	LogBytes   int64  `json:"logBytes"`
+	Message    string `json:"message,omitempty"`
+}
+
+// Terminal reports whether the run has stopped producing output.
+func (r WorkspaceRun) Terminal() bool {
+	switch r.Status {
+	case "Succeeded", "Failed", "Cancelled", "Interrupted":
+		return true
+	default:
+		return false
+	}
+}
+
 // SyncPlanRequest is the manifest sent by the client to compute a sync diff.
 type SyncPlanRequest struct {
 	Files          map[string]string `json:"files"`                    // relative path -> hex-encoded sha256

@@ -58,6 +58,10 @@ var _ = Describe("Workspace API", func() {
 			{"POST", "/v1/workspaces/my-app/sync/plan"},
 			{"POST", "/v1/workspaces/my-app/sync/delete"},
 			{"POST", "/v1/workspaces/my-app/exec"},
+			{"POST", "/v1/workspaces/my-app/runs"},
+			{"GET", "/v1/workspaces/my-app/runs/run"},
+			{"GET", "/v1/workspaces/my-app/runs/run/logs"},
+			{"POST", "/v1/workspaces/my-app/runs/run/cancel"},
 			{"POST", "/v1/workspaces/my-app/deploy"},
 		}
 
