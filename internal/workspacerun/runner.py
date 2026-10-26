@@ -28,7 +28,6 @@ TOMBSTONE_TTL = 24 * 60 * 60
 # Bump for incompatible payloads, retaining readers for older versions. Existing
 # supervisors keep writing their original format; older readers never rewrite it.
 RECORD_VERSION = 1
-ORIGINAL_UMASK = os.umask(0o077)
 
 
 class RunError(Exception):
@@ -535,6 +534,8 @@ def stream_log(directory, offset, end, follow, duration):
 
 
 def main():
+    global ORIGINAL_UMASK
+    ORIGINAL_UMASK = os.umask(0o077)
     action = sys.argv[3]
     if action not in ("active", "list", "create", "get", "log-info", "delete", "stream", "cancel"):
         raise RunError(400, "unknown runner action")
