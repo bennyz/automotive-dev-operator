@@ -417,7 +417,8 @@ func streamRunLog(t *testing.T, root, id, offset string) runnerLog {
 
 func TestRunnerPreservesCommandUmaskAndSignals(t *testing.T) {
 	root, call := localRunner(t)
-	call("create", "permissions", `echo artifact > artifact; mkdir objects; python3 -c 'import signal; print(signal.getsignal(signal.SIGHUP))'`, DefaultOptions().JSON())
+	// Compare the numeric disposition; enum string formatting varies by Python version.
+	call("create", "permissions", `echo artifact > artifact; mkdir objects; python3 -c 'import signal; print(int(signal.getsignal(signal.SIGHUP)))'`, DefaultOptions().JSON())
 	run := awaitRun(t, call, "permissions")
 	if run.Status != "Succeeded" {
 		t.Fatalf("run: %+v", run)

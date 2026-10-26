@@ -1075,8 +1075,9 @@ live commands; after restart they report `Interrupted` with no exit code unless
 one was recorded. Start a stopped workspace before reading retained runs or logs.
 Workspace images must provide Python 3.9 or newer and Linux `/proc` for runs.
 The default toolchain uses catatonit as PID 1 to reap orphaned supervisors and
-children; custom images must provide an init that reaps children too. Existing
-pods need the updated toolchain image and a restart to receive this init change.
+children; custom images must provide an init that reaps children too.
+Custom toolchain images reusing `workspace-entrypoint.sh` must install `catatonit`.
+Existing pods need the updated toolchain image and a restart to receive this init change.
 Images without Python receive an actionable error for runs; their exec/terminal
 activity still participates in auto-pause detection. The helper uses isolated
 Python imports, so workspace files and `PYTHON*` variables cannot replace its
@@ -1085,6 +1086,7 @@ commands and script contents out of Kubernetes exec request URLs.
 Run records use format version 1; existing unversioned records use the same layout.
 All future versions must preserve a common envelope: `id`, `version`, `status`,
 `startedAt`, the live supervisor's `pid` and `identity`, and terminal `finishedAt`.
+Envelope timestamps may use `Z` or an explicit UTC offset.
 The current status values and their live/terminal meanings are fixed. Identity
 remains `[boot ID, PID namespace, process start time]`. Records keep the same
 `state.json` location, root-then-run lock order and atomic replacement protocol, and each run
