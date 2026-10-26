@@ -165,7 +165,7 @@ func TestWorkspaceRunExecFailuresPreserveTheirActualCause(t *testing.T) {
 				}
 				want = protocol.Error
 			}
-			if rec.Code != tc.status || strings.Contains(response.Error, "Python 3.9") != tc.python || !strings.Contains(response.Error, want) {
+			if rec.Code != tc.status || strings.Contains(response.Error, "Python 3.12") != tc.python || !strings.Contains(response.Error, want) {
 				t.Fatalf("exec failure: %d %s; want %d with %q", rec.Code, response.Error, tc.status, want)
 			}
 		})

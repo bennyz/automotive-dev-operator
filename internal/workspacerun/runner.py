@@ -40,12 +40,6 @@ def now():
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
-def parse_time(value):
-    if isinstance(value, str) and value.endswith("Z"):
-        value = value[:-1] + "+00:00"
-    return datetime.datetime.fromisoformat(value)
-
-
 def identity(pid):
     try:
         fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
@@ -103,7 +97,7 @@ def envelope(directory, state):
         raise ValueError("invalid status")
     keys = ("id", "version", "status", "startedAt")
     for key in ("startedAt",) + (("finishedAt",) if state["status"] in TERMINAL else ()):
-        if parse_time(state[key]).tzinfo is None:
+        if datetime.datetime.fromisoformat(state[key]).tzinfo is None:
             raise ValueError(f"{key} must include a timezone")
     if state["status"] in LIVE:
         if type(state["pid"]) is not int or state["pid"] <= 0:
@@ -435,7 +429,7 @@ def prune(options):
     for directory, state in visible_runs():
         if state["status"] not in TERMINAL:
             continue
-        finished = parse_time(state["finishedAt"]).timestamp()
+        finished = datetime.datetime.fromisoformat(state["finishedAt"]).timestamp()
         terminal.append((finished, directory))
     retained = []
     total = 0
@@ -549,7 +543,7 @@ def main():
         return {"active": active_runs()}
     if action == "list":
         runs = [public(directory, state) for directory, state in visible_runs()]
-        runs.sort(key=lambda run: (parse_time(run["startedAt"]).timestamp() if "startedAt" in run else float("-inf"), run["id"]), reverse=True)
+        runs.sort(key=lambda run: (datetime.datetime.fromisoformat(run["startedAt"]).timestamp() if "startedAt" in run else float("-inf"), run["id"]), reverse=True)
         offset, limit = int(sys.argv[4]), int(sys.argv[5])
         return {"runs": runs[offset:offset + limit]}
     run_id = sys.argv[4]

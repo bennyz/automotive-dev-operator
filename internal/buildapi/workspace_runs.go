@@ -270,7 +270,7 @@ func workspaceRunExecFailure(err error) (int, string) {
 	}
 	var exitError kexec.ExitError
 	if errors.As(err, &exitError) && (exitError.ExitStatus() == 126 || exitError.ExitStatus() == 127) {
-		return http.StatusUnprocessableEntity, "workspace run helper could not execute; the image requires an executable Python 3.9 or newer: " + detail
+		return http.StatusUnprocessableEntity, "workspace run helper could not execute; the image requires an executable Python 3.12 or newer: " + detail
 	}
 	return http.StatusBadGateway, "workspace run operation failed: " + detail
 }

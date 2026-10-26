@@ -268,7 +268,7 @@ paths:
         "409":
           description: Start the workspace to access retained runs
         "422":
-          description: Unreadable run record, or the image cannot execute the helper (Python 3.9 or newer required)
+          description: Unreadable run record, or the image cannot execute the helper (Python 3.12 or newer required)
     post:
       operationId: createWorkspaceRun
       summary: Start a durable workspace command
@@ -328,7 +328,7 @@ paths:
         "410":
           description: Run ID was deleted or expired; use a new ID for a new command
         "422":
-          description: Unreadable run record, or the image cannot execute the helper (Python 3.9 or newer required)
+          description: Unreadable run record, or the image cannot execute the helper (Python 3.12 or newer required)
         "502":
           description: Pod operation failed; retry creation with the same ID
         "503":

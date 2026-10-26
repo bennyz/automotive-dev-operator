@@ -1073,7 +1073,7 @@ spec:
 Manually stopping or replacing the pod interrupts
 live commands; after restart they report `Interrupted` with no exit code unless
 one was recorded. Start a stopped workspace before reading retained runs or logs.
-Workspace images must provide Python 3.9 or newer and Linux `/proc` for runs.
+Workspace images must provide Python 3.12 or newer and Linux `/proc` for runs.
 The default toolchain uses catatonit as PID 1 to reap orphaned supervisors and
 children; custom images must provide an init that reaps children too.
 Custom toolchain images reusing `workspace-entrypoint.sh` must install `catatonit`.

@@ -90,28 +90,7 @@ func TestUnversionedRecordsRemainReadable(t *testing.T) {
 }
 
 func TestNewerRunRecordsDoNotBlockWorkspace(t *testing.T) {
-	root := t.TempDir()
-	// Exercise the Python 3.9/3.10 parser restriction even when CI uses a newer
-	// interpreter. Validation, sorting and pruning must all normalize trailing Z.
-	const oldTimeParser = `import datetime
-class OldDateTime(datetime.datetime):
-    @classmethod
-    def fromisoformat(cls, value):
-        if isinstance(value, str) and value.endswith("Z"):
-            raise ValueError("Invalid isoformat string")
-        return super().fromisoformat(value)
-datetime.datetime = OldDateTime
-`
-	call := func(action string, args ...string) runnerResult {
-		t.Helper()
-		argv, input := Command(action, args...)
-		out, _ := executeRunner(t, root, argv, oldTimeParser+input)
-		var result runnerResult
-		if err := json.Unmarshal(out, &result); err != nil {
-			t.Fatalf("runner %s: %v: %s", action, err, out)
-		}
-		return result
-	}
+	root, call := localRunner(t)
 	writeTerminalRun(t, root, "known", time.Hour, []byte("known output"))
 	filename, record := writeNewerRun(t, root, newerEnvelope("future", "Failed", 2*time.Hour))
 	if got := call("active"); got.Code != 0 || got.Active {
