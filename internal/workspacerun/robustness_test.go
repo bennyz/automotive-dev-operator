@@ -230,6 +230,78 @@ os.fsync = fail_directory_sync
 	}
 }
 
+func TestSupervisorStartFailureReportsCause(t *testing.T) {
+	// Injections are inherited by the forked supervisor. Failing before it
+	// acknowledges the launch must be reported as such, not as an interruption.
+	for _, tc := range []struct {
+		name, inject, cause, persisted string
+	}{{
+		name: "running record write",
+		inject: `import errno, os
+from pathlib import Path
+launcher, original_open = os.getpid(), Path.open
+def fail_supervisor_write(path, *args, **kwargs):
+    if path.name == "state.tmp" and os.getpid() != launcher:
+        raise OSError(errno.ENOSPC, "injected full volume")
+    return original_open(path, *args, **kwargs)
+Path.open = fail_supervisor_write
+`,
+		cause:     "OSError: [Errno 28] injected full volume",
+		persisted: "Failed",
+	}, {
+		name: "killed before acknowledging",
+		inject: `import os, signal
+os.setsid = lambda: os.kill(os.getpid(), signal.SIGKILL)
+`,
+		cause:     "it exited before acknowledging",
+		persisted: "Failed",
+	}, {
+		// Only the initial Starting record fits, so the failure cannot be
+		// persisted. The create response must still carry its cause.
+		name: "failure record write",
+		inject: `import errno
+from pathlib import Path
+original_open, writes = Path.open, [0]
+def fill_volume(path, *args, **kwargs):
+    if path.name == "state.tmp":
+        writes[0] += 1
+        if writes[0] > 1:
+            raise OSError(errno.ENOSPC, "injected full volume")
+    return original_open(path, *args, **kwargs)
+Path.open = fill_volume
+`,
+		cause:     "OSError: [Errno 28] injected full volume",
+		persisted: "Interrupted",
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			root, call := localRunner(t)
+			const command = "echo started > started"
+			argv, input := Command("create", "start", command, DefaultOptions().JSON())
+			out, stderr := executeRunner(t, root, argv, tc.inject+input)
+			var result runnerResult
+			if err := json.Unmarshal(out, &result); err != nil || len(stderr) != 0 {
+				t.Fatalf("create response: %q, stderr=%q, decode=%v", out, stderr, err)
+			}
+			run := result.Run
+			if result.Code != 0 || run.Status != "Failed" || run.ExitCode == nil || *run.ExitCode != 127 ||
+				run.Message != "Run supervisor failed to start: "+tc.cause {
+				t.Fatalf("create did not report the start failure: %+v", result)
+			}
+			// A transient-error retry with the same ID must not relaunch.
+			retry := call("create", "start", command, DefaultOptions().JSON())
+			if retry.Code != 0 || retry.Run.Status != tc.persisted {
+				t.Fatalf("retry: %+v", retry)
+			}
+			if tc.persisted == "Failed" && (retry.Run.Message != run.Message || *retry.Run.ExitCode != 127) {
+				t.Fatalf("retry did not return the recorded failure: %+v", retry)
+			}
+			if _, err := os.Stat(filepath.Join(root, "started")); !os.IsNotExist(err) {
+				t.Fatalf("command started without an acknowledged supervisor: %v", err)
+			}
+		})
+	}
+}
+
 func TestUnreadableRecordsDoNotBlockCollectionsOrLaunch(t *testing.T) {
 	root, call := localRunner(t)
 	for _, field := range []string{"truncated", "version", "finishedAt", "maxLogBytes", "exitCode", "message"} {

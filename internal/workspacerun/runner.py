@@ -473,15 +473,21 @@ def launch(directory, run_id, command, options, collection_lock):
         pid = os.fork()
         if pid == 0:
             try:
-                os.close(read_fd)
-                os.setsid()
-                # The supervisor owns no exec connection descriptors. Command
-                # output is pumped separately into bounded persistent segments.
-                with open(os.devnull, "r+b", buffering=0) as null:
-                    for fd in (0, 1, 2):
-                        os.dup2(null.fileno(), fd)
-                state.update(status="Running", pid=os.getpid(), identity=identity(os.getpid()))
-                save(directory, state)
+                try:
+                    os.close(read_fd)
+                    os.setsid()
+                    # The supervisor owns no exec connection descriptors. Command
+                    # output is pumped separately into bounded persistent segments.
+                    with open(os.devnull, "r+b", buffering=0) as null:
+                        for fd in (0, 1, 2):
+                            os.dup2(null.fileno(), fd)
+                    state.update(status="Running", pid=os.getpid(), identity=identity(os.getpid()))
+                    save(directory, state)
+                except BaseException as error:
+                    # The launcher still holds the run lock and records the cause.
+                    detail = f"{type(error).__name__}: {error}"
+                    os.write(write_fd, b"E" + detail.encode("utf-8", "replace")[:4000])
+                    os._exit(1)
                 os.write(write_fd, b"1")
                 os.close(write_fd)
                 lock.close()
@@ -491,10 +497,21 @@ def launch(directory, run_id, command, options, collection_lock):
                 os._exit(0)
         os.close(write_fd)
         try:
-            if os.read(read_fd, 1) != b"1":
-                raise RunError(500, "run supervisor failed to start")
+            # Replies up to PIPE_BUF bytes arrive in a single atomic write.
+            reply = os.read(read_fd, 4096)
         finally:
             os.close(read_fd)
+        if reply != b"1":
+            # The command never started, so it must not read as interrupted.
+            # A retry with the same ID returns this result instead of a 500.
+            detail = reply[1:].decode("utf-8", "replace") if reply[:1] == b"E" else "it exited before acknowledging"
+            state.update(status="Failed", exitCode=127, finishedAt=now(),
+                         message=f"Run supervisor failed to start: {detail}")
+            # A full volume is the likely cause, so this save may fail as well.
+            # The response still reports the cause from memory.
+            with contextlib.suppress(OSError):
+                save(directory, state)
+            return public(directory, state)
         return public(directory, read_state(directory))
 
 
