@@ -475,7 +475,7 @@ func (r *Reconciler) buildPod(ws *automotivev1alpha1.Workspace, operatorConfig *
 	}
 	initScript := `set -e
 mkdir -p /workspace/src /workspace/cache /workspace/.cache /workspace/.ssh \
-         /workspace/.config /workspace/.local/share/containers \
+         /workspace/.config /workspace/.local/share/containers /workspace/export \
          /workspace/.pkg-overlay/{usr,etc,var-lib,opt}-{upper,work}
 [ -f /workspace/.ssh/id_ed25519 ] || ssh-keygen -t ed25519 -f /workspace/.ssh/id_ed25519 -N '' -q
 if [ -f /jumpstarter/client.yaml ]; then
@@ -484,7 +484,7 @@ if [ -f /jumpstarter/client.yaml ]; then
   HOME=/workspace jmp config client use workspace || true
 fi
 chown -R 1000:1000 /workspace/src /workspace/cache /workspace/.cache /workspace/.ssh \
-                   /workspace/.config /workspace/.local`
+                   /workspace/.config /workspace/.local /workspace/export`
 
 	// For the toolchain image, run the entrypoint (handles user creation, overlayfs,
 	// subuid/subgid setup). For custom images, don't override Command so the
