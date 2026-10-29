@@ -498,7 +498,10 @@ chown -R 1000:1000 /workspace/src /workspace/cache /workspace/.cache /workspace/
 
 	podSpec := corev1.PodSpec{
 		ServiceAccountName: workspaceServiceAccountName,
-		HostUsers:          new(false),
+		// Nothing in the workspace uses the API, and any service account token
+		// in the shared namespace can pull other users' images from the registry.
+		AutomountServiceAccountToken: new(false),
+		HostUsers:                    new(false),
 		SecurityContext: &corev1.PodSecurityContext{
 			RunAsUser: ptr.To[int64](0),
 		},
